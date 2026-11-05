@@ -91,6 +91,9 @@ def truncate_html_preview(
     if max_length <= 0:
         return ""
 
+    if source.rfind("<") > source.rfind(">"):
+        return _escaped_preview(source, max_length, suffix)
+
     parser = _HTMLPreviewParser(allowed_tags=allowed_tags)
     try:
         parser.feed(source)

@@ -14,23 +14,39 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import html
+import json
 import logging
+import re
 import secrets
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import or_, select, update
+from aiogram.types import (
+    BufferedInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+)
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import selectinload
 
 from database import (
     EventDelivery,
+    EventDeliveryPart,
     EventRegistration,
     EventScenario,
     EventStep,
     User,
+)
+from event_media import (
+    EventMediaMaterializationError,
+    materialize_event_scenario_media,
+    materialize_event_scenario_media_from_telegram,
 )
 from event_service import (
     DEFAULT_ADAPTIVE_CONFIRMATION_TEMPLATE,
@@ -38,7 +54,7 @@ from event_service import (
     DEFAULT_LIVE_TEMPLATE,
     DEFAULT_RESCHEDULE_TEMPLATE,
     prepare_and_lock_delivery_for_sending,
-    render_event_template,
+    render_event_message,
 )
 from max_messenger_bot.api import MaxApiClient, MaxApiError
 from max_messenger_bot.identity import is_max_user_id, raw_max_user_id
@@ -50,12 +66,26 @@ class PreTransmissionError(Exception):
     pass
 
 
+class MediaMaterializationRequired(PreTransmissionError):
+    pass
+
+
 log = logging.getLogger(__name__)
 
 
 # Global platform cooldown trackers (MSK / UTC naive)
 _telegram_rate_limited_until: datetime | None = None
 _max_rate_limited_until: datetime | None = None
+_runtime_max_client: MaxApiClient | None = None
+
+
+def set_runtime_max_client(client: MaxApiClient | None) -> None:
+    global _runtime_max_client
+    _runtime_max_client = client
+
+
+def get_runtime_max_client() -> MaxApiClient | None:
+    return _runtime_max_client
 
 
 def get_telegram_cooldown() -> datetime | None:
@@ -80,6 +110,563 @@ def reset_cooldowns() -> None:
     global _telegram_rate_limited_until, _max_rate_limited_until
     _telegram_rate_limited_until = None
     _max_rate_limited_until = None
+
+
+def _split_html_text(text: str, max_length: int = 4000) -> list[str]:
+    if not text:
+        return []
+    if len(text) <= max_length:
+        return [text]
+    tag_re = re.compile(r"(</?[a-z][^>]*>)", re.IGNORECASE)
+    chunks: list[str] = []
+    current = ""
+    open_tags: list[tuple[str, str]] = []
+
+    def suffix() -> str:
+        return "".join(f"</{name}>" for name, _ in reversed(open_tags))
+
+    def reopen() -> str:
+        return "".join(raw for _, raw in open_tags)
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            chunks.append(current + suffix())
+            current = reopen()
+
+    def append_text(token: str) -> None:
+        nonlocal current
+        while token:
+            room = max_length - len(current) - len(suffix())
+            if room <= 0:
+                flush()
+                room = max_length - len(current) - len(suffix())
+            take = min(len(token), max(1, room))
+            if take < len(token):
+                split_at = token.rfind(" ", 0, take)
+                if split_at > take // 3:
+                    take = split_at
+            current += token[:take]
+            token = token[take:].lstrip()
+            if token and len(current) + len(token) + len(suffix()) > max_length:
+                flush()
+
+    for token in tag_re.split(text):
+        if not token:
+            continue
+        if token.startswith("<"):
+            match = re.match(r"<(/?)([a-z][^ >]*)", token, re.IGNORECASE)
+            name = match.group(2).lower() if match else ""
+            is_closing = bool(match and match.group(1))
+            is_stack_tag = bool(match and name not in {"br", "hr", "img"})
+            matching_closing = bool(is_closing and open_tags and open_tags[-1][0] == name)
+            if len(token) + len(suffix()) > max_length or (is_closing and not matching_closing):
+                append_text(html.escape(token))
+                continue
+            if is_closing and is_stack_tag:
+                if len(current) + len(token) + len("".join(f"</{n}>" for n, _ in reversed(open_tags[:-1]))) > max_length:
+                    flush()
+                current += token
+                if open_tags and open_tags[-1][0] == name:
+                    open_tags.pop()
+                continue
+            if is_stack_tag:
+                projected_suffix = f"</{name}>" + suffix()
+                if len(current) + len(token) + len(projected_suffix) > max_length:
+                    flush()
+                current += token
+                open_tags.append((name, token))
+                continue
+            if len(current) + len(token) + len(suffix()) > max_length:
+                flush()
+            current += token
+            continue
+        append_text(token)
+    if current.strip():
+        chunks.append(current + suffix())
+    return [chunk for chunk in chunks if chunk.strip()]
+
+
+def _build_delivery_plan(
+    scenario: EventScenario,
+    event_id: int,
+    rendered_text: str,
+    *,
+    include_media: bool = True,
+) -> list[dict[str, Any]]:
+    media = (
+        sorted(getattr(scenario, "media", ()) or (), key=lambda item: (item.sort_order, item.id))
+        if include_media
+        else []
+    )
+    if not media and len(rendered_text) <= 4000:
+        return []
+
+    text_chunks = _split_html_text(rendered_text, 4000)
+    media_parts: list[dict[str, Any]] = []
+    for start in range(0, len(media), 10):
+        items = []
+        for item in media[start:start + 10]:
+            items.append({
+                "file_type": item.file_type,
+                "file_id": item.file_id,
+                "max_token": item.max_token,
+                "source_platform": getattr(item, "source_platform", None),
+            })
+        media_parts.append({"kind": "media", "items": items})
+
+    if len(media) == 1 and text_chunks and len(rendered_text) <= 900 and scenario.media_order == "media_top":
+        plan = [{"kind": "media_caption", "items": [{
+            "file_type": media[0].file_type,
+            "file_id": media[0].file_id,
+            "max_token": media[0].max_token,
+            "source_platform": getattr(media[0], "source_platform", None),
+        }], "caption": rendered_text}]
+    else:
+        text_parts = [{"kind": "text", "text": chunk} for chunk in text_chunks]
+        plan = media_parts + text_parts if scenario.media_order == "media_top" else text_parts + media_parts
+    if media and (not text_chunks or scenario.media_order == "text_top"):
+        plan.append({"kind": "control", "text": ""})
+    return plan
+
+
+async def build_test_delivery_plan(
+    session_maker: async_sessionmaker[AsyncSession],
+    event_id: int,
+    step_id: int | None,
+    admin_user: Any,
+    *,
+    header: str = "",
+) -> list[dict[str, Any]]:
+    """Build the same text/media sequence as runtime delivery without creating a delivery row."""
+    from event_admin_service import render_test_step
+
+    rendered = await render_test_step(
+        session_maker,
+        event_id=event_id,
+        step_id=step_id,
+        admin_user=admin_user,
+    )
+    async with session_maker() as session:
+        scenario = await session.scalar(
+            select(EventScenario)
+            .options(selectinload(EventScenario.media))
+            .where(EventScenario.id == event_id)
+        )
+        step = await session.get(EventStep, step_id) if step_id is not None else None
+    if scenario is None:
+        raise ValueError(f"Сценарий {event_id} не найден.")
+    include_media = step_id is None or bool(step and step.include_event_details)
+    text = f"{header}\n\n{rendered}" if header else rendered
+    plan = _build_delivery_plan(
+        scenario,
+        event_id,
+        text,
+        include_media=include_media,
+    )
+    return plan or [{"kind": "text", "text": text}]
+
+
+async def ensure_max_test_media_materialized(
+    session_maker: async_sessionmaker[AsyncSession],
+    event_id: int,
+    step_id: int | None,
+    max_client: MaxApiClient,
+) -> None:
+    """Prepare Telegram-origin event media before an admin MAX preview."""
+    async with session_maker() as session:
+        scenario = await session.scalar(
+            select(EventScenario)
+            .options(selectinload(EventScenario.media))
+            .where(EventScenario.id == event_id)
+        )
+        step = await session.get(EventStep, step_id) if step_id is not None else None
+    if scenario is None:
+        raise ValueError(f"Сценарий {event_id} не найден.")
+    if step_id is not None and not (step and step.include_event_details):
+        return
+    if not any(not media.max_token for media in (scenario.media or ())):
+        return
+    await materialize_event_scenario_media_from_telegram(
+        event_id,
+        max_client,
+        session_factory=session_maker,
+    )
+
+
+async def send_test_delivery_plan(
+    plan: list[dict[str, Any]],
+    *,
+    platform: str,
+    user_id: int,
+    event_id: int,
+    bot: Bot | None = None,
+    max_client: MaxApiClient | None = None,
+) -> list[str | None]:
+    """Send an admin-only preview using runtime render/segmentation/media ordering."""
+    max_client = max_client or get_runtime_max_client()
+    sent_ids: list[str | None] = []
+    preview_parts = [payload for payload in plan if payload.get("kind") != "control"]
+    for index, payload in enumerate(preview_parts):
+        sent_ids.append(
+            await _send_delivery_part(
+                payload,
+                platform=platform,
+                user_id=user_id,
+                event_id=event_id,
+                is_last=index == len(plan) - 1,
+                bot=bot,
+                max_client=max_client,
+                include_controls=False,
+            )
+        )
+    return sent_ids
+
+
+async def _ensure_delivery_parts(
+    session_maker: async_sessionmaker[AsyncSession],
+    delivery_id: int,
+    content_version: int,
+    plan: list[dict[str, Any]],
+    now: datetime,
+    claim_token: str,
+) -> list[EventDeliveryPart] | None:
+    async with session_maker() as session:
+        bind = session.get_bind()
+        is_postgres = getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
+        if not is_postgres:
+            await session.execute(text("BEGIN IMMEDIATE"))
+        else:
+            await session.begin()
+        delivery_stmt = select(EventDelivery).where(EventDelivery.id == delivery_id)
+        if is_postgres:
+            delivery_stmt = delivery_stmt.with_for_update()
+        delivery = await session.scalar(delivery_stmt)
+        if (
+            not delivery
+            or delivery.status != "sending"
+            or delivery.claim_token != claim_token
+            or delivery.content_version_snapshot != content_version
+        ):
+            await session.rollback()
+            return None
+        current_content_version = await session.scalar(
+            select(EventScenario.content_version).where(EventScenario.id == delivery.event_id)
+        )
+        if current_content_version != content_version:
+            await session.rollback()
+            return None
+        parts = (
+            await session.execute(
+                select(EventDeliveryPart)
+                .where(EventDeliveryPart.delivery_id == delivery_id)
+                .order_by(EventDeliveryPart.part_index.asc())
+            )
+        ).scalars().all()
+        if parts:
+            await session.commit()
+            return parts
+        session.add_all([
+            EventDeliveryPart(
+                delivery_id=delivery_id,
+                part_index=index,
+                part_kind="media" if payload["kind"] == "media_caption" else payload["kind"],
+                payload_json=json.dumps(payload, ensure_ascii=False),
+                content_version=content_version,
+                status="pending",
+                next_attempt_at=now,
+            )
+            for index, payload in enumerate(plan)
+        ])
+        await session.commit()
+        return (
+            await session.execute(
+                select(EventDeliveryPart)
+                .where(EventDeliveryPart.delivery_id == delivery_id)
+                .order_by(EventDeliveryPart.part_index.asc())
+            )
+        ).scalars().all()
+
+
+async def _claim_delivery_part(
+    session_maker: async_sessionmaker[AsyncSession],
+    delivery_id: int,
+    part_id: int,
+    parent_claim_token: str,
+    content_version: int,
+    now: datetime,
+) -> tuple[str | None, str | None]:
+    token = secrets.token_hex(24)
+    async with session_maker() as session:
+        bind = session.get_bind()
+        is_postgres = getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
+        if not is_postgres:
+            await session.execute(text("BEGIN IMMEDIATE"))
+        else:
+            await session.begin()
+
+        parent_probe = await session.scalar(select(EventDelivery).where(EventDelivery.id == delivery_id))
+        if not parent_probe:
+            await session.rollback()
+            return None, None
+
+        scenario_stmt = select(EventScenario).where(EventScenario.id == parent_probe.event_id)
+        if is_postgres:
+            scenario_stmt = scenario_stmt.with_for_update(read=True)
+        scenario = await session.scalar(scenario_stmt)
+
+        registration_stmt = select(EventRegistration).where(EventRegistration.id == parent_probe.registration_id)
+        if is_postgres:
+            registration_stmt = registration_stmt.with_for_update()
+        registration = await session.scalar(registration_stmt)
+
+        step = None
+        if parent_probe.step_id is not None:
+            step_stmt = select(EventStep).where(EventStep.id == parent_probe.step_id)
+            if is_postgres:
+                step_stmt = step_stmt.with_for_update(read=True)
+            step = await session.scalar(step_stmt)
+
+        parent_stmt = select(EventDelivery).where(EventDelivery.id == delivery_id)
+        if is_postgres:
+            parent_stmt = parent_stmt.with_for_update()
+        parent = await session.scalar(parent_stmt)
+        if (
+            not parent
+            or parent.status != "sending"
+            or parent.claim_token != parent_claim_token
+            or parent.content_version_snapshot != content_version
+        ):
+            await session.rollback()
+            return None, None
+
+        rejection_reason: str | None = None
+        if not scenario or scenario.is_archived:
+            rejection_reason = "scenario_archived"
+        elif not registration or registration.status != "started" or registration.generation != parent.registration_generation:
+            rejection_reason = "cancelled"
+        elif not scenario.is_active:
+            rejection_reason = "disabled_past"
+        elif scenario.schedule_revision != parent.schedule_revision:
+            rejection_reason = "schedule_rescheduled"
+        elif parent.content_version_snapshot != scenario.content_version:
+            rejection_reason = "content_changed"
+        elif parent.step_id is not None and (not step or step.is_archived):
+            rejection_reason = "step_archived"
+        elif parent.expires_at and parent.expires_at <= now:
+            rejection_reason = "expired"
+        elif not parent.lease_until or parent.lease_until <= now:
+            rejection_reason = "lease_expired"
+        elif parent.due_at > now or parent.next_attempt_at > now:
+            await session.rollback()
+            return None, None
+
+        if rejection_reason is not None:
+            sending_part = await session.scalar(
+                select(EventDeliveryPart.id).where(
+                    EventDeliveryPart.delivery_id == delivery_id,
+                    EventDeliveryPart.status == "sending",
+                ).limit(1)
+            )
+            parent_status = "uncertain" if rejection_reason == "lease_expired" or sending_part else "skipped"
+            await session.execute(
+                update(EventDeliveryPart)
+                .where(
+                    EventDeliveryPart.delivery_id == delivery_id,
+                    EventDeliveryPart.status == "pending",
+                )
+                .values(
+                    status="skipped",
+                    finished_at=now,
+                    claim_token=None,
+                    lease_until=None,
+                    send_started_at=None,
+                    last_error=f"Delivery stopped before next part: {rejection_reason}.",
+                    updated_at=now,
+                )
+            )
+            parent.status = parent_status
+            parent.skip_reason = rejection_reason if parent_status == "skipped" else None
+            parent.finished_at = now
+            parent.last_error = f"Delivery stopped before next part: {rejection_reason}."
+            parent.claim_token = None
+            parent.lease_until = None
+            parent.send_started_at = None
+            parent.claimed_at = None
+            parent.updated_at = now
+            await session.commit()
+            return None, rejection_reason
+        stmt = (
+            update(EventDeliveryPart)
+            .where(
+                EventDeliveryPart.id == part_id,
+                EventDeliveryPart.delivery_id == delivery_id,
+                EventDeliveryPart.status == "pending",
+                EventDeliveryPart.content_version == content_version,
+                EventDeliveryPart.next_attempt_at <= now,
+            )
+            .values(
+                status="sending",
+                claim_token=token,
+                lease_until=now + timedelta(seconds=180),
+                send_started_at=now,
+                attempt_count=EventDeliveryPart.attempt_count + 1,
+                updated_at=now,
+            )
+        )
+        result = await session.execute(stmt)
+        await session.commit()
+        return (token, None) if result.rowcount == 1 else (None, None)
+
+
+async def _finish_delivery_part(
+    session_maker: async_sessionmaker[AsyncSession],
+    part_id: int,
+    token: str,
+    status: str,
+    *,
+    now: datetime,
+    external_message_id: str | None = None,
+    error: str | None = None,
+    next_attempt_at: datetime | None = None,
+) -> bool:
+    values: dict[str, Any] = {
+        "status": status,
+        "claim_token": None,
+        "lease_until": None,
+        "updated_at": now,
+    }
+    if status in {"sent", "failed", "uncertain", "skipped"}:
+        values["finished_at"] = now
+    if status == "sent":
+        values["sent_at"] = now
+    if status == "pending":
+        values["send_started_at"] = None
+    if external_message_id:
+        values["external_message_id"] = external_message_id
+    if error:
+        values["last_error"] = error
+    if next_attempt_at:
+        values["next_attempt_at"] = next_attempt_at
+    async with session_maker() as session:
+        result = await session.execute(
+            update(EventDeliveryPart)
+            .where(EventDeliveryPart.id == part_id, EventDeliveryPart.status == "sending", EventDeliveryPart.claim_token == token)
+            .values(**values)
+        )
+        await session.commit()
+        return result.rowcount == 1
+
+
+async def _send_delivery_part(
+    payload: dict[str, Any],
+    *,
+    platform: str,
+    user_id: int,
+    event_id: int,
+    is_last: bool,
+    bot: Bot | None,
+    max_client: MaxApiClient | None,
+    include_controls: bool = True,
+) -> str | None:
+    if platform == "telegram":
+        if bot is None:
+            raise PreTransmissionError("Telegram bot transport is not configured")
+
+        async def telegram_media_reference(item: dict[str, Any], index: int) -> Any:
+            if item.get("source_platform") != "max":
+                return item["file_id"]
+            token = item.get("max_token") or item.get("file_id")
+            if not token:
+                raise MediaMaterializationRequired("MAX media has no download token for Telegram delivery")
+            if max_client is None:
+                raise MediaMaterializationRequired(
+                    "MAX-origin media requires an active MAX client before Telegram delivery"
+                )
+            try:
+                content = await max_client.download_attachment(str(token))
+            except Exception as exc:
+                raise MediaMaterializationRequired(
+                    f"MAX-origin media download failed before Telegram transmission: {type(exc).__name__}"
+                ) from exc
+            if not content:
+                raise MediaMaterializationRequired("MAX-origin media download returned an empty payload")
+            suffix = ".jpg" if item.get("file_type") == "photo" else ".mp4"
+            return BufferedInputFile(bytes(content), filename=f"event-{event_id}-{index}{suffix}")
+
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Не смогу прийти", callback_data=f"ev_cancel:{event_id}")]]
+        ) if is_last and include_controls else None
+        kind = payload.get("kind")
+        if kind == "text" or kind == "control":
+            message = await bot.send_message(
+                chat_id=user_id,
+                text=payload.get("text") or "Управление мероприятием:",
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+            return str(message.message_id)
+        items = payload.get("items") or []
+        if kind == "media_caption":
+            item = items[0]
+            media_reference = await telegram_media_reference(item, 0)
+            kwargs = {"chat_id": user_id, "caption": payload.get("caption") or "", "parse_mode": "HTML", "reply_markup": markup}
+            if item["file_type"] == "photo":
+                message = await bot.send_photo(photo=media_reference, **kwargs)
+            else:
+                message = await bot.send_video(video=media_reference, **kwargs)
+            return str(message.message_id)
+        if len(items) == 1:
+            item = items[0]
+            media_reference = await telegram_media_reference(item, 0)
+            if item["file_type"] == "photo":
+                message = await bot.send_photo(chat_id=user_id, photo=media_reference, reply_markup=markup)
+            else:
+                message = await bot.send_video(chat_id=user_id, video=media_reference, reply_markup=markup)
+            return str(message.message_id)
+        media = []
+        for index, item in enumerate(items):
+            media_reference = await telegram_media_reference(item, index)
+            if item["file_type"] == "photo":
+                media.append(InputMediaPhoto(media=media_reference))
+            else:
+                media.append(InputMediaVideo(media=media_reference))
+        messages = await bot.send_media_group(chat_id=user_id, media=media)
+        return ",".join(str(getattr(message, "message_id", "")) for message in messages)
+
+    if platform == "max":
+        if max_client is None:
+            raise PreTransmissionError("MAX client transport is not configured")
+        markup = inline_keyboard([[callback_button("❌ Не смогу прийти", f"ev_cancel:{event_id}")]]) if is_last and include_controls else []
+        kind = payload.get("kind")
+        if kind in {"media", "media_caption"}:
+            attachments = []
+            for item in payload.get("items") or []:
+                token = item.get("max_token")
+                if not token:
+                    raise MediaMaterializationRequired("MAX media is not materialized for this event; upload the source media to MAX before delivery")
+                attachments.append({
+                    "type": "image" if item["file_type"] == "photo" else "video",
+                    "payload": {"token": token},
+                })
+            text = payload.get("caption") or " "
+            response = await max_client.send_message(
+                user_id=raw_max_user_id(user_id) if is_max_user_id(user_id) else user_id,
+                text=text,
+                attachments=attachments + markup,
+            )
+        else:
+            response = await max_client.send_message(
+                user_id=raw_max_user_id(user_id) if is_max_user_id(user_id) else user_id,
+                text=payload.get("text") or "Управление мероприятием:",
+                attachments=markup,
+            )
+        return extract_sent_message_id(response) or (
+            str(response.get("message_id") or response.get("mid") or response.get("id"))
+            if isinstance(response, dict) and (response.get("message_id") or response.get("mid") or response.get("id"))
+            else None
+        )
+    raise ValueError(f"Unknown platform '{platform}'")
 
 
 
@@ -215,6 +802,25 @@ async def recover_expired_leases(
         res_sending = await session.execute(sending_recover_stmt)
         recovered_sending = res_sending.rowcount or 0
 
+        await session.execute(
+            update(EventDeliveryPart)
+            .where(
+                EventDeliveryPart.status == "sending",
+                EventDeliveryPart.delivery_id.in_(select(EventDelivery.id).where(
+                    EventDelivery.status == "uncertain",
+                    EventDelivery.last_error == "Lease expired in sending state (>180s)",
+                )),
+            )
+            .values(
+                status="uncertain",
+                finished_at=effective_now,
+                last_error="Lease expired in sending state (>180s)",
+                claim_token=None,
+                lease_until=None,
+                updated_at=effective_now,
+            )
+        )
+
         await session.commit()
         return recovered_claimed, recovered_sending
 
@@ -308,6 +914,7 @@ async def finalize_delivery_outcome(
     finished_at: datetime | None = None,
     external_message_id: str | None = None,
     last_error: str | None = None,
+    skip_reason: str | None = None,
     next_attempt_at: datetime | None = None,
     now: datetime | None = None,
 ) -> bool:
@@ -336,6 +943,8 @@ async def finalize_delivery_outcome(
             values["external_message_id"] = external_message_id
         if last_error is not None:
             values["last_error"] = last_error
+        if skip_reason is not None:
+            values["skip_reason"] = skip_reason
         if next_attempt_at is not None:
             values["next_attempt_at"] = next_attempt_at
 
@@ -368,13 +977,18 @@ async def process_single_delivery(
     bot: Bot | None = None,
     max_client: MaxApiClient | None = None,
     now: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> str:
     """
     Executes the pre-send protocol and dispatches network send for a single claimed delivery.
 
     Returns the resulting status string.
     """
-    effective_now = now or datetime.utcnow()
+    def current_time() -> datetime:
+        return clock() if clock is not None else (now or datetime.utcnow())
+
+    max_client = max_client or get_runtime_max_client()
+    effective_now = current_time()
 
     # Step 1: Read delivery and relation context without locks
     async with session_maker() as session:
@@ -382,7 +996,11 @@ async def process_single_delivery(
         if not delivery or delivery.status != "claimed" or delivery.claim_token != claim_token:
             return "stale_claim"
 
-        scenario = await session.get(EventScenario, delivery.event_id)
+        scenario = await session.scalar(
+            select(EventScenario)
+            .options(selectinload(EventScenario.media))
+            .where(EventScenario.id == delivery.event_id)
+        )
         if not scenario:
             return "scenario_not_found"
 
@@ -405,25 +1023,34 @@ async def process_single_delivery(
         else:
             template = ""
 
-        rendered_text = render_event_template(
-            template, scenario, user, platform=delivery.platform, now=effective_now
+        include_event_details = delivery.message_kind != "scheduled_step" or bool(
+            step and step.include_event_details
+        )
+        rendered_text = render_event_message(
+            template,
+            scenario,
+            user,
+            platform=delivery.platform,
+            include_event_details=include_event_details,
+            now=effective_now,
         )
         expected_content_version = scenario.content_version
         expected_step_version = step.step_version if step else None
         event_id = delivery.event_id
         user_id = delivery.user_id
         platform = delivery.platform
+        content_version = scenario.content_version
 
     # Step 1.5: Platform cooldown check before Point of No Return
-    current_time = now or datetime.utcnow()
+    current_time_value = current_time()
     cooldown_until: datetime | None = None
     if platform == "telegram":
         tg_cd = get_telegram_cooldown()
-        if tg_cd and tg_cd > current_time:
+        if tg_cd and tg_cd > current_time_value:
             cooldown_until = tg_cd
     elif platform == "max":
         max_cd = get_max_cooldown()
-        if max_cd and max_cd > current_time:
+        if max_cd and max_cd > current_time_value:
             cooldown_until = max_cd
 
     if cooldown_until is not None:
@@ -442,7 +1069,7 @@ async def process_single_delivery(
                     lease_until=None,
                     send_started_at=None,
                     next_attempt_at=cooldown_until,
-                    updated_at=current_time,
+                    updated_at=current_time_value,
                 )
             )
             await session.execute(revert_stmt)
@@ -454,6 +1081,7 @@ async def process_single_delivery(
         return f"cooldown_reverted:{platform}"
 
     # Step 2: Pre-send lock and CAS validation (Point of No Return inside)
+    prepare_now = current_time() if (clock is not None or now is not None) else None
     ok, locked_delivery, skip_reason = await prepare_and_lock_delivery_for_sending(
         session_maker,
         delivery_id=delivery_id,
@@ -462,14 +1090,277 @@ async def process_single_delivery(
         expected_step_version=expected_step_version,
         rendered_text=rendered_text,
         template_text=template,
-        now=now,
+        now=prepare_now,
     )
     if not ok:
         log.info("Pre-send rejected delivery %s: reason=%s", delivery_id, skip_reason)
         return f"pre_send_rejected:{skip_reason}"
 
+    if locked_delivery and locked_delivery.content_version_snapshot != content_version:
+        async with session_maker() as session:
+            refreshed_scenario = await session.scalar(
+                select(EventScenario)
+                .options(selectinload(EventScenario.media))
+                .where(EventScenario.id == event_id)
+            )
+            refreshed_user = await session.get(User, user_id)
+            refreshed_step = await session.get(EventStep, locked_delivery.step_id) if locked_delivery.step_id else None
+        if (
+            not refreshed_scenario
+            or refreshed_scenario.content_version != locked_delivery.content_version_snapshot
+        ):
+            return "pre_send_rejected:delivery_state_changed"
+        scenario = refreshed_scenario
+        user = refreshed_user
+        step = refreshed_step
+        if locked_delivery.message_kind == "scheduled_step":
+            template = step.message_text if step else ""
+        elif locked_delivery.message_kind == "immediate_confirmation":
+            cutoff = scenario.starts_at - timedelta(minutes=15)
+            template = (
+                DEFAULT_ADAPTIVE_CONFIRMATION_TEMPLATE
+                if effective_now >= cutoff
+                else DEFAULT_CONFIRMATION_TEMPLATE
+            )
+        elif locked_delivery.message_kind == "immediate_live":
+            template = DEFAULT_LIVE_TEMPLATE
+        elif locked_delivery.message_kind == "reschedule_notice":
+            template = DEFAULT_RESCHEDULE_TEMPLATE
+        else:
+            template = ""
+        include_event_details = locked_delivery.message_kind != "scheduled_step" or bool(
+            step and step.include_event_details
+        )
+        rendered_text = render_event_message(
+            template,
+            scenario,
+            user,
+            platform=platform,
+            include_event_details=include_event_details,
+            now=effective_now,
+        )
+        expected_content_version = scenario.content_version
+        expected_step_version = step.step_version if step else None
+        content_version = scenario.content_version
+
+    send_started = current_time()
+    if platform == "max" and any(not media.max_token for media in getattr(scenario, "media", ()) or ()):
+        try:
+            if max_client is None:
+                raise EventMediaMaterializationError("MAX transport is required to materialize event media")
+            if bot is not None:
+                await materialize_event_scenario_media(event_id, bot, max_client, session_factory=session_maker)
+            else:
+                await materialize_event_scenario_media_from_telegram(
+                    event_id,
+                    max_client,
+                    session_factory=session_maker,
+                )
+            async with session_maker() as session:
+                scenario = await session.scalar(
+                    select(EventScenario)
+                    .options(selectinload(EventScenario.media))
+                    .where(EventScenario.id == event_id)
+                )
+        except EventMediaMaterializationError as exc:
+            retry_at = send_started + timedelta(seconds=60)
+            await finalize_delivery_outcome(
+                session_maker,
+                delivery_id,
+                claim_token,
+                status="pending",
+                next_attempt_at=retry_at,
+                last_error=f"MAX media materialization failed: {exc}",
+                now=now,
+            )
+            return "pre_transmission_retry"
+    plan = _build_delivery_plan(
+        scenario,
+        event_id,
+        rendered_text,
+        include_media=include_event_details,
+    )
+    if plan:
+        parts = await _ensure_delivery_parts(
+            session_maker,
+            delivery_id,
+            content_version,
+            plan,
+            send_started,
+            claim_token,
+        )
+        if parts is None:
+            return "pre_send_rejected:delivery_state_changed"
+        stale_parts = [
+            part
+            for part in parts
+            if part.status in {"pending", "sending", "uncertain"}
+            and part.content_version != content_version
+        ]
+        if stale_parts:
+            parent_status = "uncertain" if any(part.status in {"sending", "uncertain"} for part in stale_parts) else "skipped"
+            async with session_maker() as session:
+                for stale_part in stale_parts:
+                    stale_status = "uncertain" if stale_part.status in {"sending", "uncertain"} else "skipped"
+                    await session.execute(
+                        update(EventDeliveryPart)
+                        .where(
+                            EventDeliveryPart.id == stale_part.id,
+                            EventDeliveryPart.status == stale_part.status,
+                        )
+                        .values(
+                            status=stale_status,
+                            finished_at=send_started,
+                            claim_token=None,
+                            lease_until=None,
+                            send_started_at=None,
+                            last_error=(
+                                "Part belongs to an older event content version and may have been accepted."
+                                if stale_status == "uncertain"
+                                else "Part belongs to an older event content version."
+                            ),
+                            updated_at=send_started,
+                        )
+                    )
+                await session.commit()
+            finalized = await finalize_delivery_outcome(
+                session_maker,
+                delivery_id,
+                claim_token,
+                status=parent_status,
+                finished_at=send_started,
+                last_error=(
+                    "A part from an older event content version may have been accepted."
+                    if parent_status == "uncertain"
+                    else "Delivery stopped because a part belongs to an older event content version."
+                ),
+                skip_reason="content_changed" if parent_status == "skipped" else None,
+                now=now,
+            )
+            return (
+                "content_version_mismatch"
+                if finalized
+                else "pre_send_rejected:delivery_state_changed"
+            )
+        part_claim_lost = False
+        for part in parts:
+            if part.status in {"sent", "resolved_sent", "skipped", "resolved_skipped"}:
+                continue
+            if part.status == "uncertain":
+                await finalize_delivery_outcome(
+                    session_maker,
+                    delivery_id,
+                    claim_token,
+                    status="uncertain",
+                    finished_at=send_started,
+                    last_error="A delivery part is awaiting administrator resolution.",
+                    now=now,
+                )
+                return "uncertain"
+            part_now = current_time()
+            part_token, claim_rejection = await _claim_delivery_part(
+                session_maker,
+                delivery_id,
+                part.id,
+                claim_token,
+                content_version,
+                part_now,
+            )
+            if not part_token:
+                if claim_rejection:
+                    return f"pre_send_rejected:{claim_rejection}"
+                part_claim_lost = True
+                continue
+            try:
+                payload = json.loads(part.payload_json)
+                external_id = await _send_delivery_part(
+                    payload,
+                    platform=platform,
+                    user_id=user_id,
+                    event_id=event_id,
+                    is_last=part.part_index == len(parts) - 1,
+                    bot=bot,
+                    max_client=max_client,
+                )
+                part_finished = await _finish_delivery_part(
+                    session_maker,
+                    part.id,
+                    part_token,
+                    "sent",
+                    now=current_time(),
+                    external_message_id=external_id,
+                )
+                if not part_finished:
+                    return "pre_send_rejected:part_state_changed"
+            except TelegramForbiddenError as exc:
+                await _finish_delivery_part(session_maker, part.id, part_token, "failed", now=send_started, error=str(exc))
+                await finalize_delivery_outcome(session_maker, delivery_id, claim_token, status="blocked", finished_at=send_started, last_error=str(exc), now=now)
+                return "blocked"
+            except TelegramRetryAfter as exc:
+                retry_at = send_started + timedelta(seconds=getattr(exc, "retry_after", 30))
+                set_telegram_cooldown(retry_at)
+                await _finish_delivery_part(session_maker, part.id, part_token, "pending", now=send_started, error=str(exc), next_attempt_at=retry_at)
+                await finalize_delivery_outcome(session_maker, delivery_id, claim_token, status="pending", next_attempt_at=retry_at, last_error=str(exc), now=now)
+                return "rate_limited"
+            except TelegramBadRequest as exc:
+                await _finish_delivery_part(session_maker, part.id, part_token, "failed", now=send_started, error=str(exc))
+                await finalize_delivery_outcome(session_maker, delivery_id, claim_token, status="failed", finished_at=send_started, last_error=str(exc), now=now)
+                return "failed"
+            except MaxApiError as exc:
+                status_code = getattr(exc, "status", None)
+                error_text = str(exc)
+                if status_code == 429:
+                    retry_at = send_started + timedelta(seconds=30)
+                    set_max_cooldown(retry_at)
+                    await _finish_delivery_part(session_maker, part.id, part_token, "pending", now=send_started, error=error_text, next_attempt_at=retry_at)
+                    await finalize_delivery_outcome(session_maker, delivery_id, claim_token, status="pending", next_attempt_at=retry_at, last_error=error_text, now=now)
+                    return "rate_limited"
+                part_status = "uncertain" if status_code is None or status_code >= 500 else "failed"
+                await _finish_delivery_part(session_maker, part.id, part_token, part_status, now=send_started, error=error_text)
+                parent_status = "uncertain" if part_status == "uncertain" else "failed"
+                await finalize_delivery_outcome(session_maker, delivery_id, claim_token, status=parent_status, finished_at=send_started, last_error=error_text, now=now)
+                return parent_status
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                error_text = f"Timeout after part send initiated: {exc}"
+                await _finish_delivery_part(session_maker, part.id, part_token, "uncertain", now=send_started, error=error_text)
+                await finalize_delivery_outcome(session_maker, delivery_id, claim_token, status="uncertain", finished_at=send_started, last_error=error_text, now=now)
+                return "uncertain"
+            except PreTransmissionError as exc:
+                retry_at = send_started + timedelta(seconds=60)
+                await _finish_delivery_part(session_maker, part.id, part_token, "pending", now=send_started, error=str(exc), next_attempt_at=retry_at)
+                await finalize_delivery_outcome(session_maker, delivery_id, claim_token, status="pending", next_attempt_at=retry_at, last_error=str(exc), now=now)
+                return "pre_transmission_retry"
+            except Exception as exc:
+                error_text = f"Ambiguous network exception: {exc}"
+                await _finish_delivery_part(session_maker, part.id, part_token, "uncertain", now=send_started, error=error_text)
+                await finalize_delivery_outcome(session_maker, delivery_id, claim_token, status="uncertain", finished_at=send_started, last_error=error_text, now=now)
+                return "uncertain"
+
+        if part_claim_lost:
+            finalized = await finalize_delivery_outcome(
+                session_maker,
+                delivery_id,
+                claim_token,
+                status="uncertain",
+                finished_at=send_started,
+                last_error="A delivery part changed state before it could be claimed.",
+                now=now,
+            )
+            return "uncertain" if finalized else "pre_send_rejected:part_state_changed"
+
+        finished_at = now or datetime.utcnow()
+        finalized = await finalize_delivery_outcome(
+            session_maker,
+            delivery_id,
+            claim_token,
+            status="sent",
+            sent_at=finished_at,
+            finished_at=finished_at,
+            now=now,
+        )
+        return "sent" if finalized else "pre_send_rejected:delivery_state_changed"
+
     # Step 3: Network send OUTSIDE database locks
-    send_started = now or datetime.utcnow()
     try:
         if platform == "telegram":
             if bot is None:
@@ -509,7 +1400,7 @@ async def process_single_delivery(
             raise ValueError(f"Unknown platform '{platform}'")
 
         finished_at = now or datetime.utcnow()
-        await finalize_delivery_outcome(
+        finalized = await finalize_delivery_outcome(
             session_maker,
             delivery_id,
             claim_token,
@@ -519,7 +1410,7 @@ async def process_single_delivery(
             external_message_id=external_id,
             now=now,
         )
-        return "sent"
+        return "sent" if finalized else "pre_send_rejected:delivery_state_changed"
 
     except TelegramForbiddenError as exc:
         err_now = now or datetime.utcnow()
@@ -783,12 +1674,14 @@ async def dispatch_immediate_delivery(
     bot: Bot | None = None,
     max_client: MaxApiClient | None = None,
     now: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> str | None:
     """
     Attempts to atomically claim and dispatch a specific pending delivery immediately
     using the durable delivery worker protocol.
     """
-    effective_now = now or datetime.utcnow()
+    max_client = max_client or get_runtime_max_client()
+    effective_now = clock() if clock is not None else (now or datetime.utcnow())
     token = secrets.token_hex(16)
     lease_until = effective_now + timedelta(seconds=60)
 
@@ -845,5 +1738,6 @@ async def dispatch_immediate_delivery(
         bot=bot,
         max_client=max_client,
         now=now,
+        clock=clock,
     )
 

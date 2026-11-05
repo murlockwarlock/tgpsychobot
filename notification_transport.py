@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from aiogram import Bot
@@ -11,6 +12,15 @@ from max_messenger_bot.api import MaxApiError
 from translation_service import translate
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class NotificationDeliveryResult:
+    delivered: bool
+    retryable: bool = True
+    reason: str | None = None
+    status: int | None = None
+    error_code: str | None = None
 
 
 def clean_html_for_max(text: str) -> str:
@@ -28,23 +38,43 @@ def build_subscribe_keyboard(locale: str = "ru") -> InlineKeyboardMarkup:
     ])
 
 
-async def send_notification_transport(
+def build_robokassa_pending_keyboard(locale: str = "ru") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=translate("ui.subscription.check_status", locale, fallback="🔄 Проверить статус"),
+            callback_data="sub_retry_now",
+        )],
+        [InlineKeyboardButton(
+            text=translate("ui.subscription.cancel_retry", locale, fallback="🔄 Отменить и оформить заново"),
+            callback_data="sub_cancel_retry",
+        )],
+        [InlineKeyboardButton(
+            text=translate("ui.subscription.enter_promo", locale, fallback="🎁 Ввести промокод"),
+            callback_data="sub_enter_promo",
+        )],
+    ])
+
+
+async def send_notification_transport_result(
     bot: Bot,
     recipient_id: int,
     text: str,
     keyboard_type: str | None = None,
     parse_mode: str | None = None,
     reply_markup: Any | None = None,
-) -> bool:
+) -> NotificationDeliveryResult:
     """
     Unified TG / MAX notification delivery adapter.
     - If recipient_id < 100_000_000_000: sends via Telegram bot.send_message.
     - If recipient_id >= 100_000_000_000: sends via MaxApiClient.
-    Returns True if successfully delivered, False otherwise.
+    Returns a delivery result. Terminal recipient failures are marked non-retryable.
     Never throws exceptions.
     """
-    if reply_markup is None and keyboard_type == "subscribe":
-        reply_markup = build_subscribe_keyboard()
+    if reply_markup is None:
+        if keyboard_type == "subscribe":
+            reply_markup = build_subscribe_keyboard()
+        elif keyboard_type == "robokassa_pending":
+            reply_markup = build_robokassa_pending_keyboard()
 
     if recipient_id < 100_000_000_000:
         try:
@@ -54,15 +84,23 @@ async def send_notification_transport(
                 parse_mode=parse_mode,
                 reply_markup=reply_markup,
             )
-            return True
+            return NotificationDeliveryResult(delivered=True)
         except Exception as e:
             log.error("Failed to send Telegram notification to %s: %s", recipient_id, e)
-            return False
+            return NotificationDeliveryResult(
+                delivered=False,
+                retryable=True,
+                reason=f"telegram:{type(e).__name__}",
+            )
     else:
         token = os.environ.get("MAX_BOT_TOKEN")
         if not token:
             log.warning("Cannot send MAX message to %s: MAX_BOT_TOKEN not configured in env", recipient_id)
-            return False
+            return NotificationDeliveryResult(
+                delivered=False,
+                retryable=True,
+                reason="max_token_missing",
+            )
         base_url = os.environ.get("MAX_API_BASE", "https://platform-api2.max.ru")
 
         attachments = None
@@ -88,7 +126,7 @@ async def send_notification_transport(
                 max_api_user_id = recipient_id - MAX_ID_OFFSET
                 clean_text = clean_html_for_max(text)
                 await client.send_message(user_id=max_api_user_id, text=clean_text, attachments=attachments)
-                return True
+                return NotificationDeliveryResult(delivered=True)
         except MaxApiError as e:
             if e.is_suspended_recipient:
                 log.warning(
@@ -97,9 +135,45 @@ async def send_notification_transport(
                     e.status,
                     e.error_code,
                 )
+                return NotificationDeliveryResult(
+                    delivered=False,
+                    retryable=False,
+                    reason="max_chat_suspended",
+                    status=e.status,
+                    error_code=e.error_code,
+                )
             else:
                 log.error("Failed to send MAX notification to %s: %s", recipient_id, e, exc_info=e)
-            return False
+            return NotificationDeliveryResult(
+                delivered=False,
+                retryable=True,
+                reason=f"max:{e.error_code or type(e).__name__}",
+                status=e.status,
+                error_code=e.error_code,
+            )
         except Exception as e:
             log.error("Failed to send MAX notification to %s: %s", recipient_id, e, exc_info=e)
-            return False
+            return NotificationDeliveryResult(
+                delivered=False,
+                retryable=True,
+                reason=f"max:{type(e).__name__}",
+            )
+
+
+async def send_notification_transport(
+    bot: Bot,
+    recipient_id: int,
+    text: str,
+    keyboard_type: str | None = None,
+    parse_mode: str | None = None,
+    reply_markup: Any | None = None,
+) -> bool:
+    result = await send_notification_transport_result(
+        bot,
+        recipient_id,
+        text,
+        keyboard_type=keyboard_type,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
+    return result.delivered

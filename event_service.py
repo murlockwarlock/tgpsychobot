@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import html
 import json
 import logging
 import re
@@ -27,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from database import (
     DeepLinkNamespace,
     EventDelivery,
+    EventDeliveryPart,
     EventDeliveryResolution,
     EventRegistration,
     EventScenario,
@@ -34,6 +36,7 @@ from database import (
     User,
 )
 from max_messenger_bot.identity import is_max_user_id
+from admin_html_preview import truncate_html_preview
 from time_helpers import MSK, format_msk, to_msk, utc_now
 from user_metadata import load_metadata_records
 
@@ -188,6 +191,7 @@ async def _reconcile_scheduled_deliveries_for_rejoin(
             d.lease_until = None
             d.claimed_at = None
             d.send_started_at = None
+            d.content_version_snapshot = scenario.content_version
             d.updated_at = effective_now
 
             for extra_d in recoverable[1:]:
@@ -199,6 +203,7 @@ async def _reconcile_scheduled_deliveries_for_rejoin(
                 extra_d.lease_until = None
                 extra_d.claimed_at = None
                 extra_d.send_started_at = None
+                extra_d.content_version_snapshot = scenario.content_version
                 extra_d.updated_at = effective_now
         elif not any(d.retry_index == 0 for d in step_deliveries):
             new_deliv = EventDelivery(
@@ -214,6 +219,7 @@ async def _reconcile_scheduled_deliveries_for_rejoin(
                 schedule_revision=scenario.schedule_revision,
                 registration_generation=reg.generation,
                 platform=target_platform,
+                content_version_snapshot=scenario.content_version,
                 status=target_status,
                 skip_reason=target_skip_reason,
             )
@@ -250,6 +256,7 @@ async def _reconcile_scheduled_deliveries_for_rejoin(
             schedule_revision=scenario.schedule_revision,
             registration_generation=new_gen,
             platform=target_platform,
+            content_version_snapshot=scenario.content_version,
             status="pending",
         )
         session.add(imm)
@@ -269,6 +276,7 @@ async def _reconcile_scheduled_deliveries_for_rejoin(
             schedule_revision=scenario.schedule_revision,
             registration_generation=new_gen,
             platform=target_platform,
+            content_version_snapshot=scenario.content_version,
             status="pending",
         )
         session.add(imm)
@@ -495,12 +503,12 @@ DEFAULT_CONFIRMATION_TEMPLATE = (
 DEFAULT_ADAPTIVE_CONFIRMATION_TEMPLATE = (
     "Вы успешно зарегистрированы на мероприятие «{event_title}»!\n\n"
     "Мероприятие скоро начнётся или уже в эфире!\n"
-    "🔗 Ссылка для подключения: {link}"
+    "{link_or_place_icon} {link_or_place_label}: {link_or_place}"
 )
 
 DEFAULT_LIVE_TEMPLATE = (
     "Мероприятие «{event_title}» скоро начнётся / уже в эфире!\n\n"
-    "🔗 Ваша ссылка для входа: {link}"
+    "{link_or_place_icon} {link_or_place_label}: {link_or_place}"
 )
 
 DEFAULT_RESCHEDULE_TEMPLATE = (
@@ -543,27 +551,96 @@ def render_event_template(
         link_val = ""
 
     place_val = (scenario.place or "").strip()
-    link_or_place_val = (scenario.link or scenario.place or "").strip()
+    link_or_place_val = link_val or place_val
+    link_or_place_icon = "🔗" if link_val else "📍"
+    link_or_place_label = "Ссылка для подключения" if link_val else "Место встречи"
     date_val = format_msk(scenario.starts_at, "%d.%m.%Y")
     time_val = format_msk(scenario.starts_at, "%H:%M")
 
+    description_val = truncate_html_preview(
+        scenario.description or "",
+        max(len(scenario.description or "") + 1, 1),
+        suffix="",
+        allowed_tags={"b", "strong", "i", "em", "s", "strike", "u", "code", "pre", "a", "blockquote", "tg-spoiler"},
+    )
     subs = {
-        "name": user_name,
-        "event_title": scenario.title,
-        "title": scenario.title,
+        "name": html.escape(user_name, quote=False),
+        "event_title": html.escape(scenario.title, quote=False),
+        "title": html.escape(scenario.title, quote=False),
         "event_date": date_val,
         "new_date_msk": date_val,
         "event_time": time_val,
         "new_time_msk": time_val,
-        "link": link_val,
-        "link_or_place": link_or_place_val,
-        "place": place_val,
+        "event_description": description_val,
+        "description": description_val,
+        "link": html.escape(link_val, quote=True),
+        "link_or_place": html.escape(link_or_place_val, quote=True),
+        "link_or_place_icon": link_or_place_icon,
+        "link_or_place_label": link_or_place_label,
+        "place": html.escape(place_val, quote=False),
     }
 
     result = template
     for key, val in subs.items():
         result = result.replace(f"{{{key}}}", val)
     return result
+
+
+def render_event_details(scenario: EventScenario) -> str:
+    """Builds the reusable event details block appended to confirmation/reminder messages."""
+    lines = [
+        f"📅 Дата: {format_msk(scenario.starts_at, '%d.%m.%Y')}",
+        f"⏰ Время: {format_msk(scenario.starts_at, '%H:%M')} (МСК)",
+    ]
+    if scenario.event_type == "webinar" and scenario.link:
+        lines.append(f"🔗 Ссылка: {html.escape(scenario.link, quote=True)}")
+    elif scenario.place:
+        lines.append(f"📍 Место: {html.escape(scenario.place, quote=False)}")
+        if scenario.link:
+            lines.append(f"🔗 Ссылка: {html.escape(scenario.link, quote=True)}")
+    if scenario.description:
+        description = truncate_html_preview(
+            scenario.description,
+            max(len(scenario.description) + 1, 1),
+            suffix="",
+            allowed_tags={"b", "strong", "i", "em", "s", "strike", "u", "code", "pre", "a", "blockquote", "tg-spoiler"},
+        )
+        lines.extend(["", "📝 Описание:", description])
+    return "\n".join(lines)
+
+
+def render_event_message(
+    template: str,
+    scenario: EventScenario,
+    user: User | None = None,
+    platform: str = "telegram",
+    *,
+    include_event_details: bool = False,
+    now: datetime | None = None,
+) -> str:
+    rendered = render_event_template(template, scenario, user, platform=platform, now=now)
+    if include_event_details:
+        detail_lines = render_event_details(scenario).splitlines()
+        description_value = truncate_html_preview(
+            scenario.description or "",
+            max(len(scenario.description or "") + 1, 1),
+            suffix="",
+            allowed_tags={"b", "strong", "i", "em", "s", "strike", "u", "code", "pre", "a", "blockquote", "tg-spoiler"},
+        )
+        if description_value and description_value in rendered and "📝 Описание:" in detail_lines:
+            detail_lines = detail_lines[:detail_lines.index("📝 Описание:")]
+        if "📅 Дата:" in rendered:
+            detail_lines = [line for line in detail_lines if not line.startswith("📅 Дата:")]
+        if "⏰ Время:" in rendered:
+            detail_lines = [line for line in detail_lines if not line.startswith("⏰ Время:")]
+        if scenario.link and (
+            scenario.link in rendered or html.escape(scenario.link, quote=True) in rendered
+        ):
+            detail_lines = [line for line in detail_lines if not line.startswith("🔗 Ссылка:")]
+        details = "\n".join(detail_lines).strip()
+        if details and details not in rendered:
+            rendered = f"{rendered.rstrip()}\n\n{details}" if rendered.strip() else details
+    return rendered
 
 
 @dataclass(frozen=True)
@@ -759,6 +836,7 @@ async def register_user_for_event(
                 schedule_revision=scenario.schedule_revision,
                 registration_generation=1,
                 platform=platform,
+                content_version_snapshot=scenario.content_version,
                 status="pending",
             )
             session.add(imm)
@@ -787,6 +865,7 @@ async def register_user_for_event(
                         schedule_revision=scenario.schedule_revision,
                         registration_generation=1,
                         platform=platform,
+                        content_version_snapshot=scenario.content_version,
                         status=step_status,
                         skip_reason=step_skip_reason,
                     )
@@ -807,6 +886,7 @@ async def register_user_for_event(
                 schedule_revision=scenario.schedule_revision,
                 registration_generation=1,
                 platform=platform,
+                content_version_snapshot=scenario.content_version,
                 status="pending",
             )
             session.add(imm)
@@ -828,6 +908,7 @@ async def register_user_for_event(
                         schedule_revision=scenario.schedule_revision,
                         registration_generation=1,
                         platform=platform,
+                        content_version_snapshot=scenario.content_version,
                         status="skipped",
                         skip_reason="late_mode_suppressed",
                     )
@@ -1168,6 +1249,8 @@ async def reschedule_event(
                                 d.send_started_at = None
                                 d.claimed_at = None
                                 d.updated_at = effective_now
+                        if d.status in ("pending", "claimed"):
+                            d.content_version_snapshot = scenario.content_version
 
                     elif d.step_id is not None:
                         reg = reg_map.get(d.registration_id)
@@ -1193,6 +1276,7 @@ async def reschedule_event(
                         d.lease_until = None
                         d.send_started_at = None
                         d.claimed_at = None
+                        d.content_version_snapshot = scenario.content_version
                         d.updated_at = effective_now
 
             # 5. Create up-to-date notices for each active registration
@@ -1215,6 +1299,7 @@ async def reschedule_event(
                         schedule_revision=new_rev,
                         registration_generation=reg.generation,
                         platform=reg_platform,
+                        content_version_snapshot=scenario.content_version,
                         status="pending",
                     )
                 )
@@ -1237,6 +1322,7 @@ async def reschedule_event(
                             schedule_revision=new_rev,
                             registration_generation=reg.generation,
                             platform=reg_platform,
+                            content_version_snapshot=scenario.content_version,
                             status="pending",
                         )
                     )
@@ -1339,10 +1425,6 @@ async def prepare_and_lock_delivery_for_sending(
             if not scenario or scenario.is_archived:
                 await session.rollback()
                 return False, None, "scenario_archived"
-            if scenario.content_version != expected_content_version:
-                await session.rollback()
-                return False, None, "content_version_mismatch"
-
             # Step 2: Level 4 - EventRegistration FOR SHARE
             reg_stmt = select(EventRegistration).where(EventRegistration.id == reg_id)
             if is_postgres:
@@ -1389,6 +1471,37 @@ async def prepare_and_lock_delivery_for_sending(
                 await session.rollback()
                 return False, None, "not_due_yet"
 
+            if (
+                scenario.content_version != expected_content_version
+                and delivery.content_version_snapshot != scenario.content_version
+            ):
+                delivery.status = "skipped"
+                delivery.skip_reason = "content_changed"
+                delivery.finished_at = current_now
+                delivery.claim_token = None
+                delivery.lease_until = None
+                delivery.claimed_at = None
+                delivery.send_started_at = None
+                delivery.updated_at = current_now
+                await session.execute(
+                    update(EventDeliveryPart)
+                    .where(
+                        EventDeliveryPart.delivery_id == delivery.id,
+                        EventDeliveryPart.status.in_(("pending", "sending")),
+                    )
+                    .values(
+                        status="skipped",
+                        finished_at=current_now,
+                        claim_token=None,
+                        lease_until=None,
+                        send_started_at=None,
+                        last_error="Stopped because event content changed before sending.",
+                        updated_at=current_now,
+                    )
+                )
+                await session.commit()
+                return False, delivery, "content_version_mismatch"
+
             if not scenario.is_active:
                 if delivery.due_at > current_now:
                     delivery.status = "pending"
@@ -1403,8 +1516,32 @@ async def prepare_and_lock_delivery_for_sending(
                 return False, delivery, "scenario_inactive"
 
             if scenario.schedule_revision != delivery.schedule_revision:
-                await session.rollback()
-                return False, None, "schedule_rescheduled"
+                delivery.status = "skipped"
+                delivery.skip_reason = "schedule_rescheduled"
+                delivery.finished_at = current_now
+                delivery.claim_token = None
+                delivery.lease_until = None
+                delivery.claimed_at = None
+                delivery.send_started_at = None
+                delivery.updated_at = current_now
+                await session.execute(
+                    update(EventDeliveryPart)
+                    .where(
+                        EventDeliveryPart.delivery_id == delivery.id,
+                        EventDeliveryPart.status.in_(("pending", "sending")),
+                    )
+                    .values(
+                        status="skipped",
+                        finished_at=current_now,
+                        claim_token=None,
+                        lease_until=None,
+                        send_started_at=None,
+                        last_error="Stopped because event schedule changed before sending.",
+                        updated_at=current_now,
+                    )
+                )
+                await session.commit()
+                return False, delivery, "schedule_rescheduled"
 
             if reg.status != "started" or reg.generation != delivery.registration_generation:
                 delivery.status = "skipped"
@@ -1421,6 +1558,34 @@ async def prepare_and_lock_delivery_for_sending(
                 delivery.lease_until = None
                 await session.commit()
                 return False, delivery, "step_archived"
+
+            if delivery.content_version_snapshot != scenario.content_version:
+                delivery.status = "skipped"
+                delivery.skip_reason = "content_changed"
+                delivery.finished_at = current_now
+                delivery.claim_token = None
+                delivery.lease_until = None
+                delivery.claimed_at = None
+                delivery.send_started_at = None
+                delivery.updated_at = current_now
+                await session.execute(
+                    update(EventDeliveryPart)
+                    .where(
+                        EventDeliveryPart.delivery_id == delivery.id,
+                        EventDeliveryPart.status.in_(("pending", "sending")),
+                    )
+                    .values(
+                        status="skipped",
+                        finished_at=current_now,
+                        claim_token=None,
+                        lease_until=None,
+                        send_started_at=None,
+                        last_error="Stopped because event content changed before sending.",
+                        updated_at=current_now,
+                    )
+                )
+                await session.commit()
+                return False, delivery, "content_version_mismatch"
 
             if delivery.expires_at and delivery.expires_at <= current_now:
                 delivery.status = "skipped"
@@ -1453,6 +1618,7 @@ async def prepare_and_lock_delivery_for_sending(
                     attempt_count=EventDelivery.attempt_count + 1,
                     rendered_text_snapshot=rendered_text,
                     template_text_snapshot=template_text,
+                    content_version_snapshot=scenario.content_version,
                     updated_at=current_now,
                 )
             )
@@ -1567,13 +1733,29 @@ async def handle_event_start_telegram(
 
     if reg_res.status in ("registered", "rejoined"):
         if reg_res.immediate_delivery:
-            from event_delivery_worker import dispatch_immediate_delivery
-            await dispatch_immediate_delivery(
+            from event_delivery_worker import dispatch_immediate_delivery, get_runtime_max_client
+            outcome = await dispatch_immediate_delivery(
                 sm,
                 reg_res.immediate_delivery.id,
                 bot=bot,
+                max_client=get_runtime_max_client(),
                 now=now,
             )
+            if outcome == "pre_transmission_retry":
+                async with sm() as status_session:
+                    failed_delivery = await status_session.get(EventDelivery, reg_res.immediate_delivery.id)
+                warning_text = (
+                    "Регистрация сохранена. Вложения из MAX пока не удалось подготовить для Telegram; "
+                    "мы повторим отправку автоматически."
+                    if failed_delivery and "MAX-origin" in (failed_delivery.last_error or "")
+                    else "Регистрация сохранена. Вложения пока не удалось подготовить; мы повторим отправку автоматически."
+                )
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=warning_text,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
         return True
 
     return False
@@ -1716,12 +1898,21 @@ async def handle_event_start_max(
     if reg_res.status in ("registered", "rejoined"):
         if reg_res.immediate_delivery:
             from event_delivery_worker import dispatch_immediate_delivery
-            await dispatch_immediate_delivery(
+            outcome = await dispatch_immediate_delivery(
                 sm,
                 reg_res.immediate_delivery.id,
                 max_client=client,
                 now=now,
             )
+            if outcome == "pre_transmission_retry":
+                await client.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "Регистрация сохранена. Вложения пока не удалось подготовить; "
+                        "мы повторим отправку автоматически."
+                    ),
+                    attachments=attachments,
+                )
         return True
 
     return False

@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Awaitable, Callable
 
@@ -20,11 +20,18 @@ from database import (
     SubscriptionConfig,
     SubscriptionPlan,
     User,
+    UserSubscription,
+    YookassaRecurringAttempt,
     async_session_maker,
     get_all_admin_ids,
 )
 from notification_renderer import render_outbox_message
-from notification_transport import build_subscribe_keyboard, send_notification_transport
+from notification_transport import (
+    NotificationDeliveryResult,
+    build_robokassa_pending_keyboard,
+    build_subscribe_keyboard,
+    send_notification_transport_result,
+)
 from translation_service import (
     normalize_locale,
     refresh_translation_cache,
@@ -74,6 +81,9 @@ async def _prepare_outbox_payload(
         admin=admin_recipient,
     )
     localized = dict(payload)
+    payload_locale = normalize_locale(localized.get("keyboard_locale"))
+    if payload_locale:
+        locale = payload_locale
     plan_fields = (
         ("plan_id", "plan_name"),
         ("paid_plan_id", "paid_plan_name"),
@@ -102,6 +112,136 @@ async def _prepare_outbox_payload(
                 if translated and source and translated != source:
                     overrides[key] = translated
     return localized, overrides, locale
+
+
+def _normalize_datetime_for_compare(value: datetime) -> datetime:
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _reminder_bucket_for_subscription(end_date: datetime, now: datetime) -> str | None:
+    time_left = _normalize_datetime_for_compare(end_date) - _normalize_datetime_for_compare(now)
+    if timedelta(days=2) <= time_left < timedelta(days=2, hours=1):
+        return "2d"
+    if timedelta(days=1) <= time_left < timedelta(days=1, hours=1):
+        return "1d"
+    if timedelta(hours=2) <= time_left < timedelta(hours=3):
+        return "2h"
+    return None
+
+
+async def _subscription_reminder_is_current(
+    session,
+    recipient_id: int,
+    payload: dict[str, Any],
+    now: datetime,
+) -> tuple[bool, str | None]:
+    snapshot = payload.get("subscription_snapshot")
+    if not isinstance(snapshot, dict):
+        return True, None
+
+    snapshot_id = snapshot.get("id")
+    snapshot_end_date = snapshot.get("end_date")
+    if snapshot_id is None or not isinstance(snapshot_end_date, str):
+        return False, "invalid_snapshot"
+    try:
+        subscription_id = int(snapshot_id)
+        expected_end_date = _normalize_datetime_for_compare(datetime.fromisoformat(snapshot_end_date))
+    except (TypeError, ValueError):
+        return False, "invalid_snapshot"
+
+    subscription = await session.get(UserSubscription, subscription_id)
+    if subscription is None:
+        return False, "subscription_missing"
+    if int(subscription.user_id) != int(recipient_id):
+        return False, "recipient_changed"
+    if _normalize_datetime_for_compare(subscription.end_date) != expected_end_date:
+        return False, "end_date_changed"
+
+    if "plan_id" in snapshot and subscription.plan_id != snapshot.get("plan_id"):
+        return False, "plan_changed"
+    if "payment_provider" in snapshot and subscription.payment_provider != snapshot.get("payment_provider"):
+        return False, "provider_changed"
+    if "pending_robokassa_invoice_id" in snapshot:
+        expected_invoice = snapshot.get("pending_robokassa_invoice_id")
+        actual_invoice = subscription.pending_robokassa_invoice_id
+        if str(actual_invoice) != str(expected_invoice):
+            return False, "pending_invoice_changed"
+
+    bucket = snapshot.get("reminder_bucket")
+    if bucket in {"2d", "1d", "2h"}:
+        if _reminder_bucket_for_subscription(subscription.end_date, now) != bucket:
+            return False, "reminder_window_changed"
+    elif bucket in {"expired", "trial_finished"}:
+        current_end_date = _normalize_datetime_for_compare(subscription.end_date)
+        current_now = _normalize_datetime_for_compare(now)
+        if current_end_date > current_now:
+            return False, "subscription_renewed"
+
+    return True, None
+
+
+async def _payment_attempt_notification_is_current(
+    session,
+    recipient_id: int,
+    payload: dict[str, Any],
+) -> tuple[bool, str | None]:
+    snapshot = payload.get("payment_attempt_snapshot")
+    if not isinstance(snapshot, dict):
+        return True, None
+
+    snapshot_id = snapshot.get("id")
+    if snapshot_id is None:
+        return False, "invalid_snapshot"
+    try:
+        attempt_id = int(snapshot_id)
+    except (TypeError, ValueError):
+        return False, "invalid_snapshot"
+
+    attempt = await session.get(YookassaRecurringAttempt, attempt_id)
+    if attempt is None:
+        return False, "attempt_missing"
+    try:
+        recipient_key = int(recipient_id)
+        attempt_user_id = int(attempt.user_id)
+    except (TypeError, ValueError):
+        return False, "invalid_snapshot"
+    if attempt_user_id != recipient_key:
+        return False, "recipient_changed"
+
+    expected_subscription_id = snapshot.get("subscription_id")
+    if expected_subscription_id is not None:
+        try:
+            if int(attempt.subscription_id) != int(expected_subscription_id):
+                return False, "subscription_changed"
+        except (TypeError, ValueError):
+            return False, "invalid_snapshot"
+    expected_user_id = snapshot.get("user_id")
+    if expected_user_id is not None:
+        try:
+            if attempt_user_id != int(expected_user_id):
+                return False, "user_changed"
+        except (TypeError, ValueError):
+            return False, "invalid_snapshot"
+    if "idempotency_key" in snapshot and attempt.idempotency_key != snapshot.get("idempotency_key"):
+        return False, "idempotency_key_changed"
+    if "status" in snapshot and attempt.status != snapshot.get("status"):
+        return False, "status_changed"
+    if "payment_id" in snapshot and attempt.payment_id != snapshot.get("payment_id"):
+        return False, "payment_id_changed"
+
+    return True, None
+
+
+def _mark_subscription_reminder_cancelled(reason: str, now: datetime) -> dict[str, Any]:
+    return {
+        "status": "cancelled",
+        "claim_token": None,
+        "lease_until": None,
+        "last_error": f"subscription_reminder_stale:{reason}",
+        "updated_at": now,
+    }
 
 
 def get_outbox_backoff(attempt_num: int) -> timedelta:
@@ -198,7 +338,7 @@ async def enqueue_outbox_event(
 async def dispatch_outbox_by_key(
     bot: Bot,
     unique_key: str,
-    deliver_func: Callable[..., Awaitable[bool]] = send_notification_transport,
+    deliver_func: Callable[..., Awaitable[bool | NotificationDeliveryResult]] = send_notification_transport_result,
     session_maker: Any | None = None,
 ) -> bool:
     """
@@ -259,6 +399,38 @@ async def dispatch_outbox_by_key(
                 return False
 
             payload = json.loads(row.event_payload_json)
+            if row.event_type == "subscription_reminder":
+                is_current, stale_reason = await _subscription_reminder_is_current(
+                    session,
+                    row.recipient_id,
+                    payload,
+                    datetime.utcnow(),
+                )
+                if is_current:
+                    is_current, stale_reason = await _payment_attempt_notification_is_current(
+                        session,
+                        row.recipient_id,
+                        payload,
+                    )
+                if not is_current:
+                    now_cancelled = datetime.utcnow()
+                    await session.execute(
+                        update(PaymentNotificationOutbox)
+                        .where(
+                            PaymentNotificationOutbox.id == row.id,
+                            PaymentNotificationOutbox.claim_token == token,
+                        )
+                        .values(**_mark_subscription_reminder_cancelled(stale_reason or "stale", now_cancelled))
+                    )
+                    await session.commit()
+                    log.info(
+                        "OUTBOX_SUBSCRIPTION_REMINDER_CANCELLED | key=%s | recipient=%s | reason=%s",
+                        row.unique_key,
+                        row.recipient_id,
+                        stale_reason or "stale",
+                    )
+                    return False
+
             payload, text_overrides, locale = await _prepare_outbox_payload(
                 session,
                 row.recipient_id,
@@ -273,12 +445,14 @@ async def dispatch_outbox_by_key(
             reply_markup = (
                 build_subscribe_keyboard(locale)
                 if keyboard_type == "subscribe"
+                else build_robokassa_pending_keyboard(locale)
+                if keyboard_type == "robokassa_pending"
                 else None
             )
 
             is_timeout = False
             try:
-                delivered = await asyncio.wait_for(
+                delivery_result = await asyncio.wait_for(
                     deliver_func(
                         bot,
                         row.recipient_id,
@@ -289,9 +463,19 @@ async def dispatch_outbox_by_key(
                     ),
                     timeout=OUTBOX_DELIVERY_TIMEOUT_SECONDS,
                 )
+                if isinstance(delivery_result, NotificationDeliveryResult):
+                    delivered = delivery_result.delivered
+                    retryable = delivery_result.retryable
+                    failure_reason = delivery_result.reason
+                else:
+                    delivered = bool(delivery_result)
+                    retryable = True
+                    failure_reason = None
             except asyncio.TimeoutError:
                 delivered = False
                 is_timeout = True
+                retryable = True
+                failure_reason = "transport_delivery_timeout"
                 log.warning(
                     "OUTBOX_DELIVERY_TIMEOUT | key=%s | recipient=%s | timeout=%ss",
                     row.unique_key,
@@ -300,6 +484,8 @@ async def dispatch_outbox_by_key(
                 )
             except Exception as e:
                 delivered = False
+                retryable = True
+                failure_reason = f"{type(e).__name__}:{e}"
                 log.warning(
                     "OUTBOX_DELIVERY_EXCEPTION | key=%s | recipient=%s | err=%s",
                     row.unique_key,
@@ -325,8 +511,15 @@ async def dispatch_outbox_by_key(
                 return True
             else:
                 backoff = get_outbox_backoff(row.attempts)
-                new_status = "failed_terminal" if row.attempts >= row.max_attempts else "pending"
-                last_err = "transport_delivery_timeout" if is_timeout else "transport_delivery_failed"
+                new_status = (
+                    "failed_terminal"
+                    if not retryable or row.attempts >= row.max_attempts
+                    else "pending"
+                )
+                if not retryable:
+                    last_err = failure_reason or "transport_delivery_terminal"
+                else:
+                    last_err = "transport_delivery_timeout" if is_timeout else "transport_delivery_failed"
                 await session.execute(
                     update(PaymentNotificationOutbox)
                     .where(PaymentNotificationOutbox.id == row.id, PaymentNotificationOutbox.claim_token == token)
@@ -351,10 +544,11 @@ async def dispatch_outbox_by_key(
                     await _send_admin_terminal_failure_alert(bot, row)
                 else:
                     log.warning(
-                        "OUTBOX_DELIVERY_RETRY_SCHEDULED | key=%s | attempts=%s | next_retry=%s",
+                        "OUTBOX_DELIVERY_RETRY_SCHEDULED | key=%s | attempts=%s | next_retry=%s | reason=%s",
                         row.unique_key,
                         row.attempts,
                         now_done + backoff,
+                        failure_reason or last_err,
                     )
                 return False
     except Exception as e:
@@ -364,7 +558,7 @@ async def dispatch_outbox_by_key(
 
 async def process_payment_notification_outbox(
     bot: Bot,
-    deliver_func: Callable[..., Awaitable[bool]] = send_notification_transport,
+    deliver_func: Callable[..., Awaitable[bool | NotificationDeliveryResult]] = send_notification_transport_result,
     batch_size: int = 50,
     session_maker: Any | None = None,
 ) -> int:

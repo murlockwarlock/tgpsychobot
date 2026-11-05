@@ -36,7 +36,7 @@ from telegram_client import create_telegram_bot
 from automation_events import process_pending_events
 from followups import FollowupActivityMiddleware, process_due_followups
 from followups import FollowupTransportRegistry
-from event_delivery_worker import run_event_delivery_worker_cycle
+from event_delivery_worker import run_event_delivery_worker_cycle, set_runtime_max_client
 from max_messenger_bot.api import MaxApiClient
 from max_messenger_bot.settings import get_settings as get_max_settings
 from translation_service import refresh_translation_cache
@@ -266,6 +266,7 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
         max_followup_client = MaxApiClient(max_token, max_settings.max_api_base)
         await max_followup_client.__aenter__()
         dispatcher["_followup_max_client"] = max_followup_client
+    set_runtime_max_client(max_followup_client)
     scheduler = setup_scheduler(
         bot=bot,
         session_maker=async_session_maker,
@@ -358,6 +359,7 @@ async def on_shutdown(bot: Bot, dispatcher: Dispatcher):
         scheduler.shutdown(wait=False)
 
     max_followup_client = dispatcher.get("_followup_max_client")
+    set_runtime_max_client(None)
     if max_followup_client is not None:
         with suppress(Exception):
             await max_followup_client.__aexit__(None, None, None)

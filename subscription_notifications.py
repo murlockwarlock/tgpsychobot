@@ -4,12 +4,26 @@ TRIAL_BONUS_PAYMENT_PROVIDERS = frozenset({
     "Trial Referral Pay Bonus",
 })
 
+TRIAL_EXPIRING_PAYMENT_PROVIDERS = frozenset({
+    "Trial Promo",
+    "Trial Welcome",
+    *TRIAL_BONUS_PAYMENT_PROVIDERS,
+})
+
 
 def is_trial_bonus_subscription(subscription) -> bool:
     return bool(
         subscription
         and getattr(subscription, "plan_id", None) is None
         and getattr(subscription, "payment_provider", None) in TRIAL_BONUS_PAYMENT_PROVIDERS
+    )
+
+
+def is_trial_expiring_subscription(subscription) -> bool:
+    return bool(
+        subscription
+        and getattr(subscription, "plan_id", None) is None
+        and getattr(subscription, "payment_provider", None) in TRIAL_EXPIRING_PAYMENT_PROVIDERS
     )
 
 

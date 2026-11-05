@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup
-from database import (async_session_maker, BotGeneralConfig, UserSubscription, SubscriptionPlan, SubscriptionConfig, User,
+from database import (async_session_maker, BotGeneralConfig, PaymentNotificationOutbox, UserSubscription, SubscriptionPlan, SubscriptionConfig, User,
                       RobokassaPayment, PromoCode, YookassaPayment, AIConfig, get_all_admin_ids,
                       YookassaRecurringAttempt)
 from ai_integration import get_kie_remaining_credits, AIServiceError
@@ -24,6 +24,7 @@ from uuid import uuid4
 import html
 import os
 import json
+from typing import Any
 from config import OWNER_IDS
 import keyboards as kb
 import aiohttp
@@ -34,7 +35,11 @@ import xml.etree.ElementTree as ET
 from urllib.parse import urlencode
 from alert_cooldown import AlertCooldown
 from birthday_mailings import process_birthday_mailings
-from subscription_notifications import is_trial_bonus_subscription, should_send_upcoming_charge_notification
+from subscription_notifications import (
+    is_trial_bonus_subscription,
+    is_trial_expiring_subscription,
+    should_send_upcoming_charge_notification,
+)
 from subscription_retry_policy import can_retry_now, get_next_retry_at
 from error_reporting import notify_admins_about_error, sanitize_secret_values
 from robokassa_signing import build_robokassa_recurring_params, format_robokassa_amount
@@ -255,6 +260,54 @@ def _was_recent_notification_logged(recipient_id: int, key: str, now: datetime, 
     return False
 
 
+def _subscription_notification_snapshot(
+    sub: UserSubscription,
+    reminder_bucket: str,
+    *,
+    pending_robokassa_invoice_id: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": sub.id,
+        "user_id": sub.user_id,
+        "end_date": sub.end_date.isoformat(),
+        "plan_id": sub.plan_id,
+        "payment_provider": sub.payment_provider,
+        "pending_robokassa_invoice_id": (
+            sub.pending_robokassa_invoice_id
+            if pending_robokassa_invoice_id is None
+            else pending_robokassa_invoice_id
+        ),
+        "reminder_bucket": reminder_bucket,
+    }
+
+
+def _subscription_reminder_key(
+    sub: UserSubscription,
+    reminder_kind: str,
+    plan_marker: str | int,
+    reminder_bucket: str,
+) -> str:
+    return (
+        f"{reminder_kind}:{sub.id}:{plan_marker}:"
+        f"{sub.end_date.isoformat()}:{reminder_bucket}"
+    )
+
+
+def _yookassa_attempt_notification_snapshot(
+    attempt: YookassaRecurringAttempt,
+    notification_kind: str,
+) -> dict[str, Any]:
+    return {
+        "id": attempt.id,
+        "subscription_id": attempt.subscription_id,
+        "user_id": attempt.user_id,
+        "idempotency_key": attempt.idempotency_key,
+        "status": attempt.status,
+        "payment_id": attempt.payment_id,
+        "notification_kind": notification_kind,
+    }
+
+
 async def _send_deduplicated_notification(
         bot: Bot,
         recipient_id: int,
@@ -265,9 +318,15 @@ async def _send_deduplicated_notification(
         reply_markup=None,
         window: timedelta = EXPIRATION_DEDUP_WINDOW,
         logger=None,
+        keyboard_type: str | None = None,
+        keyboard_locale: str | None = None,
+        subscription_snapshot: dict[str, Any] | None = None,
+        payment_attempt_snapshot: dict[str, Any] | None = None,
 ) -> bool:
+    target_logger = logger or plog
     if _was_recent_notification_logged(recipient_id, key, now, window):
         return False
+    resolved_keyboard_locale = keyboard_locale
     if reply_markup and any(
         getattr(button, "callback_data", None) == "show_subscription_info_from_chat"
         for row in getattr(reply_markup, "inline_keyboard", ())
@@ -279,14 +338,85 @@ async def _send_deduplicated_notification(
                 recipient_id,
                 platform="max" if recipient_id >= 100_000_000_000 else "telegram",
             )
+        resolved_keyboard_locale = locale
         reply_markup = build_subscribe_keyboard(locale)
-    delivered = await send_notification_transport(bot, recipient_id, text, reply_markup=reply_markup)
-    target_logger = logger or plog
-    if delivered:
-        target_logger.info(f"NOTIFY_SENT | recipient_id={recipient_id} | key={key}")
-        return True
-    else:
-        target_logger.warning(f"NOTIFY_FAILED | recipient_id={recipient_id} | key={key}")
+
+    if reply_markup and not resolved_keyboard_locale and keyboard_type:
+        async with async_session_maker() as session:
+            resolved_keyboard_locale = await resolve_user_effective_locale(
+                session,
+                recipient_id,
+                platform="max" if recipient_id >= 100_000_000_000 else "telegram",
+            )
+
+    raw_key = f"scheduler:notification:{recipient_id}:{key}"
+    if len(raw_key) > 255:
+        raw_key = f"scheduler:notification:{recipient_id}:{hashlib.sha256(raw_key.encode('utf-8')).hexdigest()}"
+    payload = {
+        "text": text,
+        "parse_mode": None,
+        "keyboard_type": keyboard_type or ("subscribe" if reply_markup else None),
+        "keyboard_locale": resolved_keyboard_locale,
+    }
+    if subscription_snapshot is not None:
+        payload["subscription_snapshot"] = subscription_snapshot
+    if payment_attempt_snapshot is not None:
+        payload["payment_attempt_snapshot"] = payment_attempt_snapshot
+
+    try:
+        async with async_session_maker() as session:
+            row = await session.scalar(
+                select(PaymentNotificationOutbox)
+                .where(PaymentNotificationOutbox.unique_key == raw_key)
+            )
+            if row is not None:
+                if row.status in {"delivered", "failed_terminal", "cancelled"}:
+                    return False
+                if row.status == "pending" and row.next_retry_at and row.next_retry_at > now:
+                    return False
+                if row.status == "processing" and row.lease_until and row.lease_until > now:
+                    return False
+            else:
+                await enqueue_outbox_event(
+                    session,
+                    raw_key,
+                    "scheduler",
+                    recipient_id,
+                    "subscription_reminder",
+                    payload,
+                )
+                await session.commit()
+
+        delivered = await dispatch_outbox_by_key(bot, raw_key)
+
+        async with async_session_maker() as session:
+            row = await session.scalar(
+                select(PaymentNotificationOutbox)
+                .where(PaymentNotificationOutbox.unique_key == raw_key)
+            )
+        if row is not None and row.status == "delivered":
+            target_logger.info(f"NOTIFY_SENT | recipient_id={recipient_id} | key={key}")
+            return True
+        if row is not None and row.status == "failed_terminal":
+            target_logger.warning(
+                f"NOTIFY_TERMINAL | recipient_id={recipient_id} | key={key} | reason={row.last_error or 'terminal'}"
+            )
+        elif row is not None and row.status == "pending":
+            target_logger.warning(
+                f"NOTIFY_FAILED | recipient_id={recipient_id} | key={key} | "
+                f"attempt={row.attempts} | retry_at={row.next_retry_at.isoformat() if row.next_retry_at else 'unknown'}"
+            )
+        return False
+    except Exception as exc:
+        target_logger.error(
+            "Notification state unavailable for recipient_id=%s key=%s: %s",
+            recipient_id,
+            key,
+            exc,
+        )
+        target_logger.warning(
+            f"NOTIFY_FAILED | recipient_id={recipient_id} | key={key} | reason=state_unavailable"
+        )
         return False
 
 
@@ -871,7 +1001,7 @@ async def check_subscriptions(bot: Bot):
                 user_ref += f" [id=<code>{sub.user_id}</code>]"
 
                 message_text = None
-                is_trial_promo = sub.plan_id is None and sub.payment_provider in ['Trial Promo', 'Trial Welcome']
+                is_trial_promo = is_trial_expiring_subscription(sub)
                 time_left = sub.end_date - now
 
                 two_day_window_start = timedelta(days=2)
@@ -985,7 +1115,12 @@ async def check_subscriptions(bot: Bot):
                         reply_markup = user_subscribe_kb if is_trial_promo else None
                         plan_marker = sub.plan.id if sub.plan else "trial"
                         reminder_kind = "trial_reminder" if is_trial_promo else "renewal_reminder"
-                        reminder_key = f"{reminder_kind}:{sub.id}:{plan_marker}:{reminder_bucket}"
+                        reminder_key = _subscription_reminder_key(
+                            sub,
+                            reminder_kind,
+                            plan_marker,
+                            reminder_bucket,
+                        )
                         await _send_deduplicated_notification(
                             bot,
                             sub.user_id,
@@ -994,6 +1129,7 @@ async def check_subscriptions(bot: Bot):
                             now,
                             reply_markup=reply_markup,
                             window=timedelta(hours=3),
+                            subscription_snapshot=_subscription_notification_snapshot(sub, reminder_bucket),
                         )
                     except Exception:
                         pass
@@ -1015,10 +1151,16 @@ async def check_subscriptions(bot: Bot):
                                             "Пробный период завершен. Выберите тариф для продолжения.",
                                             {},
                                         ),
-                                        f"trial_finished:{sub.id}",
+                                        _subscription_reminder_key(
+                                            sub,
+                                            "trial_finished",
+                                            sub.plan.id if sub.plan else "trial",
+                                            "finished",
+                                        ),
                                         now,
                                         reply_markup=user_subscribe_kb,
                                         window=timedelta(hours=6),
+                                        subscription_snapshot=_subscription_notification_snapshot(sub, "trial_finished"),
                                     )
                                 except Exception:
                                     pass
@@ -1029,7 +1171,12 @@ async def check_subscriptions(bot: Bot):
                             plan_name_exp = sub.plan.name if sub.plan else (sub.payment_provider or "Trial")
                             if not _was_recent_notification_logged(
                                     sub.user_id,
-                                    f"expired:{sub.id}:{plan_name_exp}",
+                                    _subscription_reminder_key(
+                                        sub,
+                                        "expired",
+                                        sub.plan.id if sub.plan else "trial",
+                                        "expired",
+                                    ),
                                     now,
                                     EXPIRATION_DEDUP_WINDOW,
                             ):
@@ -1045,9 +1192,15 @@ async def check_subscriptions(bot: Bot):
                                             "Подписка истекла. Продлите её в меню.",
                                             {},
                                         ),
-                                        f"expired:{sub.id}:{plan_name_exp}",
+                                        _subscription_reminder_key(
+                                            sub,
+                                            "expired",
+                                            sub.plan.id if sub.plan else "trial",
+                                            "expired",
+                                        ),
                                         now,
                                         reply_markup=user_subscribe_kb,
+                                        subscription_snapshot=_subscription_notification_snapshot(sub, "expired"),
                                     )
                                 except Exception:
                                     pass
@@ -1512,6 +1665,14 @@ async def check_subscriptions(bot: Bot):
                                 now,
                                 reply_markup=user_subscribe_kb,
                                 window=timedelta(days=1),
+                                subscription_snapshot=_subscription_notification_snapshot(
+                                    sub,
+                                    "yookassa_pending",
+                                ),
+                                payment_attempt_snapshot=_yookassa_attempt_notification_snapshot(
+                                    att,
+                                    "pending",
+                                ),
                             )
                             if config and config.notifications_enabled:
                                 for admin_id in all_admin_ids:
@@ -1541,6 +1702,14 @@ async def check_subscriptions(bot: Bot):
                                 now,
                                 reply_markup=user_subscribe_kb,
                                 window=timedelta(days=1),
+                                subscription_snapshot=_subscription_notification_snapshot(
+                                    sub,
+                                    "yookassa_unknown",
+                                ),
+                                payment_attempt_snapshot=_yookassa_attempt_notification_snapshot(
+                                    att,
+                                    "unknown",
+                                ),
                             )
 
                         elif res.outcome in ('provider_error', 'rate_limit'):
@@ -1561,6 +1730,14 @@ async def check_subscriptions(bot: Bot):
                                 now,
                                 reply_markup=user_subscribe_kb,
                                 window=timedelta(days=1),
+                                subscription_snapshot=_subscription_notification_snapshot(
+                                    sub,
+                                    "yookassa_provider_error",
+                                ),
+                                payment_attempt_snapshot=_yookassa_attempt_notification_snapshot(
+                                    att,
+                                    "unknown",
+                                ),
                             )
 
                         else:  # declined or limit_exceeded
@@ -1686,6 +1863,13 @@ async def check_subscriptions(bot: Bot):
                                     now,
                                     reply_markup=kb.subscription_pending_keyboard(user_locale),
                                     window=timedelta(days=1),
+                                    keyboard_type="robokassa_pending",
+                                    keyboard_locale=user_locale,
+                                    subscription_snapshot=_subscription_notification_snapshot(
+                                        sub,
+                                        "robokassa_pending",
+                                        pending_robokassa_invoice_id=new_payment.id,
+                                    ),
                                 )
                             except Exception:
                                 pass

@@ -12,6 +12,13 @@ def _render_outbox_message_ru(
     Renders user notification text, parse_mode, and keyboard_type from an immutable event snapshot.
     Returns: (text, parse_mode, keyboard_type)
     """
+    if event_type == "subscription_reminder":
+        return (
+            str(payload.get("text", "")),
+            payload.get("parse_mode"),
+            payload.get("keyboard_type"),
+        )
+
     if event_type == "purchase_success":
         provider = payload.get("provider", "Yookassa")
         if provider == "Robokassa" and "end_date_msk" in payload:

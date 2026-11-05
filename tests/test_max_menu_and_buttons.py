@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import os
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 os.environ.setdefault("BOT_TOKEN", "test")
@@ -14,14 +17,23 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 import database
 import handlers
 import keyboards as tg_kb
-from database import Base, Content, Topic, User
+from database import (
+    Base,
+    Content,
+    SubscriptionBenefitGrant,
+    SubscriptionConfig,
+    SubscriptionPlan,
+    Topic,
+    User,
+    UserSubscription,
+)
 import max_messenger_bot.legacy as max_legacy
 import max_messenger_bot.storage as max_storage
 from max_messenger_bot import app as max_app
 from max_messenger_bot.services import settings as max_settings
 from max_messenger_bot.app import MaxBotApplication
 from max_messenger_bot.keyboards import inline_keyboard, main_menu_row
-from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
+from max_messenger_bot.models import MAX_ID_OFFSET, IncomingCallback, IncomingMessage, Sender
 from max_messenger_bot.services import common as max_common
 from max_messenger_bot.services import topics as max_topics
 from max_messenger_bot.services import subscriptions as max_subscriptions
@@ -29,6 +41,7 @@ from max_messenger_bot.services import admin_content as max_admin_content
 from max_messenger_bot.services import admin as max_admin
 from max_messenger_bot.keyboards import admin_panel_keyboard as max_admin_panel_keyboard
 from max_messenger_bot.storage import MaxContentMedia, StorageBase
+from max_messenger_bot.time_utils import utc_now
 from response_buttons import ResponseButton, extract_response_buttons
 
 
@@ -185,6 +198,317 @@ async def test_max_start_welcome_with_parsed_buttons_no_dynamic_menu(db_session)
     # start_message does NOT auto-append "⬅️ В меню"
     button_texts = [b["text"] for row in buttons for b in row]
     assert "⬅️ В меню" not in button_texts
+
+
+@pytest.mark.asyncio
+async def test_max_referral_registration_accumulates_welcome_and_referral_days(db_session):
+    referrer_id = MAX_ID_OFFSET + 42
+    new_user_id = MAX_ID_OFFSET + 99
+    async with db_session() as session:
+        session.add_all([
+            SubscriptionConfig(
+                id=1,
+                subscriptions_enabled=True,
+                welcome_bonus_days=3,
+                referral_enabled=True,
+                referral_bonus_days_referral=1,
+                referral_bonus_days_referrer=1,
+            ),
+            User(id=referrer_id, first_name="Referrer", name="Referrer"),
+            User(id=new_user_id, first_name="New"),
+            Content(key="start_message", text_content="Добро пожаловать!", is_visible=True),
+        ])
+        await session.commit()
+
+    before = utc_now()
+    mock_client = SimpleNamespace(send_message=AsyncMock())
+    await max_common.show_start_screen(
+        mock_client,
+        chat_id=99,
+        user_id=new_user_id,
+        start_payload="ref_42",
+    )
+
+    async with db_session() as session:
+        subscription = await session.scalar(select(UserSubscription).where(UserSubscription.user_id == new_user_id))
+        grants = (
+            await session.execute(
+                select(SubscriptionBenefitGrant.grant_type, SubscriptionBenefitGrant.days)
+                .where(SubscriptionBenefitGrant.beneficiary_user_id == new_user_id)
+                .order_by(SubscriptionBenefitGrant.id)
+            )
+        ).all()
+
+    assert subscription is not None
+    assert timedelta(days=3, hours=23) < subscription.end_date - before < timedelta(days=4, seconds=2)
+    assert [(grant_type, days) for grant_type, days in grants] == [
+        ("registration_referee", 1),
+        ("welcome", 3),
+    ]
+    sent_text = "\n".join(call.kwargs.get("text", "") for call in mock_client.send_message.await_args_list)
+    assert "1 бонусных дн." in sent_text
+    assert "Всего начислено 4 бонусных дн." in sent_text
+
+
+def _max_callback_from_call(call, text_fragment: str) -> str:
+    fragment = text_fragment.lower()
+    for attachment in call.kwargs.get("attachments") or []:
+        payload = attachment.get("payload") or {}
+        for row in payload.get("buttons") or []:
+            for button in row:
+                if fragment in str(button.get("text", "")).lower() and button.get("payload"):
+                    return button["payload"]
+    raise AssertionError(f"No MAX callback with text containing {text_fragment!r}")
+
+
+@pytest.mark.asyncio
+async def test_max_robokassa_actions_follow_real_application_callbacks(db_session, monkeypatch):
+    import scheduler
+
+    base_id = 1000
+    user_ids = [MAX_ID_OFFSET + base_id + offset for offset in range(3)]
+    plan_id = 9100
+    now = datetime.utcnow()
+    async with db_session() as session:
+        session.add(
+            SubscriptionConfig(
+                id=1,
+                subscriptions_enabled=True,
+                referral_enabled=False,
+                robokassa_merchant_login="merchant",
+                robokassa_password_1="password-1",
+                robokassa_password_2="password-2",
+            )
+        )
+        session.add(
+            Content(
+                key="menu",
+                text_content="Главное меню MAX\n[Подписка](btn:svc:subscription)",
+                is_visible=True,
+            )
+        )
+        session.add(
+            SubscriptionPlan(
+                id=plan_id,
+                name="Robokassa journey plan",
+                price=500.0,
+                duration_value=1,
+                duration_unit="months",
+                is_active=True,
+            )
+        )
+        for user_id in user_ids:
+            session.add(User(id=user_id, first_name="MAX journey", name="MAX journey"))
+            session.add(
+                UserSubscription(
+                    id=user_id - MAX_ID_OFFSET,
+                    user_id=user_id,
+                    plan_id=plan_id,
+                    start_date=now - timedelta(days=31),
+                    end_date=now - timedelta(hours=2),
+                    auto_renewal=True,
+                    payment_provider="Robokassa",
+                    payment_method_id=f"pm-{user_id}",
+                    pending_robokassa_invoice_id=base_id + (user_id - user_ids[0]) + 1,
+                    payment_attempt_count=1,
+                    last_payment_attempt=now - timedelta(hours=4),
+                )
+            )
+        await session.commit()
+
+    client = SimpleNamespace(
+        send_message=AsyncMock(),
+        answer_callback=AsyncMock(),
+        get_me=AsyncMock(return_value={"username": "journey_bot"}),
+    )
+    app = MaxBotApplication(client=client)
+
+    def callback(user_id: int, payload: str, suffix: str) -> IncomingCallback:
+        return IncomingCallback(
+            raw={},
+            callback_id=f"robokassa-{suffix}",
+            payload=payload,
+            chat_id=user_id,
+            message_id=f"message-{suffix}",
+            sender=Sender(
+                user_id=user_id,
+                username="max_journey",
+                first_name="MAX journey",
+                last_name=None,
+            ),
+        )
+
+    cancel_user = user_ids[0]
+    await app.handle_callback(callback(cancel_user, "sub_info", "cancel-screen"))
+    cancel_screen = client.send_message.await_args_list[-1]
+    cancel_payload = _max_callback_from_call(cancel_screen, "оформить заново")
+    await app.handle_callback(callback(cancel_user, cancel_payload, "cancel"))
+    async with db_session() as session:
+        cancelled_sub = await session.scalar(select(UserSubscription).where(UserSubscription.user_id == cancel_user))
+    assert cancelled_sub.auto_renewal is False
+    assert any("Автопродление отключено" in call.kwargs.get("text", "") for call in client.send_message.await_args_list)
+    assert any(call.kwargs.get("attachments") for call in client.send_message.await_args_list)
+
+    promo_user = user_ids[1]
+    await app.handle_callback(callback(promo_user, "sub_info", "promo-screen"))
+    promo_screen = client.send_message.await_args_list[-1]
+    promo_payload = _max_callback_from_call(promo_screen, "промокод")
+    await app.handle_callback(callback(promo_user, promo_payload, "promo"))
+    promo_state = await app.states.get(promo_user)
+    assert promo_state is not None
+    assert promo_state.state == "awaiting_promo_code"
+    assert "Введите промокод" in client.send_message.await_args_list[-1].kwargs["text"]
+    promo_prompt = client.send_message.await_args_list[-1]
+    menu_payload = _max_callback_from_call(promo_prompt, "в меню")
+    await app.handle_callback(callback(promo_user, menu_payload, "promo-return"))
+    assert await app.states.get(promo_user) is None
+    menu_call = client.send_message.await_args_list[-1]
+    assert menu_call.kwargs["text"] == "Главное меню MAX"
+    assert _max_callback_from_call(menu_call, "подписка") == "ai_btn:svc:subscription"
+
+    promo_handler = AsyncMock()
+    dialogue = AsyncMock()
+    monkeypatch.setattr(max_app.subscriptions_service, "apply_promo_code", promo_handler)
+    monkeypatch.setattr(max_app.common, "maybe_require_disclaimer", AsyncMock(return_value=False))
+    monkeypatch.setattr(max_app.common, "ensure_access_before_chat", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_app.common, "run_ai_dialogue", dialogue)
+    await app.handle_message(
+        IncomingMessage(
+            raw={},
+            message_id="promo-normal-message",
+            chat_id=promo_user,
+            sender=Sender(
+                user_id=promo_user,
+                username="max_journey",
+                first_name="MAX journey",
+                last_name=None,
+            ),
+            text="Обычный вопрос после меню",
+        )
+    )
+    pending_tasks = tuple(app.background_tasks)
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks)
+    promo_handler.assert_not_awaited()
+    dialogue.assert_awaited_once()
+    assert dialogue.await_args.args[3] == "Обычный вопрос после меню"
+
+    retry_user = user_ids[2]
+    monkeypatch.setattr(scheduler, "process_recurring_robokassa_payment", AsyncMock(return_value="provider_error"))
+    await app.handle_callback(callback(retry_user, "sub_info", "retry-screen"))
+    retry_screen = client.send_message.await_args_list[-1]
+    retry_payload = _max_callback_from_call(retry_screen, "списать сейчас")
+    answers_before_retry = client.answer_callback.await_count
+    await app.handle_callback(callback(retry_user, retry_payload, "retry"))
+    assert "Robokassa временно недоступен" in client.send_message.await_args_list[-1].kwargs["text"]
+    assert client.answer_callback.await_count == answers_before_retry + 1
+
+
+@pytest.mark.asyncio
+async def test_max_referral_registration_reaches_trial_reminder_max_api(db_session, monkeypatch):
+    import notification_outbox
+    import scheduler
+
+    monkeypatch.setattr(scheduler, "async_session_maker", db_session)
+    monkeypatch.setattr(notification_outbox, "async_session_maker", db_session)
+
+    referrer_id = MAX_ID_OFFSET + 142
+    new_user_id = MAX_ID_OFFSET + 199
+    async with db_session() as session:
+        session.add_all([
+            SubscriptionConfig(
+                id=1,
+                subscriptions_enabled=True,
+                welcome_bonus_days=3,
+                referral_enabled=True,
+                referral_bonus_days_referral=1,
+                referral_bonus_days_referrer=1,
+            ),
+            User(id=referrer_id, first_name="Referrer", name="Referrer"),
+            User(id=new_user_id, first_name="New"),
+            Content(key="start_message", text_content="Добро пожаловать!", is_visible=True),
+        ])
+        await session.commit()
+
+    registration_client = SimpleNamespace(send_message=AsyncMock())
+    await max_common.show_start_screen(
+        registration_client,
+        chat_id=199,
+        user_id=new_user_id,
+        start_payload="ref_142",
+    )
+
+    async with db_session() as session:
+        subscription = await session.scalar(
+            select(UserSubscription).where(UserSubscription.user_id == new_user_id)
+        )
+        assert subscription is not None
+        assert subscription.payment_provider == "Trial Referral"
+        subscription.end_date = datetime.utcnow() + timedelta(days=2, minutes=30)
+        await session.commit()
+
+    max_client = MagicMock()
+    max_client.send_message = AsyncMock(return_value={"message": {"body": {"mid": "reminder-1"}}})
+    max_client.__aenter__ = AsyncMock(return_value=max_client)
+    max_client.__aexit__ = AsyncMock(return_value=None)
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=True)
+
+    with patch.dict(os.environ, {"MAX_BOT_TOKEN": "test-max-token"}, clear=False), \
+         patch("max_messenger_bot.api.MaxApiClient", return_value=max_client):
+        await scheduler.check_subscriptions(bot)
+
+    max_client.send_message.assert_awaited_once()
+    reminder_call = max_client.send_message.await_args.kwargs
+    assert reminder_call["user_id"] == 199
+    assert "истекает" in reminder_call["text"]
+
+    async with db_session() as session:
+        outbox_rows = (
+            await session.execute(
+                select(notification_outbox.PaymentNotificationOutbox)
+                .where(notification_outbox.PaymentNotificationOutbox.recipient_id == new_user_id)
+            )
+        ).scalars().all()
+    reminder_rows = [row for row in outbox_rows if row.event_type == "subscription_reminder"]
+    assert len(reminder_rows) == 1
+    assert reminder_rows[0].status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_referral_trial_reminder_reaches_telegram_api(db_session, monkeypatch):
+    import notification_outbox
+    import scheduler
+
+    monkeypatch.setattr(scheduler, "async_session_maker", db_session)
+    monkeypatch.setattr(notification_outbox, "async_session_maker", db_session)
+
+    user_id = 22199
+    async with db_session() as session:
+        session.add(User(id=user_id, first_name="Telegram referral user"))
+        session.add(
+            UserSubscription(
+                user_id=user_id,
+                plan_id=None,
+                start_date=datetime.utcnow(),
+                end_date=datetime.utcnow() + timedelta(days=2, minutes=30),
+                payment_provider="Trial Referral",
+                auto_renewal=False,
+            )
+        )
+        session.add(SubscriptionConfig(id=1, subscriptions_enabled=True))
+        await session.commit()
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=True)
+    await scheduler.check_subscriptions(bot)
+
+    sent_texts = [
+        call.args[1]
+        for call in bot.send_message.await_args_list
+        if len(call.args) > 1 and isinstance(call.args[1], str)
+    ]
+    assert any("истекает" in text for text in sent_texts)
 
 
 @pytest.mark.asyncio

@@ -27,9 +27,11 @@ from sqlalchemy.orm import selectinload
 from database import (
     DeepLinkNamespace,
     EventDelivery,
+    EventDeliveryPart,
     EventDeliveryResolution,
     EventRegistration,
     EventScenario,
+    EventScenarioMedia,
     EventStep,
     User,
     create_event_delivery_force_retry,
@@ -38,6 +40,7 @@ from database import (
 from event_service import (
     NON_RECOVERABLE_STATUSES,
     RescheduleResult,
+    render_event_message,
     render_event_template,
     reschedule_event,
 )
@@ -68,6 +71,61 @@ EVENT_DELIVERY_STATUSES = [
 ]
 
 PROBLEM_DELIVERY_STATUSES = ["uncertain", "failed", "blocked"]
+_UNSET = object()
+
+
+async def _stop_content_changed_deliveries(
+    session: AsyncSession,
+    event_id: int,
+    now_utc: datetime,
+    *,
+    step_id: int | None = None,
+    is_postgres: bool = False,
+    preserve_duration_immediates: bool = False,
+) -> None:
+    conditions = [
+        EventDelivery.event_id == event_id,
+        EventDelivery.status.in_(("pending", "claimed", "sending")),
+    ]
+    if step_id is not None:
+        conditions.append(EventDelivery.step_id == step_id)
+    stale_stmt = select(EventDelivery).where(*conditions)
+    if is_postgres:
+        stale_stmt = stale_stmt.with_for_update()
+    for delivery in (await session.execute(stale_stmt)).scalars().all():
+        if (
+            preserve_duration_immediates
+            and delivery.message_kind in ("immediate_confirmation", "immediate_live", "reschedule_notice")
+            and delivery.status in ("pending", "claimed")
+        ):
+            continue
+        if delivery.status == "sending":
+            delivery.status = "uncertain"
+            delivery.skip_reason = "content_changed_partial"
+            delivery.last_error = "Delivery interrupted after event content changed; an in-flight part may have been accepted."
+        else:
+            delivery.status = "skipped"
+            delivery.skip_reason = "content_changed"
+        delivery.finished_at = now_utc
+        delivery.claim_token = None
+        delivery.lease_until = None
+        delivery.send_started_at = None
+        delivery.updated_at = now_utc
+        parts_stmt = select(EventDeliveryPart).where(
+            EventDeliveryPart.delivery_id == delivery.id,
+            EventDeliveryPart.status.in_(("pending", "sending")),
+        )
+        for part in (await session.execute(parts_stmt)).scalars().all():
+            if delivery.status == "uncertain" and part.status == "sending":
+                part.status = "uncertain"
+                part.last_error = "In-flight part may have been accepted before event content changed."
+            else:
+                part.status = "skipped"
+                part.last_error = "Stopped because event content changed."
+            part.finished_at = now_utc
+            part.claim_token = None
+            part.lease_until = None
+            part.updated_at = now_utc
 
 
 @dataclass(frozen=True)
@@ -86,6 +144,9 @@ class ScenarioSummary:
     schedule_revision: int
     content_version: int
     registrations_count: int
+    description: str | None = None
+    media_order: str = "media_top"
+    media_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -98,6 +159,18 @@ class StepItem:
     step_version: int
     sort_order: int
     is_archived: bool
+    include_event_details: bool = False
+
+
+@dataclass(frozen=True)
+class ScenarioMediaItem:
+    id: int
+    event_id: int
+    file_type: str
+    file_id: str
+    max_token: str | None
+    source_platform: str | None
+    sort_order: int
 
 
 @dataclass(frozen=True)
@@ -149,6 +222,17 @@ class DeliveryItem:
     platform: str
     retry_index: int
     parent_delivery_id: int | None
+
+
+@dataclass(frozen=True)
+class DeliveryPartItem:
+    id: int
+    part_index: int
+    part_kind: str
+    status: str
+    attempt_count: int
+    last_error: str | None
+    external_message_id: str | None
 
 
 # ==============================================================================
@@ -361,10 +445,19 @@ async def list_scenarios(
             .group_by(EventRegistration.event_id)
             .subquery()
         )
+        media_subq = (
+            select(
+                EventScenarioMedia.event_id,
+                func.count(EventScenarioMedia.id).label("media_count"),
+            )
+            .group_by(EventScenarioMedia.event_id)
+            .subquery()
+        )
 
         stmt = (
-            select(EventScenario, func.coalesce(reg_subq.c.reg_count, 0))
+            select(EventScenario, func.coalesce(reg_subq.c.reg_count, 0), func.coalesce(media_subq.c.media_count, 0))
             .outerjoin(reg_subq, EventScenario.id == reg_subq.c.event_id)
+            .outerjoin(media_subq, EventScenario.id == media_subq.c.event_id)
         )
         if not include_archived:
             stmt = stmt.where(EventScenario.is_archived == False)
@@ -373,7 +466,7 @@ async def list_scenarios(
 
         rows = (await session.execute(stmt)).all()
         result: list[ScenarioSummary] = []
-        for scen, reg_count in rows:
+        for scen, reg_count, media_count in rows:
             result.append(
                 ScenarioSummary(
                     id=scen.id,
@@ -390,6 +483,9 @@ async def list_scenarios(
                     schedule_revision=scen.schedule_revision,
                     content_version=scen.content_version,
                     registrations_count=int(reg_count or 0),
+                    description=scen.description,
+                    media_order=scen.media_order,
+                    media_count=int(media_count or 0),
                 )
             )
         return result
@@ -404,7 +500,14 @@ async def get_scenario_summary(
         reg_count = await session.scalar(
             select(func.count(EventRegistration.id)).where(EventRegistration.event_id == event_id)
         )
-        scen = await session.get(EventScenario, event_id)
+        media_count = await session.scalar(
+            select(func.count(EventScenarioMedia.id)).where(EventScenarioMedia.event_id == event_id)
+        )
+        scen = await session.scalar(
+            select(EventScenario)
+            .options(selectinload(EventScenario.media))
+            .where(EventScenario.id == event_id)
+        )
         if not scen:
             return None
         return ScenarioSummary(
@@ -422,6 +525,9 @@ async def get_scenario_summary(
             schedule_revision=scen.schedule_revision,
             content_version=scen.content_version,
             registrations_count=int(reg_count or 0),
+            description=scen.description,
+            media_order=scen.media_order,
+            media_count=int(media_count or 0),
         )
 
 
@@ -435,6 +541,8 @@ async def create_scenario(
     duration_minutes: int = 120,
     place: str | None = None,
     link: str | None = None,
+    description: str | None = None,
+    media_order: str = "media_top",
     is_active: bool = False,
     now_utc: datetime | None = None,
 ) -> ScenarioSummary:
@@ -453,6 +561,8 @@ async def create_scenario(
         now_utc=now_utc,
     )
     norm_code = validate_event_code(code)
+    if media_order not in {"media_top", "text_top"}:
+        raise ValueError("Порядок должен быть media_top или text_top.")
     eff_now = now_utc or utc_now()
 
     async with session_maker() as session:
@@ -480,6 +590,8 @@ async def create_scenario(
             is_archived=False,
             schedule_revision=1,
             content_version=1,
+            description=description.strip() if description and description.strip() else None,
+            media_order=media_order,
             created_at=eff_now,
             updated_at=eff_now,
         )
@@ -508,7 +620,152 @@ async def create_scenario(
             schedule_revision=scen.schedule_revision,
             content_version=scen.content_version,
             registrations_count=0,
+            description=scen.description,
+            media_order=scen.media_order,
+            media_count=0,
         )
+
+
+async def list_scenario_media(
+    session_maker: async_sessionmaker[AsyncSession],
+    event_id: int,
+) -> list[ScenarioMediaItem]:
+    async with session_maker() as session:
+        rows = (
+            await session.execute(
+                select(EventScenarioMedia)
+                .where(EventScenarioMedia.event_id == event_id)
+                .order_by(EventScenarioMedia.sort_order.asc(), EventScenarioMedia.id.asc())
+            )
+        ).scalars().all()
+        return [
+            ScenarioMediaItem(
+                id=row.id,
+                event_id=row.event_id,
+                file_type=row.file_type,
+                file_id=row.file_id,
+                max_token=row.max_token,
+                source_platform=row.source_platform,
+                sort_order=row.sort_order,
+            )
+            for row in rows
+        ]
+
+
+async def replace_scenario_media(
+    session_maker: async_sessionmaker[AsyncSession],
+    event_id: int,
+    attachments: list[dict[str, Any]],
+    *,
+    now_utc: datetime | None = None,
+) -> list[ScenarioMediaItem]:
+    if len(attachments) > 100:
+        raise ValueError("Можно добавить не более 100 медиафайлов.")
+    normalized: list[dict[str, Any]] = []
+    for index, attachment in enumerate(attachments):
+        file_type = str(attachment.get("file_type") or attachment.get("type") or "").lower()
+        file_id = str(attachment.get("file_id") or "").strip()
+        if file_type not in {"photo", "video"}:
+            raise ValueError("Поддерживаются только фото и видео.")
+        if not file_id:
+            raise ValueError("У каждого медиафайла должен быть идентификатор исходного файла.")
+        normalized.append({
+            "file_type": file_type,
+            "file_id": file_id,
+            "max_token": str(attachment.get("max_token") or "").strip() or None,
+            "source_platform": str(attachment.get("source_platform") or "").strip() or None,
+            "source_file_id": str(attachment.get("source_file_id") or file_id).strip() or file_id,
+            "sort_order": index,
+        })
+
+    eff_now = now_utc or utc_now()
+    async with session_maker() as session:
+        bind = session.get_bind()
+        is_postgres = getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
+        if not is_postgres:
+            await session.execute(text("BEGIN IMMEDIATE"))
+        else:
+            await session.begin()
+        stmt = select(EventScenario).where(EventScenario.id == event_id)
+        if is_postgres:
+            stmt = stmt.with_for_update()
+        scenario = await session.scalar(stmt)
+        if not scenario:
+            raise ValueError(f"Сценарий {event_id} не найден.")
+        if scenario.is_archived:
+            raise ValueError("Нельзя редактировать архивный сценарий.")
+        current = (
+            await session.execute(
+                select(EventScenarioMedia).where(EventScenarioMedia.event_id == event_id)
+            )
+        ).scalars().all()
+        changed = len(current) != len(normalized) or any(
+            row.file_type != item["file_type"]
+            or row.file_id != item["file_id"]
+            or row.max_token != item["max_token"]
+            or row.sort_order != item["sort_order"]
+            for row, item in zip(sorted(current, key=lambda value: (value.sort_order, value.id)), normalized)
+        )
+        if changed:
+            for row in current:
+                await session.delete(row)
+            await session.flush()
+            session.add_all([
+                EventScenarioMedia(event_id=event_id, created_at=eff_now, updated_at=eff_now, **item)
+                for item in normalized
+            ])
+            scenario.content_version += 1
+            scenario.updated_at = eff_now
+            await _stop_content_changed_deliveries(
+                session,
+                event_id,
+                eff_now,
+                is_postgres=is_postgres,
+            )
+        await session.commit()
+    return await list_scenario_media(session_maker, event_id)
+
+
+async def set_step_event_details(
+    session_maker: async_sessionmaker[AsyncSession],
+    step_id: int,
+    enabled: bool,
+    *,
+    now_utc: datetime | None = None,
+) -> StepItem:
+    eff_now = now_utc or utc_now()
+    async with session_maker() as session:
+        bind = session.get_bind()
+        is_postgres = getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
+        if not is_postgres:
+            await session.execute(text("BEGIN IMMEDIATE"))
+        else:
+            await session.begin()
+        step_stmt = select(EventStep).where(EventStep.id == step_id)
+        if is_postgres:
+            step_stmt = step_stmt.with_for_update()
+        step = await session.scalar(step_stmt)
+        if not step:
+            raise ValueError(f"Шаг {step_id} не найден.")
+        scenario = await session.get(EventScenario, step.event_id)
+        if not scenario or scenario.is_archived or step.is_archived:
+            raise ValueError("Нельзя редактировать архивный сценарий или шаг.")
+        changed = bool(enabled) != bool(step.include_event_details)
+        if changed:
+            step.include_event_details = bool(enabled)
+            step.step_version += 1
+            scenario.content_version += 1
+            step.updated_at = eff_now
+            scenario.updated_at = eff_now
+            await _stop_content_changed_deliveries(
+                session,
+                scenario.id,
+                eff_now,
+                step_id=step.id,
+                is_postgres=is_postgres,
+            )
+        await session.commit()
+    return await get_step_item(session_maker, step_id)  # type: ignore[return-value]
 
 
 async def update_scenario_fields(
@@ -519,6 +776,8 @@ async def update_scenario_fields(
     duration_minutes: int | None = None,
     place: str | None = None,
     link: str | None = None,
+    description: str | None | object = _UNSET,
+    media_order: str | object = _UNSET,
     now_utc: datetime | None = None,
 ) -> ScenarioSummary:
     """Updates content fields of a scenario in a short locked transaction, adjusting expiry for unsent immediate deliveries."""
@@ -546,6 +805,14 @@ async def update_scenario_fields(
         new_dur = duration_minutes if duration_minutes is not None else scen.duration_minutes
         new_place = place.strip() if place is not None else scen.place
         new_link = link.strip() if link is not None else scen.link
+        new_description = (
+            description.strip() if isinstance(description, str) and description.strip() else None
+            if description is not _UNSET
+            else scen.description
+        )
+        new_media_order = media_order if media_order is not _UNSET else scen.media_order
+        if new_media_order not in {"media_top", "text_top"}:
+            raise ValueError("Порядок должен быть media_top или text_top.")
 
         validate_scenario_input(
             code=scen.code,
@@ -560,13 +827,33 @@ async def update_scenario_fields(
         )
 
         duration_changed = (new_dur != scen.duration_minutes)
+        content_changed = (
+            new_title != scen.title
+            or duration_changed
+            or new_place != scen.place
+            or new_link != scen.link
+            or new_description != scen.description
+            or new_media_order != scen.media_order
+        )
 
         scen.title = new_title
         scen.duration_minutes = new_dur
         scen.place = new_place if new_place else None
         scen.link = new_link if new_link else None
-        scen.content_version += 1
+        scen.description = new_description
+        scen.media_order = new_media_order
+        if content_changed:
+            scen.content_version += 1
         scen.updated_at = eff_now
+
+        if content_changed:
+            await _stop_content_changed_deliveries(
+                session,
+                event_id,
+                eff_now,
+                is_postgres=is_postgres,
+                preserve_duration_immediates=duration_changed,
+            )
 
         if duration_changed:
             new_end_time = scen.starts_at + timedelta(minutes=new_dur)
@@ -586,6 +873,7 @@ async def update_scenario_fields(
                 imm_delivs_stmt = imm_delivs_stmt.with_for_update()
             imm_delivs = (await session.execute(imm_delivs_stmt)).scalars().all()
             for d in imm_delivs:
+                d.content_version_snapshot = scen.content_version
                 if new_end_time <= eff_now:
                     d.status = "skipped"
                     d.skip_reason = "expired"
@@ -769,7 +1057,7 @@ async def copy_scenario(
         # Load source scenario and active steps
         source_stmt = (
             select(EventScenario)
-            .options(selectinload(EventScenario.steps))
+            .options(selectinload(EventScenario.steps), selectinload(EventScenario.media))
             .where(EventScenario.id == source_event_id)
         )
         source = await session.scalar(source_stmt)
@@ -803,6 +1091,8 @@ async def copy_scenario(
             is_archived=False,
             schedule_revision=1,
             content_version=1,
+            description=source.description,
+            media_order=source.media_order,
         )
         session.add(new_scen)
         await session.flush()
@@ -825,8 +1115,21 @@ async def copy_scenario(
                 sort_order=s.sort_order,
                 step_version=1,
                 is_archived=False,
+                include_event_details=s.include_event_details,
             )
             session.add(cloned_step)
+
+        source_media = sorted(source.media, key=lambda media: (media.sort_order, media.id))
+        for media in source_media:
+            session.add(EventScenarioMedia(
+                event_id=new_scen.id,
+                file_type=media.file_type,
+                file_id=media.file_id,
+                max_token=media.max_token,
+                source_platform=media.source_platform,
+                source_file_id=media.source_file_id,
+                sort_order=media.sort_order,
+            ))
 
         await session.commit()
 
@@ -845,6 +1148,9 @@ async def copy_scenario(
             schedule_revision=new_scen.schedule_revision,
             content_version=new_scen.content_version,
             registrations_count=0,
+            description=new_scen.description,
+            media_order=new_scen.media_order,
+            media_count=len(source_media),
         )
 
 
@@ -880,6 +1186,7 @@ async def list_steps(
                 step_version=s.step_version,
                 sort_order=s.sort_order,
                 is_archived=s.is_archived,
+                include_event_details=s.include_event_details,
             )
             for s in steps
         ]
@@ -903,6 +1210,7 @@ async def get_step_item(
             step_version=s.step_version,
             sort_order=s.sort_order,
             is_archived=s.is_archived,
+            include_event_details=s.include_event_details,
         )
 
 
@@ -912,6 +1220,7 @@ async def add_step(
     offset_minutes: int,
     message_text: str,
     *,
+    include_event_details: bool = False,
     now_utc: datetime | None = None,
 ) -> StepItem:
     """Adds a new reminder step to scenario and schedules deliveries for current active registrations."""
@@ -963,12 +1272,14 @@ async def add_step(
             sort_order=sort_order,
             step_version=1,
             is_archived=False,
+            include_event_details=include_event_details,
         )
         session.add(step)
         await session.flush()  # populate step.id
 
         # Level 6: Deliveries for each active registration
         step_due = scen.starts_at + timedelta(minutes=offset_minutes)
+        new_content_version = scen.content_version + 1
         for reg in active_regs:
             step_key = f"ev:{scen.id}:reg:{reg.id}:step:{step.id}:r0"
             if reg.registration_mode == "urgent_late":
@@ -997,12 +1308,13 @@ async def add_step(
                     schedule_revision=scen.schedule_revision,
                     registration_generation=reg.generation,
                     platform=reg_platform,
+                    content_version_snapshot=new_content_version,
                     status=step_status,
                     skip_reason=step_skip_reason,
                 )
             )
 
-        scen.content_version += 1
+        scen.content_version = new_content_version
         scen.updated_at = eff_now
         await session.commit()
 
@@ -1015,6 +1327,7 @@ async def add_step(
             step_version=step.step_version,
             sort_order=step.sort_order,
             is_archived=step.is_archived,
+            include_event_details=step.include_event_details,
         )
 
 
@@ -1024,6 +1337,7 @@ async def update_step(
     *,
     offset_minutes: int | None = None,
     message_text: str | None = None,
+    include_event_details: bool | None = None,
     now_utc: datetime | None = None,
 ) -> StepItem:
     """
@@ -1076,16 +1390,24 @@ async def update_step(
 
         new_offset = offset_minutes if offset_minutes is not None else step.offset_minutes
         new_text = message_text.strip() if message_text is not None else step.message_text
+        new_include_event_details = (
+            include_event_details if include_event_details is not None else step.include_event_details
+        )
         validate_step_input(new_offset, new_text)
 
         offset_changed = (new_offset != step.offset_minutes)
+        text_changed = new_text != step.message_text or bool(new_include_event_details) != bool(step.include_event_details)
+        content_changed = offset_changed or text_changed
+        new_content_version = scen.content_version + (1 if content_changed else 0)
 
         step.offset_minutes = new_offset
         step.message_text = new_text
-        step.step_version += 1
-        step.updated_at = eff_now
-        scen.content_version += 1
-        scen.updated_at = eff_now
+        step.include_event_details = bool(new_include_event_details)
+        if content_changed:
+            step.step_version += 1
+            step.updated_at = eff_now
+            scen.content_version = new_content_version
+            scen.updated_at = eff_now
 
         # Level 6: If offset changed, update/skip safe pending and claimed deliveries of this step
         if offset_changed:
@@ -1102,6 +1424,7 @@ async def update_step(
                 safe_deliveries_stmt = safe_deliveries_stmt.with_for_update()
             safe_deliveries = (await session.execute(safe_deliveries_stmt)).scalars().all()
             for d in safe_deliveries:
+                d.content_version_snapshot = new_content_version
                 if new_due_at > eff_now:
                     d.status = "pending"
                     d.due_at = new_due_at
@@ -1122,6 +1445,15 @@ async def update_step(
                     d.send_started_at = None
                 d.updated_at = eff_now
 
+        if text_changed:
+            await _stop_content_changed_deliveries(
+                session,
+                scen.id,
+                eff_now,
+                step_id=step.id,
+                is_postgres=is_postgres,
+            )
+
         await session.commit()
 
         return StepItem(
@@ -1133,6 +1465,7 @@ async def update_step(
             step_version=step.step_version,
             sort_order=step.sort_order,
             is_archived=step.is_archived,
+            include_event_details=step.include_event_details,
         )
 
 
@@ -1404,6 +1737,32 @@ async def get_delivery_item(
         )
 
 
+async def list_delivery_parts(
+    session_maker: async_sessionmaker[AsyncSession],
+    delivery_id: int,
+) -> list[DeliveryPartItem]:
+    async with session_maker() as session:
+        parts = (
+            await session.execute(
+                select(EventDeliveryPart)
+                .where(EventDeliveryPart.delivery_id == delivery_id)
+                .order_by(EventDeliveryPart.part_index.asc())
+            )
+        ).scalars().all()
+        return [
+            DeliveryPartItem(
+                id=part.id,
+                part_index=part.part_index,
+                part_kind=part.part_kind,
+                status=part.status,
+                attempt_count=part.attempt_count,
+                last_error=part.last_error,
+                external_message_id=part.external_message_id,
+            )
+            for part in parts
+        ]
+
+
 # ==============================================================================
 # MANUAL RESOLUTION
 # ==============================================================================
@@ -1414,6 +1773,7 @@ async def resolve_uncertain_delivery(
     admin_id: int,
     resolution_type: str,
     resolution_reason: str,
+    part_id: int | None = None,
 ) -> tuple[EventDelivery, bool]:
     """
     Manually resolves an uncertain event delivery.
@@ -1482,11 +1842,59 @@ async def resolve_uncertain_delivery(
 
         now = utc_now()
         target_status = "resolved_sent" if resolution_type == "mark_sent" else "resolved_skipped"
-        delivery.status = target_status
-        if resolution_type == "mark_skipped":
-            delivery.skip_reason = "manual_resolution"
-        delivery.finished_at = now
-        delivery.updated_at = now
+        part_status = target_status
+        part_stmt = (
+            select(EventDeliveryPart)
+            .where(EventDeliveryPart.delivery_id == delivery.id)
+            .order_by(EventDeliveryPart.part_index.asc())
+        )
+        if is_postgres:
+            part_stmt = part_stmt.with_for_update()
+        parts = (await session.execute(part_stmt)).scalars().all()
+        uncertain_parts = [part for part in parts if part.status == "uncertain"]
+        if uncertain_parts:
+            target_part = next((part for part in uncertain_parts if part.id == part_id), None) if part_id else uncertain_parts[0]
+            if target_part is None:
+                raise ValueError(f"Часть доставки {part_id} не находится в статусе uncertain.")
+            target_part.status = part_status
+            target_part.finished_at = now
+            target_part.sent_at = now if resolution_type == "mark_sent" else target_part.sent_at
+            target_part.claim_token = None
+            target_part.lease_until = None
+            target_part.send_started_at = None
+            target_part.updated_at = now
+
+            remaining_uncertain = any(part.status == "uncertain" for part in parts)
+            remaining_sending = any(part.status == "sending" for part in parts)
+            remaining_active = any(part.status in {"pending", "sending", "uncertain"} for part in parts)
+            delivery.claim_token = None
+            delivery.lease_until = None
+            delivery.claimed_at = None
+            delivery.send_started_at = None
+            delivery.updated_at = now
+            if remaining_uncertain or remaining_sending:
+                delivery.status = "uncertain"
+                delivery.finished_at = None
+                delivery.skip_reason = None
+                delivery.last_error = "Часть доставки разрешена вручную; ожидаются остальные uncertain-части."
+            elif remaining_active:
+                delivery.status = "pending"
+                delivery.finished_at = None
+                delivery.skip_reason = None
+                delivery.next_attempt_at = now
+                delivery.last_error = "Часть доставки разрешена вручную; оставшиеся части возобновлены."
+            else:
+                delivery.status = target_status
+                delivery.finished_at = now
+                delivery.skip_reason = "manual_resolution" if resolution_type == "mark_skipped" else None
+        else:
+            if parts or part_id is not None:
+                raise ValueError("У uncertain-доставки нет разрешаемой uncertain-части.")
+            delivery.status = target_status
+            if resolution_type == "mark_skipped":
+                delivery.skip_reason = "manual_resolution"
+            delivery.finished_at = now
+            delivery.updated_at = now
 
         resolution = EventDeliveryResolution(
             delivery_id=delivery.id,
@@ -1533,4 +1941,10 @@ async def render_test_step(
                 "📍 Место / Ссылка: {link_or_place}"
             )
 
-        return render_event_template(scenario=scen, template=template, user=admin_user)
+        include_details = step_id is None or bool(step and step.include_event_details)
+        return render_event_message(
+            scenario=scen,
+            template=template,
+            user=admin_user,
+            include_event_details=include_details,
+        )
