@@ -2017,7 +2017,7 @@ async def test_max_long_title_application_list_edit_cancel_save_reopen(db_sessio
             assert (await session.get(EventScenario, scen.id)).title == "Б" * 1000
         card = await press(target)
         assert "Б" * 1000 in card.kwargs["text"]
-        back_payload, _ = button_payload(card, "admin_events")
+        back_payload, _ = button_payload(card, "admin_ev_page_0_0")
         listing = await press(back_payload)
         assert "Мероприятия и цепочки" in listing.kwargs["text"]
 
