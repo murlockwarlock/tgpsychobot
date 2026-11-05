@@ -116,6 +116,15 @@ def _keyboard_callbacks(method):
     }
 
 
+def _callback_for_button(method, text_fragment: str) -> str:
+    fragment = text_fragment.lower()
+    for row in (method.reply_markup.inline_keyboard if method.reply_markup else []):
+        for button in row:
+            if fragment in button.text.lower() and button.callback_data:
+                return button.callback_data
+    raise AssertionError(f"No Telegram callback with text containing {text_fragment!r}")
+
+
 @pytest.mark.asyncio
 async def test_telegram_robokassa_buttons_follow_real_dispatcher_journeys(telegram_journey_db, monkeypatch):
     sessions, handlers = telegram_journey_db
@@ -167,7 +176,8 @@ async def test_telegram_robokassa_buttons_follow_real_dispatcher_journeys(telegr
     )
     initial = next(method for method in reversed(session.calls) if isinstance(method, SendMessage))
     assert {"sub_retry_now", "sub_cancel_retry", "sub_enter_promo"}.issubset(_keyboard_callbacks(initial))
-    await _feed_callback(dispatcher, bot, cancel_user, 1, "sub_cancel_retry", 2)
+    cancel_payload = _callback_for_button(initial, "оформить заново")
+    await _feed_callback(dispatcher, bot, cancel_user, 1, cancel_payload, 2)
     async with sessions() as db:
         cancelled = await db.scalar(select(UserSubscription).where(UserSubscription.user_id == cancel_user))
     assert cancelled.auto_renewal is False
@@ -179,12 +189,15 @@ async def test_telegram_robokassa_buttons_follow_real_dispatcher_journeys(telegr
         Update(update_id=3, message=_telegram_message(bot, promo_user, 201, "⭐️ Подписка")),
     )
     assert next(method for method in reversed(session.calls) if isinstance(method, SendMessage))
-    await _feed_callback(dispatcher, bot, promo_user, 1, "sub_enter_promo", 4)
+    promo_screen = next(method for method in reversed(session.calls) if isinstance(method, SendMessage))
+    promo_payload = _callback_for_button(promo_screen, "промокод")
+    await _feed_callback(dispatcher, bot, promo_user, 1, promo_payload, 4)
     promo_prompt = next(method for method in reversed(session.calls) if isinstance(method, EditMessageText))
     assert "промокод" in promo_prompt.text.lower()
     promo_state = dispatcher.fsm.get_context(bot=bot, chat_id=promo_user, user_id=promo_user)
     assert await promo_state.get_state() == "UserStates:awaiting_promo_code"
-    await _feed_callback(dispatcher, bot, promo_user, 1, "back_to_sub_info", 5)
+    back_payload = _callback_for_button(promo_prompt, "назад")
+    await _feed_callback(dispatcher, bot, promo_user, 1, back_payload, 5)
     assert await promo_state.get_state() is None
     assert isinstance(next(method for method in reversed(session.calls) if isinstance(method, SendMessage)), SendMessage)
 
@@ -194,9 +207,10 @@ async def test_telegram_robokassa_buttons_follow_real_dispatcher_journeys(telegr
         bot,
         Update(update_id=6, message=_telegram_message(bot, retry_user, 301, "⭐️ Подписка")),
     )
-    assert next(method for method in reversed(session.calls) if isinstance(method, SendMessage))
+    retry_screen = next(method for method in reversed(session.calls) if isinstance(method, SendMessage))
+    retry_payload = _callback_for_button(retry_screen, "проверить")
     answers_before_retry = sum(method.__class__.__name__ == "AnswerCallbackQuery" for method in session.calls)
-    await _feed_callback(dispatcher, bot, retry_user, 1, "sub_retry_now", 7)
+    await _feed_callback(dispatcher, bot, retry_user, 1, retry_payload, 7)
     assert any(isinstance(method, SendMessage) and "обработке" in method.text for method in session.calls)
     assert sum(method.__class__.__name__ == "AnswerCallbackQuery" for method in session.calls) == answers_before_retry + 1
     await bot.session.close()

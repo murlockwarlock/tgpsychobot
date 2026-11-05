@@ -249,6 +249,17 @@ async def test_max_referral_registration_accumulates_welcome_and_referral_days(d
     assert "Всего начислено 4 бонусных дн." in sent_text
 
 
+def _max_callback_from_call(call, text_fragment: str) -> str:
+    fragment = text_fragment.lower()
+    for attachment in call.kwargs.get("attachments") or []:
+        payload = attachment.get("payload") or {}
+        for row in payload.get("buttons") or []:
+            for button in row:
+                if fragment in str(button.get("text", "")).lower() and button.get("payload"):
+                    return button["payload"]
+    raise AssertionError(f"No MAX callback with text containing {text_fragment!r}")
+
+
 @pytest.mark.asyncio
 async def test_max_robokassa_actions_follow_real_application_callbacks(db_session, monkeypatch):
     import scheduler
@@ -320,7 +331,10 @@ async def test_max_robokassa_actions_follow_real_application_callbacks(db_sessio
         )
 
     cancel_user = user_ids[0]
-    await app.handle_callback(callback(cancel_user, "sub_cancel_retry", "cancel"))
+    await app.handle_callback(callback(cancel_user, "sub_info", "cancel-screen"))
+    cancel_screen = client.send_message.await_args_list[-1]
+    cancel_payload = _max_callback_from_call(cancel_screen, "оформить заново")
+    await app.handle_callback(callback(cancel_user, cancel_payload, "cancel"))
     async with db_session() as session:
         cancelled_sub = await session.scalar(select(UserSubscription).where(UserSubscription.user_id == cancel_user))
     assert cancelled_sub.auto_renewal is False
@@ -328,18 +342,27 @@ async def test_max_robokassa_actions_follow_real_application_callbacks(db_sessio
     assert any(call.kwargs.get("attachments") for call in client.send_message.await_args_list)
 
     promo_user = user_ids[1]
-    await app.handle_callback(callback(promo_user, "sub_enter_promo", "promo"))
+    await app.handle_callback(callback(promo_user, "sub_info", "promo-screen"))
+    promo_screen = client.send_message.await_args_list[-1]
+    promo_payload = _max_callback_from_call(promo_screen, "промокод")
+    await app.handle_callback(callback(promo_user, promo_payload, "promo"))
     promo_state = await app.states.get(promo_user)
     assert promo_state is not None
     assert promo_state.state == "awaiting_promo_code"
     assert "Введите промокод" in client.send_message.await_args_list[-1].kwargs["text"]
-    await app.handle_callback(callback(promo_user, "main_menu", "promo-return"))
+    promo_prompt = client.send_message.await_args_list[-1]
+    menu_payload = _max_callback_from_call(promo_prompt, "в меню")
+    await app.handle_callback(callback(promo_user, menu_payload, "promo-return"))
+    assert await app.states.get(promo_user) is None
     assert client.send_message.await_args_list[-1].kwargs["text"] == "Раздел меню пока не настроен."
 
     retry_user = user_ids[2]
     monkeypatch.setattr(scheduler, "process_recurring_robokassa_payment", AsyncMock(return_value="provider_error"))
+    await app.handle_callback(callback(retry_user, "sub_info", "retry-screen"))
+    retry_screen = client.send_message.await_args_list[-1]
+    retry_payload = _max_callback_from_call(retry_screen, "списать сейчас")
     answers_before_retry = client.answer_callback.await_count
-    await app.handle_callback(callback(retry_user, "sub_retry_now", "retry"))
+    await app.handle_callback(callback(retry_user, retry_payload, "retry"))
     assert "Robokassa временно недоступен" in client.send_message.await_args_list[-1].kwargs["text"]
     assert client.answer_callback.await_count == answers_before_retry + 1
 

@@ -1178,6 +1178,9 @@ class MaxBotApplication:
 
         if data == "main_menu":
             await self.client.answer_callback(callback.callback_id)
+            state = await self.states.get(user_id)
+            if state and state.state == "awaiting_promo_code":
+                await self.states.clear(user_id)
             await common.show_menu(self.client, chat_id, user_id=user_id)
             return
         if data == "topic_start_dialogue":
