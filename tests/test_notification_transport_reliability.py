@@ -72,6 +72,92 @@ class NotificationTransportReliabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(error.is_suspended_recipient)
 
+    async def test_suspended_max_delivery_is_not_retried_by_scheduler_outbox(self):
+        from datetime import datetime
+
+        import database
+        from scheduler import _send_deduplicated_notification
+
+        await database.init_db()
+        max_user_id = 100_000_000_777
+        error = MaxApiError(
+            "POST /messages failed: HTTP 403",
+            status=403,
+            error_code="chat.denied",
+            payload={"code": "chat.denied", "message": "Key: error.dialog.suspended"},
+        )
+        mock_client_instance = MagicMock()
+        mock_client_instance.send_message = AsyncMock(side_effect=error)
+        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+        mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=True)
+
+        with patch.dict(os.environ, {"MAX_BOT_TOKEN": "valid_max_token"}, clear=False), \
+             patch("max_messenger_bot.api.MaxApiClient", return_value=mock_client_instance):
+            first = await _send_deduplicated_notification(
+                bot,
+                max_user_id,
+                "Reminder",
+                "terminal-max-reminder",
+                datetime.utcnow(),
+            )
+            second = await _send_deduplicated_notification(
+                bot,
+                max_user_id,
+                "Reminder",
+                "terminal-max-reminder",
+                datetime.utcnow(),
+            )
+
+        self.assertFalse(first)
+        self.assertFalse(second)
+        mock_client_instance.send_message.assert_awaited_once()
+        async with database.async_session_maker() as session:
+            from sqlalchemy import select
+            from database import PaymentNotificationOutbox
+
+            row = await session.scalar(
+                select(PaymentNotificationOutbox).where(
+                    PaymentNotificationOutbox.unique_key == (
+                        f"scheduler:notification:{max_user_id}:terminal-max-reminder"
+                    )
+                )
+            )
+        self.assertIsNotNone(row)
+        self.assertEqual(row.status, "failed_terminal")
+        self.assertEqual(row.last_error, "max_chat_suspended")
+
+    async def test_transient_notification_failure_is_backed_off(self):
+        from datetime import datetime
+
+        import database
+        from scheduler import _send_deduplicated_notification
+
+        await database.init_db()
+        bot = MagicMock()
+        bot.send_message = AsyncMock(side_effect=Exception("temporary network failure"))
+        user_id = 778
+
+        first = await _send_deduplicated_notification(
+            bot,
+            user_id,
+            "Reminder",
+            "transient-reminder",
+            datetime.utcnow(),
+        )
+        second = await _send_deduplicated_notification(
+            bot,
+            user_id,
+            "Reminder",
+            "transient-reminder",
+            datetime.utcnow(),
+        )
+
+        self.assertFalse(first)
+        self.assertFalse(second)
+        bot.send_message.assert_awaited_once()
+
     async def test_other_max_forbidden_response_is_not_suspended_recipient(self):
         error = MaxApiError(
             "POST /messages failed: HTTP 403",

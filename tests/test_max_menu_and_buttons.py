@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -237,6 +237,114 @@ async def test_max_referral_registration_accumulates_welcome_and_referral_days(d
     ]
     sent_text = "\n".join(call.kwargs.get("text", "") for call in mock_client.send_message.await_args_list)
     assert "1 бонусных дн." in sent_text
+    assert "Всего начислено 4 бонусных дн." in sent_text
+
+
+@pytest.mark.asyncio
+async def test_max_referral_registration_reaches_trial_reminder_max_api(db_session, monkeypatch):
+    import notification_outbox
+    import scheduler
+
+    monkeypatch.setattr(scheduler, "async_session_maker", db_session)
+    monkeypatch.setattr(notification_outbox, "async_session_maker", db_session)
+
+    referrer_id = MAX_ID_OFFSET + 142
+    new_user_id = MAX_ID_OFFSET + 199
+    async with db_session() as session:
+        session.add_all([
+            SubscriptionConfig(
+                id=1,
+                subscriptions_enabled=True,
+                welcome_bonus_days=3,
+                referral_enabled=True,
+                referral_bonus_days_referral=1,
+                referral_bonus_days_referrer=1,
+            ),
+            User(id=referrer_id, first_name="Referrer", name="Referrer"),
+            User(id=new_user_id, first_name="New"),
+            Content(key="start_message", text_content="Добро пожаловать!", is_visible=True),
+        ])
+        await session.commit()
+
+    registration_client = SimpleNamespace(send_message=AsyncMock())
+    await max_common.show_start_screen(
+        registration_client,
+        chat_id=199,
+        user_id=new_user_id,
+        start_payload="ref_142",
+    )
+
+    async with db_session() as session:
+        subscription = await session.scalar(
+            select(UserSubscription).where(UserSubscription.user_id == new_user_id)
+        )
+        assert subscription is not None
+        assert subscription.payment_provider == "Trial Referral"
+        subscription.end_date = datetime.utcnow() + timedelta(days=2, minutes=30)
+        await session.commit()
+
+    max_client = MagicMock()
+    max_client.send_message = AsyncMock(return_value={"message": {"body": {"mid": "reminder-1"}}})
+    max_client.__aenter__ = AsyncMock(return_value=max_client)
+    max_client.__aexit__ = AsyncMock(return_value=None)
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=True)
+
+    with patch.dict(os.environ, {"MAX_BOT_TOKEN": "test-max-token"}, clear=False), \
+         patch("max_messenger_bot.api.MaxApiClient", return_value=max_client):
+        await scheduler.check_subscriptions(bot)
+
+    max_client.send_message.assert_awaited_once()
+    reminder_call = max_client.send_message.await_args.kwargs
+    assert reminder_call["user_id"] == 199
+    assert "истекает" in reminder_call["text"]
+
+    async with db_session() as session:
+        outbox_rows = (
+            await session.execute(
+                select(notification_outbox.PaymentNotificationOutbox)
+                .where(notification_outbox.PaymentNotificationOutbox.recipient_id == new_user_id)
+            )
+        ).scalars().all()
+    reminder_rows = [row for row in outbox_rows if row.event_type == "subscription_reminder"]
+    assert len(reminder_rows) == 1
+    assert reminder_rows[0].status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_referral_trial_reminder_reaches_telegram_api(db_session, monkeypatch):
+    import notification_outbox
+    import scheduler
+
+    monkeypatch.setattr(scheduler, "async_session_maker", db_session)
+    monkeypatch.setattr(notification_outbox, "async_session_maker", db_session)
+
+    user_id = 22199
+    async with db_session() as session:
+        session.add(User(id=user_id, first_name="Telegram referral user"))
+        session.add(
+            UserSubscription(
+                user_id=user_id,
+                plan_id=None,
+                start_date=datetime.utcnow(),
+                end_date=datetime.utcnow() + timedelta(days=2, minutes=30),
+                payment_provider="Trial Referral",
+                auto_renewal=False,
+            )
+        )
+        session.add(SubscriptionConfig(id=1, subscriptions_enabled=True))
+        await session.commit()
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=True)
+    await scheduler.check_subscriptions(bot)
+
+    sent_texts = [
+        call.args[1]
+        for call in bot.send_message.await_args_list
+        if len(call.args) > 1 and isinstance(call.args[1], str)
+    ]
+    assert any("истекает" in text for text in sent_texts)
 
 
 @pytest.mark.asyncio

@@ -502,12 +502,13 @@ async def show_help(client: MaxApiClient, chat_id: int, user_id: int) -> None:
 
 async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, start_payload: str | None = None, states: StateStore | None = None, *, skip_content: bool = False) -> None:
     referrer_notification: tuple[int, int] | None = None
+    bonus_messages: list[str] = []
+    bonus_days_total = 0
     async with async_session_maker() as session:
         user = await session.get(User, user_id, options=[selectinload(User.current_topic), selectinload(User.subscription)])
         if not user:
             return
 
-        welcome_bonus_text = ""
         is_new_trial_needed = user.subscription is None
         sub_config = await session.get(SubscriptionConfig, 1)
         is_probably_new_user = (
@@ -555,10 +556,11 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
                         now=now,
                     )
                     if referee_granted:
-                        welcome_bonus_text = (
+                        bonus_messages.append(
                             f"🎁 <b>Вам начислено {sub_config.referral_bonus_days_referral} бонусных дн.</b>\n"
                             "Регистрация выполнена по пригласительной ссылке."
                         )
+                        bonus_days_total += sub_config.referral_bonus_days_referral
                     referrer_granted = await grant_subscription_days(
                         session,
                         grant_key=f"max_registration_referrer:{user.id}:{referrer_id}",
@@ -585,10 +587,11 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
                 now=now,
             )
             if welcome_granted:
-                welcome_bonus_text = (
+                bonus_messages.append(
                     f"🎁 <b>Вам начислен приветственный бонус!</b>\n"
                     f"Бесплатный доступ на {sub_config.welcome_bonus_days} дн."
                 )
+                bonus_days_total += sub_config.welcome_bonus_days
             await session.commit()
 
     if referrer_notification:
@@ -627,9 +630,15 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
             return
 
     await render_static_content(client, chat_id, user_id, "start_message", is_start=True)
-    if welcome_bonus_text:
+    if bonus_messages:
         from ..formatting import translate_telegram_links_to_max
-        await client.send_message(chat_id=chat_id, text=translate_telegram_links_to_max(welcome_bonus_text))
+        bonus_text = "\n\n".join(bonus_messages)
+        if len(bonus_messages) > 1:
+            bonus_text = (
+                f"🎁 <b>Всего начислено {bonus_days_total} бонусных дн.</b>\n\n"
+                f"{bonus_text}"
+            )
+        await client.send_message(chat_id=chat_id, text=translate_telegram_links_to_max(bonus_text))
 
 
 async def reset_dialogue(client: MaxApiClient, chat_id: int, user_id: int) -> None:

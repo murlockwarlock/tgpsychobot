@@ -81,6 +81,7 @@ from ai_integration import (
 )
 from error_reporting import classify_ai_error, exception_summary, notify_admins_about_error, sanitize_secret_values
 from effective_subscription import is_active_subscription, load_active_subscription
+from subscription_notifications import is_trial_expiring_subscription
 from time_helpers import format_msk
 from media_scope import PHOTO_MEDIA_TYPES, TopicMediaScope, load_media_scope, photo_media_predicate
 from ai_request_context import extract_effective_provider_and_model
@@ -13673,7 +13674,7 @@ async def _send_subscription_info(user_id: int, chat_id: int, bot: Bot, state: F
             await bot.send_message(chat_id, text, reply_markup=reply_markup)
             return
 
-        if user_sub and user_sub.end_date > now and user_sub.plan_id is None and user_sub.payment_provider in ['Trial Promo', 'Trial Welcome']:
+        if user_sub and user_sub.end_date > now and is_trial_expiring_subscription(user_sub):
             remaining_time = user_sub.end_date - now
             remaining_seconds = remaining_time.total_seconds()
 

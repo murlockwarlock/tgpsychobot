@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup
-from database import (async_session_maker, BotGeneralConfig, UserSubscription, SubscriptionPlan, SubscriptionConfig, User,
+from database import (async_session_maker, BotGeneralConfig, PaymentNotificationOutbox, UserSubscription, SubscriptionPlan, SubscriptionConfig, User,
                       RobokassaPayment, PromoCode, YookassaPayment, AIConfig, get_all_admin_ids,
                       YookassaRecurringAttempt)
 from ai_integration import get_kie_remaining_credits, AIServiceError
@@ -34,7 +34,11 @@ import xml.etree.ElementTree as ET
 from urllib.parse import urlencode
 from alert_cooldown import AlertCooldown
 from birthday_mailings import process_birthday_mailings
-from subscription_notifications import is_trial_bonus_subscription, should_send_upcoming_charge_notification
+from subscription_notifications import (
+    is_trial_bonus_subscription,
+    is_trial_expiring_subscription,
+    should_send_upcoming_charge_notification,
+)
 from subscription_retry_policy import can_retry_now, get_next_retry_at
 from error_reporting import notify_admins_about_error, sanitize_secret_values
 from robokassa_signing import build_robokassa_recurring_params, format_robokassa_amount
@@ -266,6 +270,7 @@ async def _send_deduplicated_notification(
         window: timedelta = EXPIRATION_DEDUP_WINDOW,
         logger=None,
 ) -> bool:
+    target_logger = logger or plog
     if _was_recent_notification_logged(recipient_id, key, now, window):
         return False
     if reply_markup and any(
@@ -280,13 +285,70 @@ async def _send_deduplicated_notification(
                 platform="max" if recipient_id >= 100_000_000_000 else "telegram",
             )
         reply_markup = build_subscribe_keyboard(locale)
-    delivered = await send_notification_transport(bot, recipient_id, text, reply_markup=reply_markup)
-    target_logger = logger or plog
-    if delivered:
-        target_logger.info(f"NOTIFY_SENT | recipient_id={recipient_id} | key={key}")
-        return True
-    else:
-        target_logger.warning(f"NOTIFY_FAILED | recipient_id={recipient_id} | key={key}")
+
+    raw_key = f"scheduler:notification:{recipient_id}:{key}"
+    if len(raw_key) > 255:
+        raw_key = f"scheduler:notification:{recipient_id}:{hashlib.sha256(raw_key.encode('utf-8')).hexdigest()}"
+    payload = {
+        "text": text,
+        "parse_mode": None,
+        "keyboard_type": "subscribe" if reply_markup else None,
+    }
+
+    try:
+        async with async_session_maker() as session:
+            row = await session.scalar(
+                select(PaymentNotificationOutbox)
+                .where(PaymentNotificationOutbox.unique_key == raw_key)
+            )
+            if row is not None:
+                if row.status in {"delivered", "failed_terminal"}:
+                    return False
+                if row.status == "pending" and row.next_retry_at and row.next_retry_at > now:
+                    return False
+                if row.status == "processing" and row.lease_until and row.lease_until > now:
+                    return False
+            else:
+                await enqueue_outbox_event(
+                    session,
+                    raw_key,
+                    "scheduler",
+                    recipient_id,
+                    "subscription_reminder",
+                    payload,
+                )
+                await session.commit()
+
+        delivered = await dispatch_outbox_by_key(bot, raw_key)
+
+        async with async_session_maker() as session:
+            row = await session.scalar(
+                select(PaymentNotificationOutbox)
+                .where(PaymentNotificationOutbox.unique_key == raw_key)
+            )
+        if row is not None and row.status == "delivered":
+            target_logger.info(f"NOTIFY_SENT | recipient_id={recipient_id} | key={key}")
+            return True
+        if row is not None and row.status == "failed_terminal":
+            target_logger.warning(
+                f"NOTIFY_TERMINAL | recipient_id={recipient_id} | key={key} | reason={row.last_error or 'terminal'}"
+            )
+        elif row is not None and row.status == "pending":
+            target_logger.warning(
+                f"NOTIFY_FAILED | recipient_id={recipient_id} | key={key} | "
+                f"attempt={row.attempts} | retry_at={row.next_retry_at.isoformat() if row.next_retry_at else 'unknown'}"
+            )
+        return False
+    except Exception as exc:
+        target_logger.error(
+            "Notification state unavailable for recipient_id=%s key=%s: %s",
+            recipient_id,
+            key,
+            exc,
+        )
+        target_logger.warning(
+            f"NOTIFY_FAILED | recipient_id={recipient_id} | key={key} | reason=state_unavailable"
+        )
         return False
 
 
@@ -871,7 +933,7 @@ async def check_subscriptions(bot: Bot):
                 user_ref += f" [id=<code>{sub.user_id}</code>]"
 
                 message_text = None
-                is_trial_promo = sub.plan_id is None and sub.payment_provider in ['Trial Promo', 'Trial Welcome']
+                is_trial_promo = is_trial_expiring_subscription(sub)
                 time_left = sub.end_date - now
 
                 two_day_window_start = timedelta(days=2)

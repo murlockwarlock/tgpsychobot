@@ -24,7 +24,11 @@ from database import (
     get_all_admin_ids,
 )
 from notification_renderer import render_outbox_message
-from notification_transport import build_subscribe_keyboard, send_notification_transport
+from notification_transport import (
+    NotificationDeliveryResult,
+    build_subscribe_keyboard,
+    send_notification_transport_result,
+)
 from translation_service import (
     normalize_locale,
     refresh_translation_cache,
@@ -198,7 +202,7 @@ async def enqueue_outbox_event(
 async def dispatch_outbox_by_key(
     bot: Bot,
     unique_key: str,
-    deliver_func: Callable[..., Awaitable[bool]] = send_notification_transport,
+    deliver_func: Callable[..., Awaitable[bool | NotificationDeliveryResult]] = send_notification_transport_result,
     session_maker: Any | None = None,
 ) -> bool:
     """
@@ -278,7 +282,7 @@ async def dispatch_outbox_by_key(
 
             is_timeout = False
             try:
-                delivered = await asyncio.wait_for(
+                delivery_result = await asyncio.wait_for(
                     deliver_func(
                         bot,
                         row.recipient_id,
@@ -289,9 +293,19 @@ async def dispatch_outbox_by_key(
                     ),
                     timeout=OUTBOX_DELIVERY_TIMEOUT_SECONDS,
                 )
+                if isinstance(delivery_result, NotificationDeliveryResult):
+                    delivered = delivery_result.delivered
+                    retryable = delivery_result.retryable
+                    failure_reason = delivery_result.reason
+                else:
+                    delivered = bool(delivery_result)
+                    retryable = True
+                    failure_reason = None
             except asyncio.TimeoutError:
                 delivered = False
                 is_timeout = True
+                retryable = True
+                failure_reason = "transport_delivery_timeout"
                 log.warning(
                     "OUTBOX_DELIVERY_TIMEOUT | key=%s | recipient=%s | timeout=%ss",
                     row.unique_key,
@@ -300,6 +314,8 @@ async def dispatch_outbox_by_key(
                 )
             except Exception as e:
                 delivered = False
+                retryable = True
+                failure_reason = f"{type(e).__name__}:{e}"
                 log.warning(
                     "OUTBOX_DELIVERY_EXCEPTION | key=%s | recipient=%s | err=%s",
                     row.unique_key,
@@ -325,8 +341,15 @@ async def dispatch_outbox_by_key(
                 return True
             else:
                 backoff = get_outbox_backoff(row.attempts)
-                new_status = "failed_terminal" if row.attempts >= row.max_attempts else "pending"
-                last_err = "transport_delivery_timeout" if is_timeout else "transport_delivery_failed"
+                new_status = (
+                    "failed_terminal"
+                    if not retryable or row.attempts >= row.max_attempts
+                    else "pending"
+                )
+                if not retryable:
+                    last_err = failure_reason or "transport_delivery_terminal"
+                else:
+                    last_err = "transport_delivery_timeout" if is_timeout else "transport_delivery_failed"
                 await session.execute(
                     update(PaymentNotificationOutbox)
                     .where(PaymentNotificationOutbox.id == row.id, PaymentNotificationOutbox.claim_token == token)
@@ -351,10 +374,11 @@ async def dispatch_outbox_by_key(
                     await _send_admin_terminal_failure_alert(bot, row)
                 else:
                     log.warning(
-                        "OUTBOX_DELIVERY_RETRY_SCHEDULED | key=%s | attempts=%s | next_retry=%s",
+                        "OUTBOX_DELIVERY_RETRY_SCHEDULED | key=%s | attempts=%s | next_retry=%s | reason=%s",
                         row.unique_key,
                         row.attempts,
                         now_done + backoff,
+                        failure_reason or last_err,
                     )
                 return False
     except Exception as e:
@@ -364,7 +388,7 @@ async def dispatch_outbox_by_key(
 
 async def process_payment_notification_outbox(
     bot: Bot,
-    deliver_func: Callable[..., Awaitable[bool]] = send_notification_transport,
+    deliver_func: Callable[..., Awaitable[bool | NotificationDeliveryResult]] = send_notification_transport_result,
     batch_size: int = 50,
     session_maker: Any | None = None,
 ) -> int:
