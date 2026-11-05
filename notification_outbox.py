@@ -21,6 +21,7 @@ from database import (
     SubscriptionPlan,
     User,
     UserSubscription,
+    YookassaRecurringAttempt,
     async_session_maker,
     get_all_admin_ids,
 )
@@ -177,6 +178,58 @@ async def _subscription_reminder_is_current(
         current_now = _normalize_datetime_for_compare(now)
         if current_end_date > current_now:
             return False, "subscription_renewed"
+
+    return True, None
+
+
+async def _payment_attempt_notification_is_current(
+    session,
+    recipient_id: int,
+    payload: dict[str, Any],
+) -> tuple[bool, str | None]:
+    snapshot = payload.get("payment_attempt_snapshot")
+    if not isinstance(snapshot, dict):
+        return True, None
+
+    snapshot_id = snapshot.get("id")
+    if snapshot_id is None:
+        return False, "invalid_snapshot"
+    try:
+        attempt_id = int(snapshot_id)
+    except (TypeError, ValueError):
+        return False, "invalid_snapshot"
+
+    attempt = await session.get(YookassaRecurringAttempt, attempt_id)
+    if attempt is None:
+        return False, "attempt_missing"
+    try:
+        recipient_key = int(recipient_id)
+        attempt_user_id = int(attempt.user_id)
+    except (TypeError, ValueError):
+        return False, "invalid_snapshot"
+    if attempt_user_id != recipient_key:
+        return False, "recipient_changed"
+
+    expected_subscription_id = snapshot.get("subscription_id")
+    if expected_subscription_id is not None:
+        try:
+            if int(attempt.subscription_id) != int(expected_subscription_id):
+                return False, "subscription_changed"
+        except (TypeError, ValueError):
+            return False, "invalid_snapshot"
+    expected_user_id = snapshot.get("user_id")
+    if expected_user_id is not None:
+        try:
+            if attempt_user_id != int(expected_user_id):
+                return False, "user_changed"
+        except (TypeError, ValueError):
+            return False, "invalid_snapshot"
+    if "idempotency_key" in snapshot and attempt.idempotency_key != snapshot.get("idempotency_key"):
+        return False, "idempotency_key_changed"
+    if "status" in snapshot and attempt.status != snapshot.get("status"):
+        return False, "status_changed"
+    if "payment_id" in snapshot and attempt.payment_id != snapshot.get("payment_id"):
+        return False, "payment_id_changed"
 
     return True, None
 
@@ -353,6 +406,12 @@ async def dispatch_outbox_by_key(
                     payload,
                     datetime.utcnow(),
                 )
+                if is_current:
+                    is_current, stale_reason = await _payment_attempt_notification_is_current(
+                        session,
+                        row.recipient_id,
+                        payload,
+                    )
                 if not is_current:
                     now_cancelled = datetime.utcnow()
                     await session.execute(

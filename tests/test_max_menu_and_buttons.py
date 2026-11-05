@@ -16,7 +16,16 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 import database
 import handlers
 import keyboards as tg_kb
-from database import Base, Content, SubscriptionBenefitGrant, SubscriptionConfig, Topic, User, UserSubscription
+from database import (
+    Base,
+    Content,
+    SubscriptionBenefitGrant,
+    SubscriptionConfig,
+    SubscriptionPlan,
+    Topic,
+    User,
+    UserSubscription,
+)
 import max_messenger_bot.legacy as max_legacy
 import max_messenger_bot.storage as max_storage
 from max_messenger_bot import app as max_app
@@ -238,6 +247,101 @@ async def test_max_referral_registration_accumulates_welcome_and_referral_days(d
     sent_text = "\n".join(call.kwargs.get("text", "") for call in mock_client.send_message.await_args_list)
     assert "1 бонусных дн." in sent_text
     assert "Всего начислено 4 бонусных дн." in sent_text
+
+
+@pytest.mark.asyncio
+async def test_max_robokassa_actions_follow_real_application_callbacks(db_session, monkeypatch):
+    import scheduler
+
+    base_id = 1000
+    user_ids = [MAX_ID_OFFSET + base_id + offset for offset in range(3)]
+    plan_id = 9100
+    now = datetime.utcnow()
+    async with db_session() as session:
+        session.add(
+            SubscriptionConfig(
+                id=1,
+                subscriptions_enabled=True,
+                referral_enabled=False,
+                robokassa_merchant_login="merchant",
+                robokassa_password_1="password-1",
+                robokassa_password_2="password-2",
+            )
+        )
+        session.add(
+            SubscriptionPlan(
+                id=plan_id,
+                name="Robokassa journey plan",
+                price=500.0,
+                duration_value=1,
+                duration_unit="months",
+                is_active=True,
+            )
+        )
+        for user_id in user_ids:
+            session.add(User(id=user_id, first_name="MAX journey", name="MAX journey"))
+            session.add(
+                UserSubscription(
+                    id=user_id - MAX_ID_OFFSET,
+                    user_id=user_id,
+                    plan_id=plan_id,
+                    start_date=now - timedelta(days=31),
+                    end_date=now - timedelta(hours=2),
+                    auto_renewal=True,
+                    payment_provider="Robokassa",
+                    payment_method_id=f"pm-{user_id}",
+                    pending_robokassa_invoice_id=base_id + (user_id - user_ids[0]) + 1,
+                    payment_attempt_count=1,
+                    last_payment_attempt=now - timedelta(hours=4),
+                )
+            )
+        await session.commit()
+
+    client = SimpleNamespace(
+        send_message=AsyncMock(),
+        answer_callback=AsyncMock(),
+        get_me=AsyncMock(return_value={"username": "journey_bot"}),
+    )
+    app = MaxBotApplication(client=client)
+
+    def callback(user_id: int, payload: str, suffix: str) -> IncomingCallback:
+        return IncomingCallback(
+            raw={},
+            callback_id=f"robokassa-{suffix}",
+            payload=payload,
+            chat_id=user_id,
+            message_id=f"message-{suffix}",
+            sender=Sender(
+                user_id=user_id,
+                username="max_journey",
+                first_name="MAX journey",
+                last_name=None,
+            ),
+        )
+
+    cancel_user = user_ids[0]
+    await app.handle_callback(callback(cancel_user, "sub_cancel_retry", "cancel"))
+    async with db_session() as session:
+        cancelled_sub = await session.scalar(select(UserSubscription).where(UserSubscription.user_id == cancel_user))
+    assert cancelled_sub.auto_renewal is False
+    assert any("Автопродление отключено" in call.kwargs.get("text", "") for call in client.send_message.await_args_list)
+    assert any(call.kwargs.get("attachments") for call in client.send_message.await_args_list)
+
+    promo_user = user_ids[1]
+    await app.handle_callback(callback(promo_user, "sub_enter_promo", "promo"))
+    promo_state = await app.states.get(promo_user)
+    assert promo_state is not None
+    assert promo_state.state == "awaiting_promo_code"
+    assert "Введите промокод" in client.send_message.await_args_list[-1].kwargs["text"]
+    await app.handle_callback(callback(promo_user, "main_menu", "promo-return"))
+    assert client.send_message.await_args_list[-1].kwargs["text"] == "Раздел меню пока не настроен."
+
+    retry_user = user_ids[2]
+    monkeypatch.setattr(scheduler, "process_recurring_robokassa_payment", AsyncMock(return_value="provider_error"))
+    answers_before_retry = client.answer_callback.await_count
+    await app.handle_callback(callback(retry_user, "sub_retry_now", "retry"))
+    assert "Robokassa временно недоступен" in client.send_message.await_args_list[-1].kwargs["text"]
+    assert client.answer_callback.await_count == answers_before_retry + 1
 
 
 @pytest.mark.asyncio

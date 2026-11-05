@@ -265,6 +265,169 @@ class NotificationTransportReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row.status, "cancelled")
         self.assertEqual(row.last_error, "subscription_reminder_stale:end_date_changed")
 
+    async def test_subscription_renewal_uses_new_reminder_outbox_key(self):
+        from datetime import datetime, timedelta
+
+        import database
+        from database import User, UserSubscription
+        from scheduler import (
+            _send_deduplicated_notification,
+            _subscription_notification_snapshot,
+            _subscription_reminder_key,
+        )
+        from sqlalchemy import select
+
+        await database.init_db()
+        user_id = 781
+        first_end = datetime.utcnow() + timedelta(days=2, minutes=30)
+        async with database.async_session_maker() as session:
+            session.add(
+                UserSubscription(
+                    id=user_id,
+                    user_id=user_id,
+                    plan_id=None,
+                    start_date=datetime.utcnow(),
+                    end_date=first_end,
+                    payment_provider="Yookassa",
+                    auto_renewal=True,
+                )
+            )
+            session.add(User(id=user_id, first_name="Renewed reminder user"))
+            await session.commit()
+
+        async with database.async_session_maker() as session:
+            subscription = await session.get(UserSubscription, user_id)
+        first_key = _subscription_reminder_key(subscription, "renewal_reminder", "trial", "2d")
+        first_result = await _send_deduplicated_notification(
+            MagicMock(send_message=AsyncMock(return_value=True)),
+            user_id,
+            "До окончания осталось 2 дня",
+            first_key,
+            datetime.utcnow(),
+            subscription_snapshot=_subscription_notification_snapshot(subscription, "2d"),
+        )
+
+        async with database.async_session_maker() as session:
+            subscription = await session.get(UserSubscription, user_id)
+            subscription.end_date = datetime.utcnow() + timedelta(days=2, minutes=30)
+            await session.commit()
+        second_key = _subscription_reminder_key(subscription, "renewal_reminder", "trial", "2d")
+        second_result = await _send_deduplicated_notification(
+            MagicMock(send_message=AsyncMock(return_value=True)),
+            user_id,
+            "До окончания осталось 2 дня",
+            second_key,
+            datetime.utcnow(),
+            subscription_snapshot=_subscription_notification_snapshot(subscription, "2d"),
+        )
+
+        self.assertNotEqual(first_key, second_key)
+        self.assertTrue(first_result)
+        self.assertTrue(second_result)
+        async with database.async_session_maker() as session:
+            rows = (
+                await session.execute(
+                    select(database.PaymentNotificationOutbox).where(
+                        database.PaymentNotificationOutbox.recipient_id == user_id
+                    )
+                )
+            ).scalars().all()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row.status for row in rows}, {"delivered"})
+
+    async def test_yookassa_attempt_notification_is_cancelled_after_attempt_state_changes(self):
+        from datetime import datetime, timedelta
+
+        import database
+        from database import User, UserSubscription, YookassaRecurringAttempt
+        from scheduler import (
+            _send_deduplicated_notification,
+            _subscription_notification_snapshot,
+            _yookassa_attempt_notification_snapshot,
+        )
+        from sqlalchemy import select
+
+        await database.init_db()
+        user_id = 782
+        now = datetime.utcnow()
+        async with database.async_session_maker() as session:
+            subscription = UserSubscription(
+                id=user_id,
+                user_id=user_id,
+                plan_id=1,
+                start_date=now - timedelta(days=30),
+                end_date=now + timedelta(days=30),
+                payment_provider="Yookassa",
+                payment_method_id="pm-yookassa-782",
+                auto_renewal=True,
+            )
+            attempt = YookassaRecurringAttempt(
+                id=user_id,
+                subscription_id=user_id,
+                user_id=user_id,
+                plan_id=1,
+                idempotency_key="yk-rec-782-state",
+                amount=500.0,
+                payment_method_id="pm-yookassa-782",
+                status="pending",
+                payment_id="yk-payment-782",
+                attempt_started_at=now,
+            )
+            session.add_all([User(id=user_id, first_name="Yookassa user"), subscription, attempt])
+            await session.commit()
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock(side_effect=Exception("temporary network failure"))
+        key = "yk_pending:782:yk-payment-782"
+        async with database.async_session_maker() as session:
+            subscription = await session.get(UserSubscription, user_id)
+            attempt = await session.get(YookassaRecurringAttempt, user_id)
+            snapshot = _subscription_notification_snapshot(subscription, "yookassa_pending")
+            attempt_snapshot = _yookassa_attempt_notification_snapshot(attempt, "pending")
+
+        first = await _send_deduplicated_notification(
+            bot,
+            user_id,
+            "Запрос YooKassa ожидает подтверждения",
+            key,
+            datetime.utcnow(),
+            subscription_snapshot=snapshot,
+            payment_attempt_snapshot=attempt_snapshot,
+        )
+        self.assertFalse(first)
+
+        async with database.async_session_maker() as session:
+            attempt = await session.get(YookassaRecurringAttempt, user_id)
+            attempt.status = "succeeded"
+            row = await session.scalar(
+                select(database.PaymentNotificationOutbox).where(
+                    database.PaymentNotificationOutbox.unique_key == f"scheduler:notification:{user_id}:{key}"
+                )
+            )
+            row.next_retry_at = datetime.utcnow() - timedelta(minutes=1)
+            await session.commit()
+
+        second = await _send_deduplicated_notification(
+            bot,
+            user_id,
+            "Запрос YooKassa ожидает подтверждения",
+            key,
+            datetime.utcnow(),
+            subscription_snapshot=snapshot,
+            payment_attempt_snapshot=attempt_snapshot,
+        )
+        self.assertFalse(second)
+        bot.send_message.assert_awaited_once()
+
+        async with database.async_session_maker() as session:
+            row = await session.scalar(
+                select(database.PaymentNotificationOutbox).where(
+                    database.PaymentNotificationOutbox.unique_key == f"scheduler:notification:{user_id}:{key}"
+                )
+            )
+        self.assertEqual(row.status, "cancelled")
+        self.assertEqual(row.last_error, "subscription_reminder_stale:status_changed")
+
     async def test_robokassa_pending_keyboard_survives_scheduler_outbox(self):
         from datetime import datetime, timedelta
 
