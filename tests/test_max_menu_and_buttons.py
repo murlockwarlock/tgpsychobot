@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -280,6 +281,13 @@ async def test_max_robokassa_actions_follow_real_application_callbacks(db_sessio
             )
         )
         session.add(
+            Content(
+                key="menu",
+                text_content="Главное меню MAX\n[Подписка](btn:svc:subscription)",
+                is_visible=True,
+            )
+        )
+        session.add(
             SubscriptionPlan(
                 id=plan_id,
                 name="Robokassa journey plan",
@@ -354,7 +362,36 @@ async def test_max_robokassa_actions_follow_real_application_callbacks(db_sessio
     menu_payload = _max_callback_from_call(promo_prompt, "в меню")
     await app.handle_callback(callback(promo_user, menu_payload, "promo-return"))
     assert await app.states.get(promo_user) is None
-    assert client.send_message.await_args_list[-1].kwargs["text"] == "Раздел меню пока не настроен."
+    menu_call = client.send_message.await_args_list[-1]
+    assert menu_call.kwargs["text"] == "Главное меню MAX"
+    assert _max_callback_from_call(menu_call, "подписка") == "ai_btn:svc:subscription"
+
+    promo_handler = AsyncMock()
+    dialogue = AsyncMock()
+    monkeypatch.setattr(max_app.subscriptions_service, "apply_promo_code", promo_handler)
+    monkeypatch.setattr(max_app.common, "maybe_require_disclaimer", AsyncMock(return_value=False))
+    monkeypatch.setattr(max_app.common, "ensure_access_before_chat", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_app.common, "run_ai_dialogue", dialogue)
+    await app.handle_message(
+        IncomingMessage(
+            raw={},
+            message_id="promo-normal-message",
+            chat_id=promo_user,
+            sender=Sender(
+                user_id=promo_user,
+                username="max_journey",
+                first_name="MAX journey",
+                last_name=None,
+            ),
+            text="Обычный вопрос после меню",
+        )
+    )
+    pending_tasks = tuple(app.background_tasks)
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks)
+    promo_handler.assert_not_awaited()
+    dialogue.assert_awaited_once()
+    assert dialogue.await_args.args[3] == "Обычный вопрос после меню"
 
     retry_user = user_ids[2]
     monkeypatch.setattr(scheduler, "process_recurring_robokassa_payment", AsyncMock(return_value="provider_error"))
