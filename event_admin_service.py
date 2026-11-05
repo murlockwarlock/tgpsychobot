@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from database import (
+    EVENT_TITLE_MAX_LENGTH,
     DeepLinkNamespace,
     EventDelivery,
     EventDeliveryPart,
@@ -71,6 +72,18 @@ EVENT_DELIVERY_STATUSES = [
 ]
 
 PROBLEM_DELIVERY_STATUSES = ["uncertain", "failed", "blocked"]
+EVENT_LIST_TITLE_PREVIEW_CHARS = 80
+EVENT_BUTTON_TITLE_PREVIEW_CHARS = 52
+
+
+def compact_event_title(title: str, *, limit: int = EVENT_LIST_TITLE_PREVIEW_CHARS) -> str:
+    """Single-line caption for list views; the stored title stays unchanged."""
+    compact = " ".join(title.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit - 1].rstrip() + "…"
+
+
 _UNSET = object()
 
 
@@ -392,8 +405,10 @@ def validate_scenario_input(
         raise ValueError("Тип сценария должен быть 'webinar' или 'meeting'.")
 
     title_clean = (title or "").strip()
-    if not title_clean or len(title_clean) > 255:
-        raise ValueError("Название сценария обязательно и должно содержать от 1 до 255 символов.")
+    if not title_clean or len(title_clean) > EVENT_TITLE_MAX_LENGTH:
+        raise ValueError(
+            f"Название сценария обязательно и должно содержать от 1 до {EVENT_TITLE_MAX_LENGTH} символов."
+        )
 
     if not (15 <= duration_minutes <= 1440):
         raise ValueError("Продолжительность мероприятия должна быть от 15 до 1440 минут (24 ч).")

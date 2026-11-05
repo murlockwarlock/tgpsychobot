@@ -28,6 +28,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from database import async_session_maker, get_all_admin_ids
 from admin_html_preview import truncate_html_preview
 from event_admin_service import (
+    EVENT_TITLE_MAX_LENGTH,
+    EVENT_BUTTON_TITLE_PREVIEW_CHARS,
+    compact_event_title,
     PRESET_OFFSETS,
     PROBLEM_DELIVERY_STATUSES,
     DeliveryItem,
@@ -157,7 +160,7 @@ def _scenarios_list_keyboard(
     for s in scenarios:
         status_icon = "📦" if s.is_archived else ("🟢" if s.is_active else "⚪️")
         type_icon = "💻" if s.event_type == "webinar" else "📍"
-        btn_text = f"{status_icon} {type_icon} {s.title} ({s.starts_at_msk[:10]})"
+        btn_text = f"{status_icon} {type_icon} {compact_event_title(s.title, limit=EVENT_BUTTON_TITLE_PREVIEW_CHARS)} ({s.starts_at_msk[:10]})"
         builder.button(text=btn_text, callback_data=f"admin_ev_open_{s.id}_{page}_{1 if include_archived else 0}")
 
     builder.adjust(1)
@@ -487,7 +490,7 @@ async def _show_scenarios_page(callback: CallbackQuery, page: int, include_archi
             status = "📦 В архиве" if s.is_archived else ("🟢 Активно" if s.is_active else "⚪️ Выключено")
             kind = "Вебинар" if s.event_type == "webinar" else "Очная встреча"
             text_lines.append(
-                f"<b>{idx + 1 + page * SCENARIOS_PAGE_SIZE}. {html.escape(s.title)}</b>\n"
+                f"<b>{idx + 1 + page * SCENARIOS_PAGE_SIZE}. {html.escape(compact_event_title(s.title))}</b>\n"
                 f"• Код: <code>{s.code}</code> | Тип: {kind}\n"
                 f"• Начало: {s.starts_at_msk}\n"
                 f"• Статус: {status} | Регистраций: <b>{s.registrations_count}</b>\n"
@@ -686,7 +689,7 @@ async def process_create_code(message: Message, state: FSMContext) -> None:
     await state.set_state(EventAdminStates.create_title)
     await message.answer(
         f"✅ Код принят: <code>{norm_code}</code>\n\n"
-        f"<b>Шаг 2 из 5:</b> Введите название мероприятия (до 255 символов):",
+        f"<b>Шаг 2 из 5:</b> Введите название мероприятия (до 1000 символов):",
         parse_mode="HTML",
     )
 
@@ -695,7 +698,7 @@ async def process_create_code(message: Message, state: FSMContext) -> None:
 async def process_create_title(message: Message, state: FSMContext) -> None:
     title = (message.text or "").strip()
     if not title or len(title) > 255:
-        await message.answer("❌ Название не должно быть пустым и не может превышать 255 символов. Попробуйте ещё раз:")
+        await message.answer("❌ Название не должно быть пустым и не может превышать 1000 символов. Попробуйте ещё раз:")
         return
 
     await state.update_data(create_title=title)
@@ -880,7 +883,7 @@ async def start_edit_title(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(edit_event_id=event_id, event_list_back=list_back)
     await state.set_state(EventAdminStates.edit_title)
     await callback.message.edit_text(
-        "✏️ Введите новое название мероприятия (до 255 символов):",
+        "✏️ Введите новое название мероприятия (до 1000 символов):",
         reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=_event_open_callback(event_id, list_back)).as_markup(),
     )
 

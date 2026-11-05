@@ -1920,3 +1920,101 @@ async def test_max_scenario_card_registration_link(db_session_maker, mock_client
     text = mock_client.send_message.call_args.kwargs["text"]
     assert "• <b>Ссылка для регистрации:</b> <code>https://max.ru/test_bot?start=max_link_test</code>" in text
     assert "• <b>Код события:</b> <code>max_link_test</code>" in text
+
+
+@pytest.mark.asyncio
+async def test_max_long_title_application_list_edit_cancel_save_reopen(db_session_maker, monkeypatch):
+    """MAX incoming callback/message -> real service -> rendered keyboard -> DB -> back."""
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    from event_admin_service import create_scenario
+    from max_messenger_bot import app as max_app_module
+
+    original = "А" * 1000
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_long_event_title",
+        event_type="webinar",
+        title=original,
+        starts_at_utc=datetime.utcnow() + timedelta(days=5),
+        link="https://example.test/max-long-title",
+    )
+    client = AsyncMock(spec=MaxApiClient)
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    async def press(payload):
+        client.reset_mock()
+        await app.handle_callback(
+            IncomingCallback(
+                raw={},
+                callback_id=f"long-title-{payload}",
+                payload=payload,
+                chat_id=123,
+                message_id=None,
+                sender=sender,
+            )
+        )
+        assert client.send_message.called, payload
+        return client.send_message.await_args_list[-1]
+
+    def button_payload(call, prefix):
+        for attachment in call.kwargs.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    if button.get("payload", "").startswith(prefix):
+                        return button["payload"], button.get("text", "")
+        raise AssertionError(f"No visible MAX button {prefix!r}")
+
+    try:
+        listing = await press("admin_events")
+        assert original not in listing.kwargs["text"]
+        assert len(listing.kwargs["text"]) < 4000
+        target, label = button_payload(listing, f"admin_ev_open_{scen.id}")
+        assert len(label) < 100 and "…" in label
+
+        card = await press(target)
+        assert original in card.kwargs["text"]
+        menu_payload, _ = button_payload(card, f"admin_ev_edit_menu_{scen.id}")
+        edit_menu = await press(menu_payload)
+        title_payload, _ = button_payload(edit_menu, f"admin_ev_edit_title_{scen.id}")
+        prompt = await press(title_payload)
+        assert "1000 символов" in prompt.kwargs["text"]
+        cancel_payload, _ = button_payload(prompt, f"admin_ev_open_{scen.id}")
+        card = await press(cancel_payload)
+        assert original in card.kwargs["text"]
+
+        edit_menu = await press(button_payload(card, f"admin_ev_edit_menu_{scen.id}")[0])
+        prompt = await press(button_payload(edit_menu, f"admin_ev_edit_title_{scen.id}")[0])
+        client.reset_mock()
+        await app.handle_message(
+            IncomingMessage(
+                raw={},
+                message_id="max-long-invalid",
+                chat_id=123,
+                sender=sender,
+                text="В" * 1001,
+            )
+        )
+        assert "1000" in client.send_message.await_args_list[-1].kwargs["text"]
+        assert (await app.states.get(456)).state == "max_event_edit_title"
+        client.reset_mock()
+        await app.handle_message(
+            IncomingMessage(
+                raw={},
+                message_id="max-long-valid",
+                chat_id=123,
+                sender=sender,
+                text="Б" * 1000,
+            )
+        )
+        async with db_session_maker() as session:
+            assert (await session.get(EventScenario, scen.id)).title == "Б" * 1000
+        card = await press(target)
+        assert "Б" * 1000 in card.kwargs["text"]
+        back_payload, _ = button_payload(card, "admin_events")
+        listing = await press(back_payload)
+        assert "Мероприятия и цепочки" in listing.kwargs["text"]
+    finally:
+        await app.states.clear(456)

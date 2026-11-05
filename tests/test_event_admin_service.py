@@ -1325,3 +1325,70 @@ async def test_claimed_delivery_offset_moved_past_skips(test_session_maker):
     assert stats["sent"] == 0
     assert not mock_bot.send_message.called
 
+
+
+def test_event_title_1000_boundaries_and_list_preview():
+    from database import EVENT_TITLE_MAX_LENGTH
+    from event_admin_service import (
+        EVENT_BUTTON_TITLE_PREVIEW_CHARS,
+        compact_event_title,
+    )
+
+    assert EVENT_TITLE_MAX_LENGTH == 1000
+    assert EventScenario.__table__.c.title.type.length == 1000
+    future = datetime.utcnow() + timedelta(days=5)
+    for length in (1, 255, 256, 999, 1000):
+        validate_scenario_input(
+            code="long_title_service",
+            event_type="webinar",
+            title="Т" * length,
+            starts_at_utc=future,
+            duration_minutes=120,
+            place=None,
+            link="https://example.test/event",
+        )
+    for bad_title in ("", "   ", "А" * 1001):
+        with pytest.raises(ValueError, match="1000"):
+            validate_scenario_input(
+                code="long_title_service",
+                event_type="webinar",
+                title=bad_title,
+                starts_at_utc=future,
+                duration_minutes=120,
+                place=None,
+                link="https://example.test/event",
+            )
+
+    full_title = "Очень   длинное\nназвание " + ("Я" * 1000)
+    preview = compact_event_title(full_title)
+    button = compact_event_title(full_title, limit=EVENT_BUTTON_TITLE_PREVIEW_CHARS)
+    assert "\n" not in preview
+    assert len(preview) <= 80 and preview.endswith("…")
+    assert len(button) <= EVENT_BUTTON_TITLE_PREVIEW_CHARS and button.endswith("…")
+    assert full_title.endswith("Я" * 1000)
+
+
+@pytest.mark.asyncio
+async def test_event_title_1000_create_edit_persist_and_reject_1001(test_session_maker):
+    original = "А" * 1000
+    scenario = await create_scenario(
+        test_session_maker,
+        code="long_title_roundtrip",
+        event_type="webinar",
+        title=original,
+        starts_at_utc=datetime.utcnow() + timedelta(days=5),
+        link="https://example.test/event",
+    )
+    assert scenario.title == original
+    async with test_session_maker() as session:
+        assert (await session.get(EventScenario, scenario.id)).title == original
+
+    updated_title = "Б" * 1000
+    updated = await update_scenario_fields(test_session_maker, scenario.id, title=updated_title)
+    assert updated.title == updated_title
+    with pytest.raises(ValueError, match="1000"):
+        await update_scenario_fields(test_session_maker, scenario.id, title="В" * 1001)
+    async with test_session_maker() as session:
+        assert (await session.get(EventScenario, scenario.id)).title == updated_title
+    listing = await list_scenarios(test_session_maker)
+    assert next(s.title for s in listing if s.id == scenario.id) == updated_title

@@ -1746,8 +1746,23 @@ async def test_real_postgresql_init_and_schema_verification():
 
             await database.init_db()
 
+            # Emulate the deployed VARCHAR(255) schema, then verify idempotent widening.
+            async with pg_engine.begin() as conn:
+                await conn.execute(text(
+                    "ALTER TABLE event_scenarios ALTER COLUMN title TYPE VARCHAR(255)"
+                ))
+            await database.init_db()
+
             async with pg_engine.connect() as conn:
                 await conn.run_sync(verify_event_reminder_chains_schema)
+                title_length = await conn.run_sync(
+                    lambda sync_conn: next(
+                        column["type"].length
+                        for column in inspect(sync_conn).get_columns("event_scenarios")
+                        if column["name"] == "title"
+                    )
+                )
+                assert title_length == 1000
     finally:
         await pg_engine.dispose()
 

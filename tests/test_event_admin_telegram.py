@@ -2115,3 +2115,82 @@ def test_scenario_card_text_with_and_without_bot_username():
     assert "• <b>Ссылка для регистрации:</b> <code>https://t.me/psycho_bot?start=webinar_ai</code>" in text_with
     assert "• <b>Код события (/start):</b> <code>webinar_ai</code>" in text_with
 
+
+
+@pytest.mark.asyncio
+async def test_telegram_long_title_real_dispatcher_list_edit_cancel_save_reopen(db_session_maker, monkeypatch):
+    """A->Z->A: actual keyboard callbacks and aiogram-validated Telegram methods."""
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    original = "А" * 1000
+    scen = await create_scenario(
+        db_session_maker,
+        code="telegram_long_event_title",
+        event_type="webinar",
+        title=original,
+        starts_at_utc=datetime.utcnow() + timedelta(days=5),
+        link="https://example.test/long-title",
+    )
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    def visible_callback(methods, prefix):
+        method = next(
+            m for m in methods
+            if isinstance(m, (EditMessageText, SendMessage)) and m.reply_markup is not None
+        )
+        for row in method.reply_markup.inline_keyboard:
+            for button in row:
+                if button.callback_data and button.callback_data.startswith(prefix):
+                    return button.callback_data
+        raise AssertionError(f"No visible button with prefix {prefix!r}")
+
+    try:
+        methods = await _feed_callback(dp, bot, "admin_events")
+        listing = next(m for m in methods if isinstance(m, EditMessageText))
+        assert original not in listing.text
+        assert len(listing.text) < 4096
+        target_callback = visible_callback(methods, f"admin_ev_open_{scen.id}")
+        button = next(b for row in listing.reply_markup.inline_keyboard for b in row if b.callback_data == target_callback)
+        assert len(button.text) < 100 and button.text.endswith(("… (" + scen.starts_at_msk[:10] + ")"))
+
+        methods = await _feed_callback(dp, bot, target_callback)
+        card = next(m for m in methods if isinstance(m, EditMessageText))
+        assert original in card.text
+        edit_callback = visible_callback(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await _feed_callback(dp, bot, edit_callback)
+        edit_title_callback = visible_callback(methods, f"admin_ev_edit_title_{scen.id}")
+        methods = await _feed_callback(dp, bot, edit_title_callback)
+        assert "1000 символов" in next(m for m in methods if isinstance(m, EditMessageText)).text
+        cancel_callback = visible_callback(methods, f"admin_ev_open_{scen.id}")
+        methods = await _feed_callback(dp, bot, cancel_callback)
+        assert original in next(m for m in methods if isinstance(m, EditMessageText)).text
+
+        methods = await _feed_callback(dp, bot, visible_callback(methods, f"admin_ev_edit_menu_{scen.id}"))
+        methods = await _feed_callback(dp, bot, visible_callback(methods, f"admin_ev_edit_title_{scen.id}"))
+        invalid = await _feed_message(dp, bot, "В" * 1001)
+        assert "1000 символов" in next(m for m in invalid if isinstance(m, SendMessage)).text
+        valid = await _feed_message(dp, bot, "Б" * 1000)
+        assert "Б" * 1000 in next(m for m in valid if isinstance(m, SendMessage)).text
+        async with db_session_maker() as session:
+            assert (await session.get(EventScenario, scen.id)).title == "Б" * 1000
+
+        methods = await _feed_callback(dp, bot, target_callback)
+        assert "Б" * 1000 in next(m for m in methods if isinstance(m, EditMessageText)).text
+        back_callback = visible_callback(methods, "admin_events")
+        methods = await _feed_callback(dp, bot, back_callback)
+        assert "Сценарии мероприятий" in next(m for m in methods if isinstance(m, EditMessageText)).text
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
