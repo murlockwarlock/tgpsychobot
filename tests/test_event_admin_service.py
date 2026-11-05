@@ -1392,3 +1392,11 @@ async def test_event_title_1000_create_edit_persist_and_reject_1001(test_session
         assert (await session.get(EventScenario, scenario.id)).title == updated_title
     listing = await list_scenarios(test_session_maker)
     assert next(s.title for s in listing if s.id == scenario.id) == updated_title
+
+    # The final user-visible message must retain the full title, not the list preview.
+    from event_delivery_worker import build_test_delivery_plan
+
+    plan = await build_test_delivery_plan(test_session_maker, scenario.id, None, None)
+    text_parts = [part["text"] for part in plan if part["kind"] == "text"]
+    assert updated_title in "\n".join(text_parts)
+    assert all(len(part) <= 4000 for part in text_parts)

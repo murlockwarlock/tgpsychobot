@@ -1929,6 +1929,10 @@ async def test_max_long_title_application_list_edit_cancel_save_reopen(db_sessio
     from event_admin_service import create_scenario
     from max_messenger_bot import app as max_app_module
 
+    # Full MAX API/application ingress invokes ensure_user before FSM handlers.
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+
     original = "А" * 1000
     scen = await create_scenario(
         db_session_maker,
@@ -2015,6 +2019,42 @@ async def test_max_long_title_application_list_edit_cancel_save_reopen(db_sessio
         assert "Б" * 1000 in card.kwargs["text"]
         back_payload, _ = button_payload(card, "admin_events")
         listing = await press(back_payload)
+        assert "Мероприятия и цепочки" in listing.kwargs["text"]
+
+        # Create another full-length title through the real MAX Application FSM.
+        create_payload, _ = button_payload(listing, "admin_ev_create_webinar")
+        prompt = await press(create_payload)
+        assert "Шаг 1 из 5" in prompt.kwargs["text"]
+
+        async def send_input(text, suffix):
+            client.reset_mock()
+            await app.handle_message(
+                IncomingMessage(
+                    raw={},
+                    message_id=f"max-title-create-{suffix}",
+                    chat_id=123,
+                    sender=sender,
+                    text=text,
+                )
+            )
+            assert client.send_message.called
+            return client.send_message.await_args_list[-1]
+
+        await send_input("max_new_long_title_event", "code")
+        title_prompt = await send_input("Г" * 1000, "title")
+        assert "Шаг 3 из 5" in title_prompt.kwargs["text"]
+        await send_input(
+            (datetime.utcnow() + timedelta(days=40)).strftime("%d.%m.%Y %H:%M"),
+            "date",
+        )
+        await send_input("120", "duration")
+        await send_input("https://example.test/new-max-long-title", "link")
+        async with db_session_maker() as session:
+            created = await session.scalar(
+                select(EventScenario).where(EventScenario.code == "max_new_long_title_event")
+            )
+            assert created is not None and created.title == "Г" * 1000
+        listing = await press("admin_events")
         assert "Мероприятия и цепочки" in listing.kwargs["text"]
     finally:
         await app.states.clear(456)

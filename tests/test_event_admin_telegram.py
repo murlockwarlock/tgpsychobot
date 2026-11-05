@@ -2191,6 +2191,28 @@ async def test_telegram_long_title_real_dispatcher_list_edit_cancel_save_reopen(
         back_callback = visible_callback(methods, "admin_events")
         methods = await _feed_callback(dp, bot, back_callback)
         assert "Сценарии мероприятий" in next(m for m in methods if isinstance(m, EditMessageText)).text
+
+        # Creation: real visible button, wizard inputs, saved DB row and screen.
+        create_callback = visible_callback(methods, "admin_ev_create_webinar")
+        methods = await _feed_callback(dp, bot, create_callback)
+        assert "Шаг 1 из 5" in next(m for m in methods if isinstance(m, EditMessageText)).text
+        await _feed_message(dp, bot, "tg_new_long_title_event")
+        methods = await _feed_message(dp, bot, "Г" * 1000)
+        assert "Шаг 3 из 5" in next(m for m in methods if isinstance(m, SendMessage)).text
+        await _feed_message(dp, bot, _future_msk_text(days=40))
+        await _feed_message(dp, bot, "120")
+        methods = await _feed_message(dp, bot, "https://example.test/new-long-title")
+        created_card = next(m for m in methods if isinstance(m, SendMessage))
+        assert "Мероприятие успешно создано" in created_card.text
+        assert "Г" * 1000 in created_card.text
+        async with db_session_maker() as session:
+            created = await session.scalar(
+                select(EventScenario).where(EventScenario.code == "tg_new_long_title_event")
+            )
+            assert created is not None and created.title == "Г" * 1000
+        list_callback = visible_callback(methods, "admin_events")
+        methods = await _feed_callback(dp, bot, list_callback)
+        assert "Сценарии мероприятий" in next(m for m in methods if isinstance(m, EditMessageText)).text
     finally:
         for router in routers:
             router._parent_router = original_parents[router]
