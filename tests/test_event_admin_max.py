@@ -2274,3 +2274,171 @@ async def test_max_long_title_application_list_edit_cancel_save_reopen(db_sessio
         assert "Мероприятия и цепочки" in listing.kwargs["text"]
     finally:
         await app.states.clear(456)
+
+
+@pytest.mark.asyncio
+async def test_max_real_application_limits_error_screen_edit_and_reopen_journey(db_session_maker, monkeypatch):
+    """Real MAX Application journey:
+
+    1. Open event description editor and enter long description exceeding safe caption limit.
+    2. Press the real Save button.
+    3. Receive validated outgoing message explaining limit excess (platform, actual length, limit, excess, recommendation).
+    4. Verify working edit buttons on error screen (edit description, edit title, format menu, save, cancel draft).
+    5. Test unified draft across format change and cancel draft.
+    6. Fix description text to a valid length.
+    7. Press Save and verify success confirmation.
+    8. Reopen event card and verify updated description in DB and card view.
+    """
+    from max_messenger_bot import app as max_app_module
+    from max_messenger_bot.app import MaxBotApplication
+    from max_messenger_bot.api import MaxApiClient
+    from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
+    from event_admin_service import create_scenario, update_scenario_fields
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    now = datetime.utcnow()
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_journey_limits",
+        event_type="webinar",
+        title="MAX Journey Limits Webinar",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/max-journey",
+        media_format="separate_media_top",
+    )
+    async with db_session_maker() as session:
+        session.add(EventScenarioMedia(
+            event_id=scen.id,
+            file_type="photo",
+            file_id="max_photo_1",
+            max_token="max_photo_1",
+            source_platform="max",
+            sort_order=0,
+        ))
+        await session.commit()
+    await update_scenario_fields(db_session_maker, scen.id, media_format="caption")
+
+    client = AsyncMock(spec=MaxApiClient)
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+
+    async def press(payload):
+        client.reset_mock()
+        await app.handle_callback(
+            IncomingCallback(
+                raw={},
+                callback_id=f"journey-{payload}",
+                payload=payload,
+                chat_id=123,
+                message_id=None,
+                sender=sender,
+            )
+        )
+        assert client.send_message.called, f"No message sent for callback {payload}"
+        return client.send_message.await_args_list[-1]
+
+    async def send_msg(text):
+        client.reset_mock()
+        await app.handle_message(
+            IncomingMessage(
+                raw={},
+                message_id="msg-journey",
+                chat_id=123,
+                sender=sender,
+                text=text,
+            )
+        )
+        assert client.send_message.called, f"No message sent for text {text[:20]}"
+        return client.send_message.await_args_list[-1]
+
+    def get_buttons(call):
+        res = []
+        for attachment in call.kwargs.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    res.append((button.get("payload", ""), button.get("text", "")))
+        return res
+
+    try:
+        # Step 1: Open description editor
+        call = await press(f"admin_ev_edit_description_{scen.id}")
+        assert "Описание мероприятия" in call.kwargs["text"]
+
+        # Step 2: Feed long description exceeding caption limit (950 chars > 900)
+        long_desc = "Д" * 950
+        call = await send_msg(long_desc)
+        assert "Черновик обновлён" in call.kwargs["text"]
+
+        # Step 3: Press real Save button
+        call = await press(f"admin_ev_description_save_{scen.id}")
+        error_text = call.kwargs["text"]
+        assert "Невозможно сохранить изменения!" in error_text
+        assert "• Платформа: <b>TELEGRAM</b>" in error_text or "• Платформа: <b>MAX</b>" in error_text
+        assert "Фактическая длина:" in error_text
+        assert "лимит:" in error_text
+        assert "Превышение:" in error_text
+        assert "Рекомендация:" in error_text
+
+        # Step 4: Verify working edit buttons on error screen
+        buttons = get_buttons(call)
+        button_payloads = [b[0] for b in buttons]
+        assert f"admin_ev_edit_description_{scen.id}" in button_payloads
+        assert f"admin_ev_edit_title_{scen.id}" in button_payloads
+        assert f"admin_ev_format_menu_{scen.id}" in button_payloads
+        assert f"admin_ev_description_save_{scen.id}" in button_payloads
+        assert f"admin_ev_cancel_draft_{scen.id}" in button_payloads
+
+        # Test unified draft: edit title while draft exists
+        call = await press(f"admin_ev_edit_title_{scen.id}")
+        assert "новое название" in call.kwargs["text"]
+        call = await send_msg("MAX Новое Название 🎯")
+        assert "Название в черновике обновлено" in call.kwargs["text"]
+
+        # Check DB is still untouched
+        async with db_session_maker() as session:
+            unchanged = await session.get(EventScenario, scen.id)
+            assert unchanged.title == "MAX Journey Limits Webinar"
+            assert unchanged.description is None
+
+        # Test cancel draft: click cancel draft button
+        call = await press(f"admin_ev_cancel_draft_{scen.id}")
+        assert any("Черновик сброшен" in c.kwargs.get("text", "") for c in client.send_message.await_args_list)
+        assert "Редактирование мероприятия" in call.kwargs["text"]
+        state_after_cancel = await app.states.get(456)
+        assert state_after_cancel is None or state_after_cancel.state is None
+
+        # Re-open description editor and feed long description again
+        call = await press(f"admin_ev_edit_description_{scen.id}")
+        call = await send_msg(long_desc)
+        call = await press(f"admin_ev_description_save_{scen.id}")
+        assert "Невозможно сохранить" in call.kwargs["text"]
+
+        # Step 5: Click edit description button from error screen
+        call = await press(f"admin_ev_edit_description_{scen.id}")
+        assert "Описание мероприятия" in call.kwargs["text"]
+
+        # Step 6: Fix text to valid length
+        valid_desc = "Корректное описание мероприятия для MAX."
+        call = await send_msg(valid_desc)
+        assert "Черновик обновлён" in call.kwargs["text"]
+
+        # Step 7: Click Save
+        call = await press(f"admin_ev_description_save_{scen.id}")
+        assert "сохранены" in call.kwargs["text"]
+
+        # Step 8: Reopen event card and check result
+        call = await press(f"admin_ev_open_{scen.id}")
+        assert valid_desc in call.kwargs["text"]
+
+        async with db_session_maker() as session:
+            refreshed = await session.get(EventScenario, scen.id)
+            assert refreshed.description == valid_desc
+            assert refreshed.media_mode == "caption"
+    finally:
+        await app.states.clear(456)
+

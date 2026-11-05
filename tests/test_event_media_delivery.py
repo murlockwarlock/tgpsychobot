@@ -1,7 +1,8 @@
 import os
 import io
+import asyncio
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault("BOT_TOKEN", "test_token")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
@@ -859,3 +860,82 @@ async def test_single_media_caption_uses_valid_delivery_part_kind(session_factor
         ))
         assert part.part_kind == "media"
         assert part.status == "sent"
+
+
+@pytest.mark.asyncio
+async def test_max_consecutive_messages_rate_limiting_sleep_pause(session_factory):
+    """Verifies that consecutive messages on MAX respect the 0.5s rate limit pause."""
+    from event_delivery_worker import send_test_delivery_plan
+    now = datetime.utcnow()
+    async with session_factory() as session:
+        session.add(User(id=9801, first_name="RateLimit User"))
+        scenario = EventScenario(
+            code="max_rate_limit_event",
+            event_type="webinar",
+            title="Rate Limit Webinar",
+            starts_at=now + timedelta(days=1),
+            duration_minutes=120,
+            link="https://example.test/rate-limit",
+            description="Текст для проверки rate limit",
+            media_mode="separate",
+            media_order="media_top",
+            is_active=True,
+        )
+        session.add(scenario)
+        await session.flush()
+        session.add(EventScenarioMedia(
+            event_id=scenario.id,
+            file_type="photo",
+            file_id="photo-1",
+            max_token="token-1",
+            sort_order=0,
+        ))
+        await session.commit()
+
+    registration = await register_user_for_event(
+        session_factory,
+        9801,
+        "max_rate_limit_event",
+        platform="max",
+        now=now,
+    )
+    claimed = await claim_pending_deliveries(session_factory, now=now)
+    assert claimed
+
+    max_client = AsyncMock()
+    max_client.send_message = AsyncMock(return_value={"message_id": "max_msg_1"})
+
+    sleep_calls = []
+    original_sleep = asyncio.sleep
+
+    async def mock_sleep(delay):
+        sleep_calls.append(delay)
+
+    with patch("event_delivery_worker.asyncio.sleep", side_effect=mock_sleep):
+        result = await process_single_delivery(
+            session_factory,
+            registration.immediate_delivery.id,
+            claimed[0][1],
+            max_client=max_client,
+            now=now,
+        )
+        assert result == "sent"
+        # Since this was a multi-part delivery on MAX (media + text + control),
+        # asyncio.sleep(0.5) must have been called between consecutive parts
+        assert 0.5 in sleep_calls
+
+    # Also verify send_test_delivery_plan has the pause
+    test_plan = [
+        {"kind": "media", "items": [{"file_type": "photo", "max_token": "tok1"}]},
+        {"kind": "text", "text": "Hello MAX"},
+    ]
+    test_sleep_calls = []
+    with patch("event_delivery_worker.asyncio.sleep", side_effect=lambda d: test_sleep_calls.append(d)):
+        await send_test_delivery_plan(
+            test_plan,
+            platform="max",
+            user_id=9801,
+            event_id=scenario.id,
+            max_client=max_client,
+        )
+        assert 0.5 in test_sleep_calls

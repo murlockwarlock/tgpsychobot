@@ -59,7 +59,7 @@ ALLOWED_EVENT_HTML_TAGS = frozenset({
 })
 
 _CUSTOM_EMOJI_PATTERN = re.compile(
-    r'<tg-emoji\b[^>]*\bemoji-id=["\']?([^"\'>]+)["\']?[^>]*>(.*?)</tg-emoji>',
+    r'<tg-emoji\b[^>]*\b(?:emoji-id|id)=["\']?([^"\'>]+)["\']?[^>]*>(.*?)</tg-emoji>',
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -110,6 +110,33 @@ def strip_telegram_custom_emoji(text: str) -> str:
     return _CUSTOM_EMOJI_PATTERN.sub(r"\2", text)
 
 
+def format_event_html_title(title: str, platform: str = "telegram") -> str:
+    """
+    Renders title safely:
+    - For Telegram: preserves valid <tg-emoji> tags while escaping other unsafe HTML characters.
+    - For MAX: replaces <tg-emoji> tags with Unicode fallback and escapes HTML characters.
+    """
+    if not title:
+        return ""
+    if platform == "max":
+        plain = strip_telegram_custom_emoji(title)
+        return html.escape(plain, quote=False)
+    if "<tg-emoji" not in title:
+        return html.escape(title, quote=False)
+
+    emoji_tokens: list[str] = []
+
+    def _repl(match: re.Match) -> str:
+        emoji_tokens.append(match.group(0))
+        return f"\x00EMOJI_{len(emoji_tokens) - 1}\x00"
+
+    tokenized = _CUSTOM_EMOJI_PATTERN.sub(_repl, title)
+    escaped = html.escape(tokenized, quote=False)
+    for idx, token in enumerate(emoji_tokens):
+        escaped = escaped.replace(f"\x00EMOJI_{idx}\x00", token)
+    return escaped
+
+
 def render_plain_text_for_max(text: str) -> str:
     """
     Renders text for MAX Bot API:
@@ -152,6 +179,17 @@ class TelegramHtmlValidator(HTMLParser):
         self.plain_tokens: list[str] = []
         self.errors: list[str] = []
 
+    @classmethod
+    def validate(cls, text: str, allowed_tags: frozenset[str] = ALLOWED_EVENT_HTML_TAGS) -> None:
+        """Parses and validates text, raising ValueError if HTML tags are invalid or unbalanced."""
+        if not text:
+            return
+        parser = cls(allowed_tags=allowed_tags)
+        parser.feed(text)
+        _, errors = parser.finish()
+        if errors:
+            raise ValueError("; ".join(errors))
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag_lower = tag.lower()
         if tag_lower not in self.allowed_tags:
@@ -162,7 +200,7 @@ class TelegramHtmlValidator(HTMLParser):
             if not has_href:
                 self.errors.append("Тег <a> обязан содержать атрибут href")
         elif tag_lower == "tg-emoji":
-            has_emoji_id = any(name.lower() == "emoji-id" and value for name, value in attrs)
+            has_emoji_id = any(name.lower() in ("emoji-id", "id") and value for name, value in attrs)
             if not has_emoji_id:
                 self.errors.append("Тег <tg-emoji> обязан содержать атрибут emoji-id")
         if tag_lower not in self.void_tags:
@@ -309,9 +347,54 @@ class ScenarioValidationResult:
 class EventContentValidationError(ValueError):
     """Raised on service/backend boundary when event content exceeds safe delivery limits."""
 
-    def __init__(self, message: str, result: ScenarioValidationResult):
+    def __init__(
+        self,
+        message: str,
+        result: ScenarioValidationResult | None = None,
+        *,
+        platform: str | None = None,
+        actual_length: int | None = None,
+        limit_length: int | None = None,
+        recommendation: str | None = None,
+        excess: int | None = None,
+    ):
         super().__init__(message)
         self.result = result
+        self._message = message
+        first = result.violations[0] if result and result.violations else None
+        self._platform = platform or (first.platform if first else "all")
+        self._actual_length = actual_length if actual_length is not None else (first.length if first else 0)
+        self._limit_length = limit_length if limit_length is not None else (first.limit if first else 0)
+        self._recommendation = recommendation if recommendation is not None else (first.recommendation if first and first.recommendation else "")
+        self._excess = excess if excess is not None else (first.excess if first else max(0, self._actual_length - self._limit_length))
+
+    @property
+    def message(self) -> str:
+        return self._message
+
+    @property
+    def platform(self) -> str:
+        return self._platform
+
+    @property
+    def actual_length(self) -> int:
+        return self._actual_length
+
+    @property
+    def limit_length(self) -> int:
+        return self._limit_length
+
+    @property
+    def recommendation(self) -> str:
+        return self._recommendation
+
+    @property
+    def excess(self) -> int:
+        return self._excess
+
+    @property
+    def primary_violation(self) -> PathValidationResult | None:
+        return self.result.violations[0] if self.result and self.result.violations else None
 
 
 # Stress test user probe with realistic maximum name length in Telegram (up to 64 chars)

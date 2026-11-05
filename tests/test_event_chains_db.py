@@ -1973,6 +1973,102 @@ async def test_real_postgresql_migration_backfills_delivery_content_version_snap
 
 
 @pytest.mark.asyncio
+async def test_real_postgresql_media_mode_migration_and_constraints():
+    """Real PostgreSQL migration test: verifies media_mode column addition, backfill, CHECK constraints, and idempotence."""
+    pg_engine, skip_reason = await _get_safe_postgres_engine()
+    if pg_engine is None:
+        pytest.skip(skip_reason)
+
+    try:
+        async with pg_engine.begin() as conn:
+            await conn.execute(text("DROP SCHEMA public CASCADE;"))
+            await conn.execute(text("CREATE SCHEMA public;"))
+            await conn.run_sync(Base.metadata.create_all)
+
+        # Emulate pre-migration schema: drop media_mode and its constraint
+        async with pg_engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE event_scenarios DROP CONSTRAINT IF EXISTS ck_event_scenarios_media_mode"))
+            await conn.execute(text("ALTER TABLE event_scenarios DROP COLUMN IF EXISTS media_mode"))
+
+        base_now = datetime.utcnow()
+        async with pg_engine.begin() as conn:
+            # Seed legacy user
+            await conn.execute(text("INSERT INTO users (id, first_name) VALUES (8888, 'Legacy User')"))
+            # Seed legacy event without media_mode column
+            await conn.execute(text(
+                "INSERT INTO event_scenarios (id, code, event_type, title, starts_at, duration_minutes, is_active, is_archived, schedule_revision, content_version, media_order) "
+                "VALUES (101, 'legacy_event_1', 'webinar', 'Historical Webinar', :starts_at, 120, true, false, 1, 1, 'media_top')"
+            ), {"starts_at": base_now + timedelta(days=1)})
+            # Seed registration and delivery
+            await conn.execute(text(
+                "INSERT INTO event_registrations (id, event_id, user_id, status, generation, registration_mode, registered_at) "
+                "VALUES (201, 101, 8888, 'started', 1, 'standard', :reg_at)"
+            ), {"reg_at": base_now})
+            await conn.execute(text(
+                "INSERT INTO event_deliveries (id, event_id, user_id, registration_id, message_kind, delivery_key, due_at, next_attempt_at, expires_at, schedule_revision, registration_generation, content_version_snapshot, platform, status) "
+                "VALUES (301, 101, 8888, 201, 'scheduled_step', 'ev:101:reg:201:step:1:r0', :due_at, :next_at, :exp_at, 1, 1, 1, 'telegram', 'pending')"
+            ), {"due_at": base_now, "next_at": base_now, "exp_at": base_now + timedelta(hours=2)})
+
+        sessions = async_sessionmaker(pg_engine, expire_on_commit=False, class_=AsyncSession)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(database, "engine", pg_engine)
+            mp.setattr(database, "async_session_maker", sessions)
+            # 1. Run migration via init_db
+            await database.init_db()
+            # 2. Verify idempotence: run init_db again without error
+            await database.init_db()
+
+        # Verify historical scenario backfilled to 'legacy_auto' while preserving all existing data
+        async with sessions() as session:
+            scen = await session.get(EventScenario, 101)
+            assert scen is not None
+            assert scen.id == 101
+            assert scen.title == "Historical Webinar"
+            assert scen.media_mode == "legacy_auto"
+            assert scen.media_order == "media_top"
+
+            delivery = await session.get(EventDelivery, 301)
+            assert delivery is not None
+            assert delivery.status == "pending"
+
+        # Verify CHECK constraint ck_event_scenarios_media_mode rejects invalid values
+        async with sessions() as session:
+            with pytest.raises(IntegrityError):
+                await session.execute(text(
+                    "INSERT INTO event_scenarios (code, event_type, title, starts_at, duration_minutes, is_active, is_archived, schedule_revision, content_version, media_order, media_mode) "
+                    "VALUES ('invalid_scen', 'webinar', 'Invalid Mode', :starts_at, 120, true, false, 1, 1, 'media_top', 'invalid_mode')"
+                ), {"starts_at": base_now + timedelta(days=2)})
+                await session.commit()
+
+        # Verify new event creation with explicit formats works on PostgreSQL
+        from event_admin_service import create_scenario
+        scen_sep = await create_scenario(
+            sessions,
+            code="new_pg_separate_event",
+            event_type="webinar",
+            title="New PG Separate Event",
+            starts_at_utc=base_now + timedelta(days=3),
+            media_format="separate_text_top",
+        )
+        assert scen_sep.media_mode == "separate"
+        assert scen_sep.media_order == "text_top"
+        assert scen_sep.media_format == "separate_text_top"
+
+        scen_cap = await create_scenario(
+            sessions,
+            code="new_pg_caption_event",
+            event_type="webinar",
+            title="New PG Caption Event",
+            starts_at_utc=base_now + timedelta(days=4),
+            media_format="caption",
+        )
+        assert scen_cap.media_mode == "caption"
+        assert scen_cap.media_format == "caption"
+    finally:
+        await pg_engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_real_postgresql_structural_invariants_and_retry_model():
     """Real PostgreSQL integration test: verifies CHECK constraints, partial unique index, and retry chaining on PostgreSQL."""
     pg_engine, skip_reason = await _get_safe_postgres_engine()

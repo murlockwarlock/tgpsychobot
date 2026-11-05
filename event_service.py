@@ -37,6 +37,7 @@ from database import (
 )
 from max_messenger_bot.identity import is_max_user_id
 from admin_html_preview import truncate_html_preview
+from event_content_validator import format_event_html_title, strip_telegram_custom_emoji
 from time_helpers import MSK, format_msk, to_msk, utc_now
 from user_metadata import load_metadata_records
 
@@ -563,10 +564,11 @@ def render_event_template(
         suffix="",
         allowed_tags={"b", "strong", "i", "em", "s", "strike", "u", "code", "pre", "a", "blockquote", "tg-spoiler", "tg-emoji"},
     )
+    title_val = format_event_html_title(scenario.title, platform)
     subs = {
         "name": html.escape(user_name, quote=False),
-        "event_title": html.escape(scenario.title, quote=False),
-        "title": html.escape(scenario.title, quote=False),
+        "event_title": title_val,
+        "title": title_val,
         "event_date": date_val,
         "new_date_msk": date_val,
         "event_time": time_val,
@@ -1703,11 +1705,12 @@ async def handle_event_start_telegram(
 
     if reg_res.status == "event_ended":
         title = reg_res.scenario.title if reg_res.scenario else norm_code
+        safe_title = format_event_html_title(title, "telegram")
         await bot.send_message(
             chat_id=chat_id,
             text=(
                 "Регистрация на мероприятие «"
-                f"{html.escape(title, quote=False)}» завершена, так как мероприятие уже прошло."
+                f"{safe_title}» завершена, так как мероприятие уже прошло."
             ),
             parse_mode="HTML",
         )
@@ -1720,7 +1723,7 @@ async def handle_event_start_telegram(
     )
 
     if reg_res.status == "already_registered":
-        safe_title = html.escape(scen.title, quote=False)
+        safe_title = format_event_html_title(scen.title, "telegram")
         safe_link_or_place = html.escape(scen.link or scen.place or "", quote=True)
         duration = timedelta(minutes=scen.duration_minutes)
         is_live = scen.starts_at <= effective_now < scen.starts_at + duration
@@ -1875,11 +1878,12 @@ async def handle_event_start_max(
 
     if reg_res.status == "event_ended":
         title = reg_res.scenario.title if reg_res.scenario else norm_code
+        safe_title = format_event_html_title(title, "max")
         await client.send_message(
             chat_id=chat_id,
             text=(
                 "Регистрация на мероприятие «"
-                f"{html.escape(title, quote=False)}» завершена, так как мероприятие уже прошло."
+                f"{safe_title}» завершена, так как мероприятие уже прошло."
             ),
         )
         return True
@@ -1889,7 +1893,7 @@ async def handle_event_start_max(
     attachments = inline_keyboard([[callback_button("❌ Не смогу прийти", f"ev_cancel:{scen.id}")]])
 
     if reg_res.status == "already_registered":
-        safe_title = html.escape(scen.title, quote=False)
+        safe_title = format_event_html_title(scen.title, "max")
         safe_link_or_place = html.escape(scen.link or scen.place or "", quote=True)
         duration = timedelta(minutes=scen.duration_minutes)
         is_live = scen.starts_at <= effective_now < scen.starts_at + duration

@@ -2054,7 +2054,7 @@ class MaxBotApplication:
             if data.startswith("admin_ev_format_menu_"):
                 parts = data.split("_")
                 event_id = int(parts[4])
-                await admin_events_service.show_format_menu(self.client, chat_id, event_id)
+                await admin_events_service.show_format_menu(self.client, chat_id, event_id, states=self.states, user_id=user_id)
                 return
             if data.startswith("admin_ev_set_fmt_"):
                 parts = data.split("_")
@@ -2078,6 +2078,10 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_ev_description_save_"):
                 await admin_events_service.save_description(self.client, self.states, chat_id, user_id)
+                return
+            if data.startswith("admin_ev_cancel_draft_"):
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.cancel_draft(self.client, self.states, chat_id, user_id, event_id)
                 return
             if data.startswith("admin_ev_description_delete_"):
                 event_id = int(data.split("_")[-1])

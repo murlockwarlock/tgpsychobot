@@ -2400,3 +2400,166 @@ async def test_telegram_long_title_navigation_preserves_page_and_archive_context
     finally:
         for router in routers:
             router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_real_dispatcher_limits_error_screen_edit_and_reopen_journey(db_session_maker, monkeypatch):
+    """Full A -> Z -> A real dispatcher journey:
+    1. Enter description exceeding limit
+    2. Click Save
+    3. Get validated outgoing error screen explaining excess without AttributeError
+    4. See working edit buttons
+    5. Fix text
+    6. Save successfully
+    7. Reopen event and verify updated description in DB and card.
+    """
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+    from database import EventScenarioMedia
+
+    now = datetime.utcnow()
+    scen = await create_scenario(
+        db_session_maker,
+        code="tg_journey_limits",
+        event_type="webinar",
+        title="Journey Limits Webinar",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/journey",
+        media_format="separate_media_top",
+    )
+    async with db_session_maker() as session:
+        session.add(EventScenarioMedia(
+            event_id=scen.id,
+            file_type="photo",
+            file_id="tg_photo_1",
+            sort_order=0,
+        ))
+        await session.commit()
+    from event_admin_service import update_scenario_fields
+    await update_scenario_fields(db_session_maker, scen.id, media_format="caption")
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    def extract_buttons(methods):
+        for m in methods:
+            if isinstance(m, (EditMessageText, SendMessage)) and m.reply_markup is not None:
+                return [b.callback_data for row in m.reply_markup.inline_keyboard for b in row if b.callback_data]
+        return []
+
+    try:
+        # Step 1: Open description editor
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_description_{scen.id}")
+        assert any(isinstance(m, EditMessageText) for m in methods)
+
+        # Step 2: Feed long description exceeding caption limit (950 chars > 900)
+        long_desc = "Д" * 950
+        methods = await _feed_message(dp, bot, long_desc)
+        assert any(isinstance(m, SendMessage) for m in methods)
+
+        # Step 3: Click Save
+        methods = await _feed_callback(dp, bot, f"admin_ev_description_save_{scen.id}")
+        error_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        # Verify validated outgoing message explaining excess
+        assert "Невозможно сохранить" in error_msg.text
+        assert "TELEGRAM" in error_msg.text
+        assert "Фактическая длина:" in error_msg.text
+        assert "лимит:" in error_msg.text
+        assert "Превышение:" in error_msg.text
+
+        # Step 4: Verify working edit buttons on error screen
+        buttons = extract_buttons([error_msg])
+        assert f"admin_ev_edit_description_{scen.id}" in buttons
+        assert f"admin_ev_edit_title_{scen.id}" in buttons
+        assert f"admin_ev_format_menu_{scen.id}" in buttons
+        assert f"admin_ev_description_save_{scen.id}" in buttons
+        assert f"admin_ev_cancel_draft_{scen.id}" in buttons
+
+        # Step 5: Click edit description button
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_description_{scen.id}")
+        assert any(isinstance(m, EditMessageText) for m in methods)
+
+        # Step 6: Fix text to valid length
+        valid_desc = "Корректное описание вебинара для проверки сохранения."
+        methods = await _feed_message(dp, bot, valid_desc)
+
+        # Step 7: Click Save
+        methods = await _feed_callback(dp, bot, f"admin_ev_description_save_{scen.id}")
+        success_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "сохранены" in success_msg.text
+
+        # Step 8: Reopen event card and check result
+        methods = await _feed_callback(dp, bot, f"admin_ev_open_{scen.id}")
+        card = next(m for m in methods if isinstance(m, EditMessageText))
+        assert valid_desc in card.text
+
+        async with db_session_maker() as session:
+            refreshed = await session.get(EventScenario, scen.id)
+            assert refreshed.description == valid_desc
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_real_dispatcher_custom_emoji_title_journey(db_session_maker, monkeypatch):
+    """Real dispatcher journey for custom emoji support in title."""
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    now = datetime.utcnow()
+    scen = await create_scenario(
+        db_session_maker,
+        code="tg_journey_custom_emoji",
+        event_type="webinar",
+        title="Обычное название",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/emoji",
+    )
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    try:
+        # Start edit title
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_title_{scen.id}")
+        assert any(isinstance(m, EditMessageText) for m in methods)
+
+        # Send title containing custom emoji tag
+        emoji_title = '<tg-emoji id="5368324170671202286">🔥</tg-emoji> Горячий вебинар'
+        methods = await _feed_message(dp, bot, emoji_title)
+        saved_msg = next(m for m in methods if isinstance(m, SendMessage))
+        # Must preserve <tg-emoji> without escaping into &lt;tg-emoji&gt;
+        assert '<tg-emoji id="5368324170671202286">🔥</tg-emoji>' in saved_msg.text
+        assert '&lt;tg-emoji' not in saved_msg.text
+
+        # Reopen card
+        methods = await _feed_callback(dp, bot, f"admin_ev_open_{scen.id}")
+        card = next(m for m in methods if isinstance(m, EditMessageText))
+        assert '<tg-emoji id="5368324170671202286">🔥</tg-emoji>' in card.text
+
+        async with db_session_maker() as session:
+            db_scen = await session.get(EventScenario, scen.id)
+            assert db_scen.title == emoji_title
+            assert len(db_scen.title) <= 1000
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
