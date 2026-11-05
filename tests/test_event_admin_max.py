@@ -2,6 +2,7 @@ import io
 import os
 import re
 import json
+import html
 from functools import wraps
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -27,7 +28,8 @@ from database import (
 )
 from max_messenger_bot.api import MaxApiClient
 from max_messenger_bot.app import MaxBotApplication
-from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
+from max_messenger_bot.formatting import MAX_MESSAGE_TEXT_LEN
+from max_messenger_bot.models import MAX_ID_OFFSET, IncomingCallback, IncomingMessage, Sender
 from max_messenger_bot.services import admin_events as max_admin_events
 from max_messenger_bot.storage import StateStore
 from time_helpers import utc_now
@@ -71,6 +73,45 @@ class MemoryStateStore:
 
     async def clear(self, user_id: int):
         self._store.pop(user_id, None)
+
+
+class _RecordedMaxResponse:
+    status = 200
+    content_type = "application/json"
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def text(self):
+        return json.dumps(self.payload, ensure_ascii=False)
+
+    async def json(self):
+        return self.payload
+
+
+class _RecordedMaxSession:
+    def __init__(self):
+        self.requests = []
+
+    def request(self, method, url, **kwargs):
+        body = kwargs.get("json")
+        if body is not None:
+            body = json.loads(json.dumps(body, ensure_ascii=False))
+        self.requests.append({
+            "method": method,
+            "url": url,
+            "params": dict(kwargs.get("params") or {}),
+            "body": body,
+        })
+        return _RecordedMaxResponse({
+            "message": {"body": {"mid": f"max-runtime-{len(self.requests)}"}},
+        })
 
 
 @pytest.fixture
@@ -786,6 +827,175 @@ async def test_max_paginated_card_mutations_and_stats_return_to_original_list(
         assert f"admin_ev_open_{target.id}_1_1" in last_payloads()
         await feed(f"admin_ev_open_{target.id}_1_1")
         assert "admin_ev_page_1_1" in last_payloads()
+    finally:
+        await app.states.clear(456)
+
+
+@pytest.mark.asyncio
+async def test_max_long_title_delivery_uses_serialized_runtime_request(db_session_maker):
+    from event_admin_service import create_scenario
+    from event_delivery_worker import build_test_delivery_plan, send_test_delivery_plan
+
+    title = "<&>" + "Я" * 997
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_title_delivery_runtime",
+        event_type="webinar",
+        title=title,
+        starts_at_utc=datetime.utcnow() + timedelta(days=5),
+        link="https://example.test/max-title-runtime",
+    )
+
+    async with db_session_maker() as session:
+        stored = await session.get(EventScenario, scen.id)
+        assert stored is not None and stored.title == title
+
+    plan = await build_test_delivery_plan(db_session_maker, scen.id, None, None)
+    client = MaxApiClient(token="test-token", base_url="https://max.test")
+    transport = _RecordedMaxSession()
+    client._session = transport
+
+    sent_ids = await send_test_delivery_plan(
+        plan,
+        platform="max",
+        user_id=MAX_ID_OFFSET + 456,
+        event_id=scen.id,
+        max_client=client,
+    )
+
+    assert sent_ids == ["max-runtime-1"]
+    assert len(transport.requests) == 1
+    request = transport.requests[0]
+    assert request["method"] == "POST"
+    assert request["url"] == "https://max.test/messages"
+    assert request["params"]["user_id"] == 456
+    body = request["body"]
+    assert body["format"] == "html"
+    assert html.escape(title, quote=False) in body["text"]
+    assert title in html.unescape(body["text"])
+    assert len(body["text"].encode("utf-16-le")) // 2 <= MAX_MESSAGE_TEXT_LEN
+    assert json.loads(json.dumps(body, ensure_ascii=False)) == body
+
+
+@pytest.mark.asyncio
+async def test_max_long_title_navigation_preserves_page_and_archive_context(db_session_maker, monkeypatch):
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    from max_messenger_bot import app as max_app_module
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+    from event_admin_service import archive_scenario, create_scenario
+
+    original_title = "А" * 1000
+    base_start = datetime.utcnow() + timedelta(days=5)
+    target = await create_scenario(
+        db_session_maker,
+        code="max_title_navigation_target",
+        event_type="webinar",
+        title=original_title,
+        starts_at_utc=base_start,
+        link="https://example.test/max-navigation",
+    )
+    for index in range(6):
+        filler = await create_scenario(
+            db_session_maker,
+            code=f"max_title_navigation_filler_{index}",
+            event_type="webinar",
+            title=f"Навигация {index}",
+            starts_at_utc=base_start + timedelta(days=1),
+            link=f"https://example.test/max-navigation/{index}",
+        )
+        if index == 0:
+            await archive_scenario(db_session_maker, filler.id)
+
+    transport = _RecordedMaxSession()
+    client = MaxApiClient(token="test-token", base_url="https://max.test")
+    client._session = transport
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+
+    async def press(payload):
+        transport.requests.clear()
+        await app.handle_callback(
+            IncomingCallback(
+                raw={},
+                callback_id=f"navigation-{payload}",
+                payload=payload,
+                chat_id=123,
+                message_id=None,
+                sender=sender,
+            )
+        )
+        assert transport.requests, payload
+        return transport.requests[-1]["body"]
+
+    async def send_input(text, suffix):
+        transport.requests.clear()
+        await app.handle_message(
+            IncomingMessage(
+                raw={},
+                message_id=f"max-navigation-{suffix}",
+                chat_id=123,
+                sender=sender,
+                text=text,
+            )
+        )
+        assert transport.requests, suffix
+        return transport.requests[-1]["body"]
+
+    def button_payload(body, prefix):
+        for attachment in body.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    payload = button.get("payload")
+                    if payload and payload.startswith(prefix):
+                        return payload
+        raise AssertionError(f"No visible MAX callback with prefix {prefix!r}")
+
+    try:
+        listing = await press("admin_events")
+        assert "Страница 1 из 1" in listing["text"]
+        listing = await press(button_payload(listing, "admin_ev_toggle_archive_view_1"))
+        assert "Страница 1 из 2" in listing["text"]
+
+        listing = await press(button_payload(listing, "admin_ev_page_1_1"))
+        assert "Страница 2 из 2" in listing["text"]
+        target_callback = button_payload(listing, f"admin_ev_open_{target.id}_1_1")
+
+        card = await press(target_callback)
+        assert original_title in card["text"]
+        edit_callback = button_payload(card, f"admin_ev_edit_menu_{target.id}_1_1")
+        edit_menu = await press(edit_callback)
+        title_callback = button_payload(edit_menu, f"admin_ev_edit_title_{target.id}")
+        prompt = await press(title_callback)
+        assert "1000 символов" in prompt["text"]
+        assert (await app.states.get(456)).state == "max_event_edit_title"
+
+        card = await press(button_payload(prompt, f"admin_ev_open_{target.id}_1_1"))
+        assert original_title in card["text"]
+        assert (await app.states.get(456)).state == "max_event_card"
+
+        edit_menu = await press(button_payload(card, f"admin_ev_edit_menu_{target.id}_1_1"))
+        prompt = await press(button_payload(edit_menu, f"admin_ev_edit_title_{target.id}"))
+        invalid = await send_input("В" * 1001, "invalid")
+        assert "1000" in invalid["text"]
+        assert (await app.states.get(456)).state == "max_event_edit_title"
+        async with db_session_maker() as session:
+            assert (await session.get(EventScenario, target.id)).title == original_title
+
+        updated_title = "Б" * 1000
+        saved_card = await send_input(updated_title, "save")
+        assert updated_title in saved_card["text"]
+        assert await app.states.get(456) is None
+        listing = await press(button_payload(saved_card, "admin_ev_page_1_1"))
+        assert "Страница 2 из 2" in listing["text"]
+        assert target.code in listing["text"]
+
+        card = await press(button_payload(listing, f"admin_ev_open_{target.id}_1_1"))
+        assert updated_title in card["text"]
+        assert button_payload(card, "admin_ev_page_1_1") == "admin_ev_page_1_1"
+        assert "Мероприятия и цепочки напоминаний" not in card["text"]
     finally:
         await app.states.clear(456)
 

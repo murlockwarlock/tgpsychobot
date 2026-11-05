@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import html
 from functools import wraps
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -2213,6 +2214,185 @@ async def test_telegram_long_title_real_dispatcher_list_edit_cancel_save_reopen(
         list_callback = visible_callback(methods, "admin_events")
         methods = await _feed_callback(dp, bot, list_callback)
         assert "Сценарии мероприятий" in next(m for m in methods if isinstance(m, EditMessageText)).text
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_long_title_delivery_uses_validated_outgoing_method(db_session_maker):
+    from event_admin_service import create_scenario
+    from event_delivery_worker import build_test_delivery_plan, send_test_delivery_plan
+
+    title = "<&>" + "Я" * 997
+    scen = await create_scenario(
+        db_session_maker,
+        code="telegram_title_delivery_runtime",
+        event_type="webinar",
+        title=title,
+        starts_at_utc=datetime.utcnow() + timedelta(days=5),
+        link="https://example.test/telegram-title-runtime",
+    )
+
+    async with db_session_maker() as session:
+        stored = await session.get(EventScenario, scen.id)
+        assert stored is not None and stored.title == title
+
+    plan = await build_test_delivery_plan(db_session_maker, scen.id, None, None)
+
+    class ValidatingTelegramTransport:
+        def __init__(self):
+            self.methods = []
+
+        async def send_message(self, *, chat_id, text, parse_mode, reply_markup=None):
+            method = SendMessage(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+            validated = SendMessage.model_validate(method.model_dump())
+            self.methods.append(validated)
+            return SimpleNamespace(message_id=f"telegram-runtime-{len(self.methods)}")
+
+    transport = ValidatingTelegramTransport()
+    sent_ids = await send_test_delivery_plan(
+        plan,
+        platform="telegram",
+        user_id=12345,
+        event_id=scen.id,
+        bot=transport,
+    )
+
+    assert sent_ids == ["telegram-runtime-1"]
+    assert len(transport.methods) == 1
+    method = transport.methods[0]
+    assert method.parse_mode == "HTML"
+    assert html.escape(title, quote=False) in method.text
+    assert title in html.unescape(method.text)
+    assert len(method.text.encode("utf-16-le")) // 2 <= 4096
+    assert SendMessage.model_validate(method.model_dump()).text == method.text
+
+
+@pytest.mark.asyncio
+async def test_telegram_long_title_navigation_preserves_page_and_archive_context(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import archive_scenario, create_scenario
+    import handlers
+
+    original_title = "А" * 1000
+    base_start = datetime.utcnow() + timedelta(days=5)
+    target = await create_scenario(
+        db_session_maker,
+        code="telegram_title_navigation_target",
+        event_type="webinar",
+        title=original_title,
+        starts_at_utc=base_start,
+        link="https://example.test/telegram-navigation",
+    )
+    for index in range(6):
+        filler = await create_scenario(
+            db_session_maker,
+            code=f"telegram_title_navigation_filler_{index}",
+            event_type="webinar",
+            title=f"Навигация {index}",
+            starts_at_utc=base_start + timedelta(days=1),
+            link=f"https://example.test/telegram-navigation/{index}",
+        )
+        if index == 0:
+            await archive_scenario(db_session_maker, filler.id)
+
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    routers = (event_admin_router, handlers.router)
+    original_parents = {router: router._parent_router for router in routers}
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+    fsm = FSMContext(
+        storage=storage,
+        key=StorageKey(bot_id=bot.id, chat_id=12345, user_id=12345),
+    )
+
+    def validate_methods(methods):
+        for method in methods:
+            assert hasattr(method, "model_dump")
+            method.__class__.model_validate(method.model_dump())
+        return methods
+
+    def visible_callback(methods, prefix):
+        for method in methods:
+            if not isinstance(method, (EditMessageText, SendMessage)) or method.reply_markup is None:
+                continue
+            for row in method.reply_markup.inline_keyboard:
+                for button in row:
+                    if button.callback_data and button.callback_data.startswith(prefix):
+                        return button.callback_data
+        raise AssertionError(f"No visible Telegram callback with prefix {prefix!r}")
+
+    async def feed_callback(data):
+        return validate_methods(await _feed_callback(dp, bot, data))
+
+    async def feed_message(text):
+        return validate_methods(await _feed_message(dp, bot, text))
+
+    try:
+        methods = await feed_callback("admin_events")
+        listing = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "страница 1 из 1" in listing.text
+        methods = await feed_callback(visible_callback(methods, "admin_ev_toggle_archive_view_1"))
+        listing = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "страница 1 из 2" in listing.text
+
+        methods = await feed_callback(visible_callback(methods, "admin_ev_page_1_1"))
+        listing = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "страница 2 из 2" in listing.text
+        target_callback = visible_callback(methods, f"admin_ev_open_{target.id}_1_1")
+
+        methods = await feed_callback(target_callback)
+        card = next(method for method in methods if isinstance(method, EditMessageText))
+        assert original_title in card.text
+        edit_callback = visible_callback(methods, f"admin_ev_edit_menu_{target.id}_1_1")
+        methods = await feed_callback(edit_callback)
+        title_callback = visible_callback(methods, f"admin_ev_edit_title_{target.id}")
+        methods = await feed_callback(title_callback)
+        assert "1000 символов" in next(method for method in methods if isinstance(method, EditMessageText)).text
+        assert (await fsm.get_state()).endswith("edit_title")
+
+        methods = await feed_callback(visible_callback(methods, f"admin_ev_open_{target.id}_1_1"))
+        card = next(method for method in methods if isinstance(method, EditMessageText))
+        assert original_title in card.text
+        assert await fsm.get_state() is None
+
+        methods = await feed_callback(visible_callback(methods, f"admin_ev_edit_menu_{target.id}_1_1"))
+        methods = await feed_callback(visible_callback(methods, f"admin_ev_edit_title_{target.id}"))
+        invalid_methods = await feed_message("В" * 1001)
+        assert "1000 символов" in next(method for method in invalid_methods if isinstance(method, SendMessage)).text
+        assert (await fsm.get_state()).endswith("edit_title")
+        async with db_session_maker() as session:
+            assert (await session.get(EventScenario, target.id)).title == original_title
+
+        updated_title = "Б" * 1000
+        methods = await feed_message(updated_title)
+        saved_card = next(method for method in methods if isinstance(method, SendMessage))
+        assert updated_title in saved_card.text
+        assert await fsm.get_state() is None
+        back_callback = visible_callback(methods, "admin_ev_page_1_1")
+
+        methods = await feed_callback(back_callback)
+        listing = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "страница 2 из 2" in listing.text
+        assert target.code in listing.text
+        reopened_callback = visible_callback(methods, f"admin_ev_open_{target.id}_1_1")
+
+        methods = await feed_callback(reopened_callback)
+        reopened_card = next(method for method in methods if isinstance(method, EditMessageText))
+        assert updated_title in reopened_card.text
+        assert visible_callback(methods, "admin_ev_page_1_1") == "admin_ev_page_1_1"
+        assert "Сценарии мероприятий и цепочки напоминаний" not in reopened_card.text
     finally:
         for router in routers:
             router._parent_router = original_parents[router]
