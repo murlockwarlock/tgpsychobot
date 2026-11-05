@@ -559,7 +559,6 @@ async def show_start_screen(client: MaxApiClient, chat_id: int, user_id: int, st
                             f"🎁 <b>Вам начислено {sub_config.referral_bonus_days_referral} бонусных дн.</b>\n"
                             "Регистрация выполнена по пригласительной ссылке."
                         )
-                        is_new_trial_needed = False
                     referrer_granted = await grant_subscription_days(
                         session,
                         grant_key=f"max_registration_referrer:{user.id}:{referrer_id}",

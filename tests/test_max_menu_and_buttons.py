@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 os.environ.setdefault("BOT_TOKEN", "test")
@@ -14,14 +16,14 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 import database
 import handlers
 import keyboards as tg_kb
-from database import Base, Content, Topic, User
+from database import Base, Content, SubscriptionBenefitGrant, SubscriptionConfig, Topic, User, UserSubscription
 import max_messenger_bot.legacy as max_legacy
 import max_messenger_bot.storage as max_storage
 from max_messenger_bot import app as max_app
 from max_messenger_bot.services import settings as max_settings
 from max_messenger_bot.app import MaxBotApplication
 from max_messenger_bot.keyboards import inline_keyboard, main_menu_row
-from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
+from max_messenger_bot.models import MAX_ID_OFFSET, IncomingCallback, IncomingMessage, Sender
 from max_messenger_bot.services import common as max_common
 from max_messenger_bot.services import topics as max_topics
 from max_messenger_bot.services import subscriptions as max_subscriptions
@@ -29,6 +31,7 @@ from max_messenger_bot.services import admin_content as max_admin_content
 from max_messenger_bot.services import admin as max_admin
 from max_messenger_bot.keyboards import admin_panel_keyboard as max_admin_panel_keyboard
 from max_messenger_bot.storage import MaxContentMedia, StorageBase
+from max_messenger_bot.time_utils import utc_now
 from response_buttons import ResponseButton, extract_response_buttons
 
 
@@ -185,6 +188,55 @@ async def test_max_start_welcome_with_parsed_buttons_no_dynamic_menu(db_session)
     # start_message does NOT auto-append "⬅️ В меню"
     button_texts = [b["text"] for row in buttons for b in row]
     assert "⬅️ В меню" not in button_texts
+
+
+@pytest.mark.asyncio
+async def test_max_referral_registration_accumulates_welcome_and_referral_days(db_session):
+    referrer_id = MAX_ID_OFFSET + 42
+    new_user_id = MAX_ID_OFFSET + 99
+    async with db_session() as session:
+        session.add_all([
+            SubscriptionConfig(
+                id=1,
+                subscriptions_enabled=True,
+                welcome_bonus_days=3,
+                referral_enabled=True,
+                referral_bonus_days_referral=1,
+                referral_bonus_days_referrer=1,
+            ),
+            User(id=referrer_id, first_name="Referrer", name="Referrer"),
+            User(id=new_user_id, first_name="New"),
+            Content(key="start_message", text_content="Добро пожаловать!", is_visible=True),
+        ])
+        await session.commit()
+
+    before = utc_now()
+    mock_client = SimpleNamespace(send_message=AsyncMock())
+    await max_common.show_start_screen(
+        mock_client,
+        chat_id=99,
+        user_id=new_user_id,
+        start_payload="ref_42",
+    )
+
+    async with db_session() as session:
+        subscription = await session.scalar(select(UserSubscription).where(UserSubscription.user_id == new_user_id))
+        grants = (
+            await session.execute(
+                select(SubscriptionBenefitGrant.grant_type, SubscriptionBenefitGrant.days)
+                .where(SubscriptionBenefitGrant.beneficiary_user_id == new_user_id)
+                .order_by(SubscriptionBenefitGrant.id)
+            )
+        ).all()
+
+    assert subscription is not None
+    assert timedelta(days=3, hours=23) < subscription.end_date - before < timedelta(days=4, seconds=2)
+    assert [(grant_type, days) for grant_type, days in grants] == [
+        ("registration_referee", 1),
+        ("welcome", 3),
+    ]
+    sent_text = "\n".join(call.kwargs.get("text", "") for call in mock_client.send_message.await_args_list)
+    assert "1 бонусных дн." in sent_text
 
 
 @pytest.mark.asyncio
