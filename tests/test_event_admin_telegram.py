@@ -2188,7 +2188,7 @@ async def test_telegram_long_title_real_dispatcher_list_edit_cancel_save_reopen(
 
         methods = await _feed_callback(dp, bot, target_callback)
         assert "Б" * 1000 in next(m for m in methods if isinstance(m, EditMessageText)).text
-        back_callback = visible_callback(methods, "admin_events")
+        back_callback = visible_callback(methods, "admin_ev_page_0_0")
         methods = await _feed_callback(dp, bot, back_callback)
         assert "Сценарии мероприятий" in next(m for m in methods if isinstance(m, EditMessageText)).text
 

@@ -1545,7 +1545,7 @@ async def test_max_webinar_creation_flow(db_session_maker, mock_client, states, 
     assert st.state == "max_event_create_starts_at"
 
     # Step 3: Starts at MSK
-    await max_admin_events.receive_create_starts_at(mock_client, states, chat_id=123, user_id=456, raw_dt="05.11.2026 17:00")
+    await max_admin_events.receive_create_starts_at(mock_client, states, chat_id=123, user_id=456, raw_dt=(datetime.utcnow() + timedelta(days=30)).strftime("%d.%m.%Y %H:%M"))
     st = await states.get(456)
     assert st.state == "max_event_create_duration"
 
@@ -1569,7 +1569,7 @@ async def test_max_meeting_creation_flow(db_session_maker, mock_client, states, 
     await max_admin_events.start_scenario_create(mock_client, states, chat_id=123, user_id=456, event_type="meeting")
     await max_admin_events.receive_create_code(mock_client, states, chat_id=123, user_id=456, raw_code="spb_offline")
     await max_admin_events.receive_create_title(mock_client, states, chat_id=123, user_id=456, raw_title="SPB Live Meetup")
-    await max_admin_events.receive_create_starts_at(mock_client, states, chat_id=123, user_id=456, raw_dt="08.11.2026 19:00")
+    await max_admin_events.receive_create_starts_at(mock_client, states, chat_id=123, user_id=456, raw_dt=(datetime.utcnow() + timedelta(days=30)).strftime("%d.%m.%Y %H:%M"))
     await max_admin_events.receive_create_duration(mock_client, states, chat_id=123, user_id=456, raw_dur="180")
 
     st = await states.get(456)

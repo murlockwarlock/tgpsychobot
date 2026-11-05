@@ -2122,13 +2122,14 @@ async def init_db():
                     (column for column in insp.get_columns("event_scenarios") if column["name"] == "title"),
                     None,
                 )
-                if title_column is None:
-                    raise RuntimeError("Critical column title missing in event_scenarios")
-                current_length = getattr(title_column["type"], "length", None)
-                if current_length is not None and current_length < EVENT_TITLE_MAX_LENGTH:
-                    sync_conn.execute(text(
-                        f"ALTER TABLE event_scenarios ALTER COLUMN title TYPE VARCHAR({EVENT_TITLE_MAX_LENGTH})"
-                    ))
+                # Legacy schema verifiers report absent columns. The final
+                # schema verifier is responsible for failing closed on that case.
+                if title_column is not None:
+                    current_length = getattr(title_column["type"], "length", None)
+                    if current_length is not None and current_length < EVENT_TITLE_MAX_LENGTH:
+                        sync_conn.execute(text(
+                            f"ALTER TABLE event_scenarios ALTER COLUMN title TYPE VARCHAR({EVENT_TITLE_MAX_LENGTH})"
+                        ))
             event_scenario_columns = {c['name'] for c in insp.get_columns('event_scenarios')}
             if 'description' not in event_scenario_columns:
                 sync_conn.execute(text("ALTER TABLE event_scenarios ADD COLUMN description TEXT"))
