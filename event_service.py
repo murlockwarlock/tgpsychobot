@@ -1702,7 +1702,10 @@ async def handle_event_start_telegram(
         title = reg_res.scenario.title if reg_res.scenario else norm_code
         await bot.send_message(
             chat_id=chat_id,
-            text=f"Регистрация на мероприятие «{title}» завершена, так как мероприятие уже прошло.",
+            text=(
+                "Регистрация на мероприятие «"
+                f"{html.escape(title, quote=False)}» завершена, так как мероприятие уже прошло."
+            ),
             parse_mode="HTML",
         )
         return True
@@ -1714,17 +1717,19 @@ async def handle_event_start_telegram(
     )
 
     if reg_res.status == "already_registered":
+        safe_title = html.escape(scen.title, quote=False)
+        safe_link_or_place = html.escape(scen.link or scen.place or "", quote=True)
         duration = timedelta(minutes=scen.duration_minutes)
         is_live = scen.starts_at <= effective_now < scen.starts_at + duration
         if is_live:
             text_body = (
-                f"Вы уже зарегистрированы на мероприятие «{scen.title}»!\n\n"
+                f"Вы уже зарегистрированы на мероприятие «{safe_title}»!\n\n"
                 f"Оно сейчас в эфире!\n"
-                f"🔗 Ваша ссылка для входа: {scen.link or scen.place}"
+                f"🔗 Ваша ссылка для входа: {safe_link_or_place}"
             )
         else:
             text_body = (
-                f"Вы уже зарегистрированы на мероприятие «{scen.title}»!\n\n"
+                f"Вы уже зарегистрированы на мероприятие «{safe_title}»!\n\n"
                 f"📅 Дата: {format_msk(scen.starts_at, '%d.%m.%Y')}\n"
                 f"⏰ Время: {format_msk(scen.starts_at, '%H:%M')} (МСК)"
             )
@@ -1869,7 +1874,10 @@ async def handle_event_start_max(
         title = reg_res.scenario.title if reg_res.scenario else norm_code
         await client.send_message(
             chat_id=chat_id,
-            text=f"Регистрация на мероприятие «{title}» завершена, так как мероприятие уже прошло.",
+            text=(
+                "Регистрация на мероприятие «"
+                f"{html.escape(title, quote=False)}» завершена, так как мероприятие уже прошло."
+            ),
         )
         return True
 
@@ -1878,17 +1886,19 @@ async def handle_event_start_max(
     attachments = inline_keyboard([[callback_button("❌ Не смогу прийти", f"ev_cancel:{scen.id}")]])
 
     if reg_res.status == "already_registered":
+        safe_title = html.escape(scen.title, quote=False)
+        safe_link_or_place = html.escape(scen.link or scen.place or "", quote=True)
         duration = timedelta(minutes=scen.duration_minutes)
         is_live = scen.starts_at <= effective_now < scen.starts_at + duration
         if is_live:
             text_body = (
-                f"Вы уже зарегистрированы на мероприятие «{scen.title}»!\n\n"
+                f"Вы уже зарегистрированы на мероприятие «{safe_title}»!\n\n"
                 f"Оно сейчас в эфире!\n"
-                f"🔗 Ваша ссылка для входа: {scen.link or scen.place}"
+                f"🔗 Ваша ссылка для входа: {safe_link_or_place}"
             )
         else:
             text_body = (
-                f"Вы уже зарегистрированы на мероприятие «{scen.title}»!\n\n"
+                f"Вы уже зарегистрированы на мероприятие «{safe_title}»!\n\n"
                 f"📅 Дата: {format_msk(scen.starts_at, '%d.%m.%Y')}\n"
                 f"⏰ Время: {format_msk(scen.starts_at, '%H:%M')} (МСК)"
             )

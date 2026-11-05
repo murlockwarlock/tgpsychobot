@@ -1726,7 +1726,7 @@ async def _get_safe_postgres_engine():
 
 @pytest.mark.asyncio
 async def test_real_postgresql_init_and_schema_verification():
-    """Real PostgreSQL integration test: verifies init_db and fail-closed schema verification on PostgreSQL."""
+    """Real PostgreSQL migration widens title without changing existing events."""
     pg_engine, skip_reason = await _get_safe_postgres_engine()
     if pg_engine is None:
         pytest.skip(skip_reason)
@@ -1746,8 +1746,102 @@ async def test_real_postgresql_init_and_schema_verification():
 
             await database.init_db()
 
+            # Emulate the deployed schema before the title migration.
+            async with pg_engine.begin() as conn:
+                await conn.execute(text(
+                    "ALTER TABLE event_scenarios ALTER COLUMN title TYPE VARCHAR(255)"
+                ))
+
+            legacy_title = "Старое мероприятие " + "Я" * (255 - len("Старое мероприятие "))
+            legacy_starts_at = datetime.utcnow() + timedelta(days=5)
+            async with sessions() as session:
+                legacy = EventScenario(
+                    code="pg_legacy_title_255",
+                    event_type="webinar",
+                    title=legacy_title,
+                    starts_at=legacy_starts_at,
+                    duration_minutes=90,
+                    link="https://example.test/legacy-title",
+                    is_active=True,
+                    is_archived=False,
+                    schedule_revision=7,
+                    content_version=3,
+                    description="Existing event must survive the title migration.",
+                    media_order="media_top",
+                )
+                session.add(legacy)
+                await session.flush()
+                legacy_id = legacy.id
+                await session.commit()
+                legacy_before = {
+                    column.name: getattr(legacy, column.name)
+                    for column in EventScenario.__table__.columns
+                }
+
+            await database.init_db()
+
+            def title_length(sync_conn):
+                return next(
+                    column["type"].length
+                    for column in inspect(sync_conn).get_columns("event_scenarios")
+                    if column["name"] == "title"
+                )
+
             async with pg_engine.connect() as conn:
                 await conn.run_sync(verify_event_reminder_chains_schema)
+                assert await conn.run_sync(title_length) == 1000
+
+            async with sessions() as session:
+                migrated_legacy = await session.get(EventScenario, legacy_id)
+                assert migrated_legacy is not None
+                assert {
+                    column.name: getattr(migrated_legacy, column.name)
+                    for column in EventScenario.__table__.columns
+                } == legacy_before
+
+                new = EventScenario(
+                    code="pg_new_title_1000",
+                    event_type="webinar",
+                    title="Н" * 1000,
+                    starts_at=datetime.utcnow() + timedelta(days=6),
+                    duration_minutes=120,
+                    link="https://example.test/new-title",
+                    is_active=False,
+                    is_archived=False,
+                    schedule_revision=1,
+                    content_version=1,
+                    media_order="media_top",
+                )
+                session.add(new)
+                await session.flush()
+                new_id = new.id
+                await session.commit()
+                new_before = {
+                    column.name: getattr(new, column.name)
+                    for column in EventScenario.__table__.columns
+                }
+                assert new.title == "Н" * 1000
+
+            await database.init_db()
+
+            async with pg_engine.connect() as conn:
+                await conn.run_sync(verify_event_reminder_chains_schema)
+                assert await conn.run_sync(title_length) == 1000
+
+            async with sessions() as session:
+                legacy_after_second_init = await session.get(EventScenario, legacy_id)
+                new_after_second_init = await session.get(EventScenario, new_id)
+                assert legacy_after_second_init is not None
+                assert new_after_second_init is not None
+                assert {
+                    column.name: getattr(legacy_after_second_init, column.name)
+                    for column in EventScenario.__table__.columns
+                } == legacy_before
+                assert {
+                    column.name: getattr(new_after_second_init, column.name)
+                    for column in EventScenario.__table__.columns
+                } == new_before
+                assert new_after_second_init.title == "Н" * 1000
     finally:
         await pg_engine.dispose()
 

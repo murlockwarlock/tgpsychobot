@@ -60,6 +60,7 @@ engine = create_async_engine(DATABASE_URL, **_engine_options)
 async_session_maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 DATABASE_INIT_ADVISORY_LOCK_KEY = 0x544750535943484F
+EVENT_TITLE_MAX_LENGTH = 1000
 
 Base = declarative_base()
 
@@ -1347,6 +1348,18 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
             if cols[col_name].get("nullable") is not False:
                 raise RuntimeError(f"Critical column {col_name} in {tbl} must be NOT NULL")
 
+    # A VARCHAR(255) leftover in PostgreSQL would reject a valid 1000-character title.
+    if sync_conn.dialect.name == "postgresql":
+        title_column = next(
+            col for col in insp.get_columns("event_scenarios") if col["name"] == "title"
+        )
+        current_length = getattr(title_column["type"], "length", None)
+        if current_length is not None and current_length < EVENT_TITLE_MAX_LENGTH:
+            raise RuntimeError(
+                f"event_scenarios.title allows only {current_length} characters; "
+                f"expected at least {EVENT_TITLE_MAX_LENGTH}"
+            )
+
     # 3. Foreign Keys and ondelete actions (RESTRICT)
     expected_foreign_keys = {
         "event_steps": [
@@ -2104,6 +2117,19 @@ async def init_db():
                 except Exception:
                     pass
             EventScenario.__table__.create(sync_conn, checkfirst=True)
+            if dialect_name == "postgresql":
+                title_column = next(
+                    (column for column in insp.get_columns("event_scenarios") if column["name"] == "title"),
+                    None,
+                )
+                # Legacy schema verifiers report absent columns. The final
+                # schema verifier is responsible for failing closed on that case.
+                if title_column is not None:
+                    current_length = getattr(title_column["type"], "length", None)
+                    if current_length is not None and current_length < EVENT_TITLE_MAX_LENGTH:
+                        sync_conn.execute(text(
+                            f"ALTER TABLE event_scenarios ALTER COLUMN title TYPE VARCHAR({EVENT_TITLE_MAX_LENGTH})"
+                        ))
             event_scenario_columns = {c['name'] for c in insp.get_columns('event_scenarios')}
             if 'description' not in event_scenario_columns:
                 sync_conn.execute(text("ALTER TABLE event_scenarios ADD COLUMN description TEXT"))
@@ -2908,7 +2934,7 @@ class EventScenario(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     code = Column(String(64), unique=True, nullable=False, index=True)
     event_type = Column(String(16), nullable=False)
-    title = Column(String(255), nullable=False)
+    title = Column(String(EVENT_TITLE_MAX_LENGTH), nullable=False)
     starts_at = Column(DateTime, nullable=False)  # naive UTC
     duration_minutes = Column(Integer, default=120, nullable=False)
     place = Column(Text, nullable=True)  # Strictly NULL for webinar; NOT NULL for meeting

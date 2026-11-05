@@ -20,6 +20,9 @@ from typing import Any
 from urllib.parse import quote
 
 from event_admin_service import (
+    EVENT_TITLE_MAX_LENGTH,
+    EVENT_BUTTON_TITLE_PREVIEW_CHARS,
+    compact_event_title,
     PRESET_OFFSETS,
     PROBLEM_DELIVERY_STATUSES,
     DeliveryItem,
@@ -170,7 +173,7 @@ async def show_scenarios(
     for s in page_scenarios:
         status_icon = "📦" if s.is_archived else ("🟢" if s.is_active else "⚪️")
         type_icon = "💻" if s.event_type == "webinar" else "📍"
-        label = f"{status_icon} {type_icon} {s.title} ({s.starts_at_msk[:10]})"
+        label = f"{status_icon} {type_icon} {compact_event_title(s.title, limit=EVENT_BUTTON_TITLE_PREVIEW_CHARS)} ({s.starts_at_msk[:10]})"
         rows.append([callback_button(label, f"admin_ev_open_{s.id}_{page}_{1 if include_archived else 0}")])
 
     # Pagination
@@ -205,7 +208,7 @@ async def show_scenarios(
             status = "📦 В архиве" if s.is_archived else ("🟢 Активно" if s.is_active else "⚪️ Выключено")
             kind = "Вебинар" if s.event_type == "webinar" else "Очная встреча"
             text_lines.append(
-                f"<b>{idx + 1 + page * PAGE_SIZE}. {html.escape(s.title)}</b>\n"
+                f"<b>{idx + 1 + page * PAGE_SIZE}. {html.escape(compact_event_title(s.title))}</b>\n"
                 f"• Код: <code>{s.code}</code> | Тип: {kind}\n"
                 f"• Начало: {s.starts_at_msk}\n"
                 f"• Статус: {status} | Регистраций: <b>{s.registrations_count}</b>\n\n"
@@ -403,7 +406,7 @@ async def receive_create_code(
     await states.set(user_id, chat_id, "max_event_create_title", (await states.get(user_id)).data)
     await client.send_message(
         chat_id=chat_id,
-        text=f"✅ Код принят: <code>{norm_code}</code>\n\n<b>Шаг 2 из 5:</b> Введите название мероприятия (до 255 символов):",
+        text=f"✅ Код принят: <code>{norm_code}</code>\n\n<b>Шаг 2 из 5:</b> Введите название мероприятия (до {EVENT_TITLE_MAX_LENGTH} символов):",
     )
 
 
@@ -415,8 +418,8 @@ async def receive_create_title(
     raw_title: str,
 ) -> None:
     title = raw_title.strip()
-    if not title or len(title) > 255:
-        await client.send_message(chat_id=chat_id, text="❌ Название не должно быть пустым и не может превышать 255 символов:")
+    if not title or len(title) > EVENT_TITLE_MAX_LENGTH:
+        await client.send_message(chat_id=chat_id, text=f"❌ Название не должно быть пустым и не может превышать {EVENT_TITLE_MAX_LENGTH} символов:")
         return
 
     state_obj = await states.get(user_id)
@@ -834,7 +837,7 @@ async def start_edit_title(client: MaxApiClient, states: StateStore, chat_id: in
     await states.set(user_id, chat_id, "max_event_edit_title", {"event_id": event_id, "event_list_back": list_back})
     await client.send_message(
         chat_id=chat_id,
-        text="✏️ Введите новое название мероприятия (до 255 символов):",
+        text=f"✏️ Введите новое название мероприятия (до {EVENT_TITLE_MAX_LENGTH} символов):",
         attachments=inline_keyboard([_back(_event_open_callback(event_id, list_back))]),
     )
 
