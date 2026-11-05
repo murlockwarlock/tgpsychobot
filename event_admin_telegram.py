@@ -68,11 +68,36 @@ from event_admin_service import (
     validate_scenario_input,
     validate_step_input,
 )
+from event_content_validator import (
+    ALLOWED_EVENT_HTML_TAGS,
+    MEDIA_FORMAT_CAPTION,
+    MEDIA_FORMAT_LEGACY_AUTO,
+    MEDIA_FORMAT_SEPARATE_MEDIA_TOP,
+    MEDIA_FORMAT_SEPARATE_TEXT_TOP,
+    EventContentValidationError,
+    TelegramHtmlValidator,
+    calculate_available_description_chars,
+    get_media_format,
+    parse_visible_telegram_text,
+    render_plain_text_for_max,
+    strip_telegram_custom_emoji,
+)
 from event_delivery_worker import build_test_delivery_plan, send_test_delivery_plan
 
 log = logging.getLogger(__name__)
 
 router = Router(name="event_admin")
+
+
+def _format_event_html_title(title: str) -> str:
+    """Renders title with custom emoji preserved when valid, escaping unsafe HTML."""
+    if "<tg-emoji" in title:
+        try:
+            TelegramHtmlValidator().validate(title)
+            return title
+        except Exception:
+            return html.escape(title)
+    return html.escape(title)
 _answered_callbacks: set[str] = set()
 
 
@@ -240,6 +265,16 @@ def _scenario_card_keyboard(s: ScenarioSummary, back: str = "admin_events") -> A
     return builder.as_markup()
 
 
+def _format_display_name(fmt: str) -> str:
+    if fmt == MEDIA_FORMAT_CAPTION:
+        return "💬 Фото/видео с текстом (подпись)"
+    if fmt == MEDIA_FORMAT_SEPARATE_TEXT_TOP:
+        return "📝 Текст отдельно, медиа ниже"
+    if fmt == MEDIA_FORMAT_SEPARATE_MEDIA_TOP:
+        return "🖼️ Текст отдельно, медиа выше"
+    return "Стандартный (авто)"
+
+
 def _scenario_edit_keyboard(s: ScenarioSummary, *, list_back: str = "admin_events") -> Any:
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Изменить название", callback_data=f"admin_ev_edit_title_{s.id}")
@@ -254,9 +289,15 @@ def _scenario_edit_keyboard(s: ScenarioSummary, *, list_back: str = "admin_event
     builder.button(text="📝 Описание", callback_data=f"admin_ev_edit_description_{s.id}")
     builder.button(text="🖼 Медиа", callback_data=f"admin_ev_edit_media_{s.id}")
     builder.button(
+        text=f"⚙️ Формат: {_format_display_name(s.media_format)}",
+        callback_data=f"admin_ev_format_menu_{s.id}",
+    )
+    builder.button(
         text=f"↕️ Порядок: {'медиа → текст' if s.media_order == 'media_top' else 'текст → медиа'}",
         callback_data=f"admin_ev_toggle_media_order_{s.id}",
     )
+    builder.button(text="👁 Предпросмотр Telegram", callback_data=f"admin_ev_preview_tg_{s.id}")
+    builder.button(text="👁 Предпросмотр MAX", callback_data=f"admin_ev_preview_max_{s.id}")
 
     builder.button(text="⬅️ Назад в карточку", callback_data=_event_open_callback(s.id, list_back))
     builder.adjust(1)
@@ -554,10 +595,11 @@ def _format_scenario_card_text(s: ScenarioSummary, bot_username: str | None = No
             loc_lines.append(f"• <b>Ссылка:</b> {html.escape(s.link)}")
 
     loc_block = "\n".join(loc_lines)
-    details_block = (
-        f"• <b>Описание:</b> {html.escape(s.description[:160])}{'…' if len(s.description) > 160 else ''}\n"
-        if s.description else "• <b>Описание:</b> —\n"
-    )
+    if s.description:
+        desc_preview = truncate_html_preview(s.description, 160, allowed_tags=ALLOWED_EVENT_HTML_TAGS)
+        details_block = f"• <b>Описание:</b> {desc_preview}\n"
+    else:
+        details_block = "• <b>Описание:</b> —\n"
 
     if bot_username:
         reg_link = f"https://t.me/{html.escape(bot_username)}?start={html.escape(s.code)}"
@@ -568,15 +610,22 @@ def _format_scenario_card_text(s: ScenarioSummary, bot_username: str | None = No
     else:
         code_and_link = f"• <b>Код события (/start):</b> <code>{s.code}</code>\n"
 
+    warning_block = (
+        f"⚠️ <b>Внимание:</b> {html.escape(s.content_warning)}\n"
+        if not s.is_content_valid and s.content_warning
+        else ""
+    )
+
     return (
-        f"📅 <b>Карточка мероприятия: {html.escape(s.title)}</b>\n\n"
+        f"📅 <b>Карточка мероприятия: {_format_event_html_title(s.title)}</b>\n\n"
         f"{code_and_link}"
         f"• <b>Тип:</b> {kind_str}\n"
         f"• <b>Дата и время начала:</b> {s.starts_at_msk}\n"
         f"• <b>Длительность:</b> {s.duration_minutes} мин.\n"
         f"{loc_block}\n"
         f"{details_block}"
-        f"• <b>Медиа:</b> {s.media_count} | порядок: {'медиа → текст' if s.media_order == 'media_top' else 'текст → медиа'}\n"
+        f"• <b>Медиа:</b> {s.media_count} | формат: {_format_display_name(s.media_format)}\n"
+        f"{warning_block}"
         f"• <b>Статус:</b> {status_str}\n"
         f"• <b>Всего регистраций:</b> <b>{s.registrations_count}</b>\n"
         f"• <b>Ревизия расписания:</b> {s.schedule_revision} (версия контента: {s.content_version})\n"
@@ -696,15 +745,22 @@ async def process_create_code(message: Message, state: FSMContext) -> None:
 
 @router.message(EventAdminStates.create_title)
 async def process_create_title(message: Message, state: FSMContext) -> None:
-    title = (message.text or "").strip()
-    if not title or len(title) > EVENT_TITLE_MAX_LENGTH:
-        await message.answer(f"❌ Название не должно быть пустым и не может превышать {EVENT_TITLE_MAX_LENGTH} символов. Попробуйте ещё раз:")
+    raw = message.html_text if isinstance(message.html_text, str) else (message.text or "")
+    title = raw.strip()
+    try:
+        if not title:
+            raise ValueError(f"Название не должно быть пустым и не может превышать {EVENT_TITLE_MAX_LENGTH} символов.")
+        _, visible_len, _ = parse_visible_telegram_text(title)
+        if visible_len > EVENT_TITLE_MAX_LENGTH:
+            raise ValueError(f"Название не должно превышать {EVENT_TITLE_MAX_LENGTH} символов (сейчас: {visible_len}).")
+    except Exception as exc:
+        await message.answer(f"❌ {exc}\nПопробуйте ещё раз:")
         return
 
     await state.update_data(create_title=title)
     await state.set_state(EventAdminStates.create_starts_at)
     await message.answer(
-        f"✅ Название: <b>{html.escape(title)}</b>\n\n"
+        f"✅ Название: <b>{_format_event_html_title(title)}</b>\n\n"
         f"<b>Шаг 3 из 5:</b> Введите дату и время начала мероприятия по <b>Московскому времени (МСК)</b>.\n\n"
         f"Формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
         f"Пример: <code>25.10.2026 19:00</code>",
@@ -827,6 +883,7 @@ async def _finalize_scenario_creation(
             duration_minutes=duration,
             place=place,
             link=link,
+            media_format=MEDIA_FORMAT_SEPARATE_MEDIA_TOP,
             is_active=False,
         )
         await state.clear()
@@ -867,11 +924,215 @@ async def show_edit_menu(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     await callback.message.edit_text(
-        f"✏️ <b>Редактирование мероприятия: {html.escape(scen.title)}</b>\n\n"
+        f"✏️ <b>Редактирование мероприятия: {_format_event_html_title(scen.title)}</b>\n\n"
         f"Выберите поле, которое хотите изменить:",
         parse_mode="HTML",
         reply_markup=_scenario_edit_keyboard(scen, list_back=list_back),
     )
+
+
+@router.callback_query(F.data.startswith("admin_ev_format_menu_"))
+async def show_format_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    parts = callback.data.split("_")
+    event_id = int(parts[4])
+    scen = await get_scenario_summary(async_session_maker, event_id)
+    if not scen:
+        await callback.answer("Мероприятие не найдено.", show_alert=True)
+        return
+
+    state_data = await state.get_data()
+    list_back = state_data.get("event_list_back", "admin_events")
+    current_fmt = scen.media_format
+
+    builder = InlineKeyboardBuilder()
+    opt1_icon = "🔘 " if current_fmt == MEDIA_FORMAT_SEPARATE_MEDIA_TOP else "⚪️ "
+    builder.button(
+        text=f"{opt1_icon}🖼️ Текст отдельно, медиа выше",
+        callback_data=f"admin_ev_set_fmt_{event_id}_{MEDIA_FORMAT_SEPARATE_MEDIA_TOP}",
+    )
+    opt2_icon = "🔘 " if current_fmt == MEDIA_FORMAT_SEPARATE_TEXT_TOP else "⚪️ "
+    builder.button(
+        text=f"{opt2_icon}📝 Текст отдельно, медиа ниже",
+        callback_data=f"admin_ev_set_fmt_{event_id}_{MEDIA_FORMAT_SEPARATE_TEXT_TOP}",
+    )
+    opt3_icon = "🔘 " if current_fmt == MEDIA_FORMAT_CAPTION else "⚪️ "
+    builder.button(
+        text=f"{opt3_icon}💬 Фото/видео с текстом (подпись)",
+        callback_data=f"admin_ev_set_fmt_{event_id}_{MEDIA_FORMAT_CAPTION}",
+    )
+    builder.button(text="⬅️ Назад в меню редактирования", callback_data=_event_edit_menu_callback(event_id, list_back))
+    builder.adjust(1)
+
+    text = (
+        f"⚙️ <b>Формат доставки для: {_format_event_html_title(scen.title)}</b>\n\n"
+        f"Текущий формат: <b>{_format_display_name(current_fmt)}</b>\n\n"
+        f"<b>Доступные форматы:</b>\n"
+        f"• <b>Текст отдельно, медиа выше:</b> отправка медиа (до 10 файлов), затем отдельный текст (до 4000 симв.).\n"
+        f"• <b>Текст отдельно, медиа ниже:</b> сначала текст сообщения (до 4000 симв.), затем медиа.\n"
+        f"• <b>Фото/видео с текстом (подпись):</b> ровно одно медиа с подписью (до 900 симв. в TG, до 3900 в MAX).\n\n"
+        f"Выберите желаемый формат:"
+    )
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("admin_ev_set_fmt_"))
+async def set_format_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    parts = callback.data.split("_")
+    event_id = int(parts[4])
+    new_fmt = "_".join(parts[5:])
+    state_data = await state.get_data()
+    list_back = state_data.get("event_list_back", "admin_events")
+    draft = state_data.get("description_draft") if state_data.get("edit_event_id") == event_id else None
+
+    try:
+        kwargs: dict[str, Any] = {"media_format": new_fmt}
+        if draft is not None:
+            kwargs["description"] = draft
+        scen = await update_scenario_fields(
+            async_session_maker,
+            event_id,
+            **kwargs,
+        )
+        await callback.answer(f"Формат изменен: {_format_display_name(scen.media_format)}")
+        await callback.message.edit_text(
+            f"✏️ <b>Редактирование мероприятия: {_format_event_html_title(scen.title)}</b>\n\n"
+            f"✅ Формат доставки успешно обновлён на: <b>{_format_display_name(scen.media_format)}</b>\n\n"
+            f"Выберите поле, которое хотите изменить:",
+            parse_mode="HTML",
+            reply_markup=_scenario_edit_keyboard(scen, list_back=list_back),
+        )
+    except EventContentValidationError as err:
+        rec = f"\n\n💡 Рекомендация: {err.recommendation}" if err.recommendation else ""
+        await callback.answer(f"❌ Нельзя выбрать формат: {err.message}{rec}", show_alert=True)
+    except Exception as exc:
+        await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin_ev_preview_tg_"))
+async def show_telegram_preview(callback: CallbackQuery, state: FSMContext) -> None:
+    parts = callback.data.split("_")
+    event_id = int(parts[4])
+    scen = await get_scenario_summary(async_session_maker, event_id)
+    if not scen:
+        await callback.answer("Мероприятие не найдено.", show_alert=True)
+        return
+
+    state_data = await state.get_data()
+    list_back = state_data.get("event_list_back", "admin_events")
+
+    plan = await build_test_delivery_plan(
+        async_session_maker,
+        event_id=event_id,
+        step_id=None,
+        admin_user=callback.from_user,
+    )
+
+    msg_count = len(plan)
+    order_lines = []
+    first_sample = ""
+    for idx, part in enumerate(plan, 1):
+        kind = part.get("kind")
+        if kind == "media_caption":
+            cap = part.get("caption", "")
+            first_sample = cap
+            order_lines.append(f"{idx}. Сообщение с медиа и подписью ({len(cap)} симв.)")
+        elif kind == "album":
+            m_cnt = len(part.get("media", []))
+            order_lines.append(f"{idx}. Альбом из {m_cnt} медиа")
+        elif kind == "single_media":
+            order_lines.append(f"{idx}. Одно медиа-сообщение")
+        elif kind == "text":
+            txt = part.get("text", "")
+            if not first_sample:
+                first_sample = txt
+            order_lines.append(f"{idx}. Текстовое сообщение ({len(txt)} симв.)")
+        elif kind == "control":
+            order_lines.append(f"{idx}. Кнопка управления регистрацией")
+
+    steps = await list_steps(async_session_maker, event_id, include_archived=False)
+    available_budget = calculate_available_description_chars(
+        scen,
+        media_format=scen.media_format,
+        steps=steps,
+    )["conservative"]
+    desc_len = len(scen.description or "")
+
+    preview_body = (
+        f"👁 <b>Предпросмотр доставки (Telegram)</b>\n\n"
+        f"• <b>Формат:</b> {_format_display_name(scen.media_format)}\n"
+        f"• <b>Сообщений к отправке:</b> {msg_count}\n"
+        f"• <b>Порядок доставки:</b>\n" + "\n".join(f"  {od}" for od in order_lines) + "\n\n"
+        f"• <b>Бюджет описания:</b> {desc_len} / {available_budget} симв. (остаток: {available_budget - desc_len})\n"
+        f"• <b>Статус валидации:</b> {'✅ Пройдена' if scen.is_content_valid else f'❌ Превышение ({scen.content_warning})'}\n\n"
+        f"<b>Пример текста первого сообщения:</b>\n"
+        f"<blockquote>{truncate_html_preview(first_sample, 1200, allowed_tags=ALLOWED_EVENT_HTML_TAGS) or '—'}</blockquote>"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Назад в меню редактирования", callback_data=_event_edit_menu_callback(event_id, list_back))
+    await callback.message.edit_text(preview_body, parse_mode="HTML", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("admin_ev_preview_max_"))
+async def show_max_preview(callback: CallbackQuery, state: FSMContext) -> None:
+    parts = callback.data.split("_")
+    event_id = int(parts[4])
+    scen = await get_scenario_summary(async_session_maker, event_id)
+    if not scen:
+        await callback.answer("Мероприятие не найдено.", show_alert=True)
+        return
+
+    state_data = await state.get_data()
+    list_back = state_data.get("event_list_back", "admin_events")
+
+    plan = await build_test_delivery_plan(
+        async_session_maker,
+        event_id=event_id,
+        step_id=None,
+        admin_user=callback.from_user,
+    )
+
+    msg_count = len(plan)
+    order_lines = []
+    first_sample = ""
+    for idx, part in enumerate(plan, 1):
+        kind = part.get("kind")
+        if kind == "media_caption":
+            cap = render_plain_text_for_max(part.get("caption", ""))
+            first_sample = cap
+            order_lines.append(f"{idx}. Сообщение с медиа и текстом ({len(cap)} симв.)")
+        elif kind == "album":
+            m_cnt = len(part.get("media", []))
+            order_lines.append(f"{idx}. Сообщение с {m_cnt} вложениями")
+        elif kind == "single_media":
+            order_lines.append(f"{idx}. Сообщение с 1 медиа-вложением")
+        elif kind == "text":
+            txt = render_plain_text_for_max(part.get("text", ""))
+            if not first_sample:
+                first_sample = txt
+            order_lines.append(f"{idx}. Текст ({len(txt)} симв.)")
+        elif kind == "control":
+            order_lines.append(f"{idx}. Кнопка управления (1 attachment)")
+
+    total_attachments = scen.media_count + 1
+    plain_sample = html.escape(first_sample[:1200])
+
+    preview_body = (
+        f"👁 <b>Предпросмотр доставки (MAX)</b>\n\n"
+        f"• <b>Формат:</b> {_format_display_name(scen.media_format)}\n"
+        f"• <b>Сообщений к отправке:</b> {msg_count}\n"
+        f"• <b>Порядок доставки:</b>\n" + "\n".join(f"  {od}" for od in order_lines) + "\n\n"
+        f"• <b>Ограничения MAX:</b>\n"
+        f"  - Вложений: {total_attachments} / 12 ({'✅ в норме' if total_attachments <= 12 else '❌ превышение!'})\n"
+        f"  - Лимит текста: до 3900 симв. ({'✅ в норме' if len(first_sample) <= 3900 else '❌ превышение!'})\n"
+        f"  - Rate limit: 2 сообщ./сек в один диалог (очередь с интервалом 0.5с)\n\n"
+        f"<b>Пример текста для MAX (plain text / без HTML):</b>\n"
+        f"<blockquote>{plain_sample or '—'}</blockquote>"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Назад в меню редактирования", callback_data=_event_edit_menu_callback(event_id, list_back))
+    await callback.message.edit_text(preview_body, parse_mode="HTML", reply_markup=kb.as_markup())
 
 
 @router.callback_query(F.data.startswith("admin_ev_edit_title_"))
@@ -890,7 +1151,8 @@ async def start_edit_title(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(EventAdminStates.edit_title)
 async def process_edit_title(message: Message, state: FSMContext) -> None:
-    title = (message.text or "").strip()
+    raw = message.html_text if isinstance(message.html_text, str) else (message.text or "")
+    title = raw.strip()
     data = await state.get_data()
     event_id = data["edit_event_id"]
     list_back = data.get("event_list_back", "admin_events")
@@ -898,7 +1160,7 @@ async def process_edit_title(message: Message, state: FSMContext) -> None:
         scen = await update_scenario_fields(async_session_maker, event_id, title=title)
         await state.clear()
         await message.answer(
-            f"✅ Название обновлено на: <b>{html.escape(scen.title)}</b>",
+            f"✅ Название обновлено на: <b>{_format_event_html_title(scen.title)}</b>",
             parse_mode="HTML",
             reply_markup=_scenario_card_keyboard(scen, list_back),
         )
@@ -1020,18 +1282,40 @@ async def start_edit_description(callback: CallbackQuery, state: FSMContext) -> 
         return
     state_data = await state.get_data()
     list_back = state_data.get("event_list_back", "admin_events")
-    await state.clear()
+    existing_draft = (
+        state_data.get("description_draft")
+        if state_data.get("edit_event_id") == event_id
+        else (scen.description or "")
+    )
+    await state.set_state(EventAdminStates.edit_description)
     await state.update_data(
         edit_event_id=event_id,
-        description_draft=scen.description or "",
+        description_draft=existing_draft,
         description_input_started=False,
         event_list_back=list_back,
     )
-    await state.set_state(EventAdminStates.edit_description)
+
+    steps = await list_steps(async_session_maker, event_id, include_archived=False)
+    budgets = calculate_available_description_chars(
+        scen,
+        media_format=scen.media_format,
+        steps=steps,
+    )
+    available_chars = budgets["conservative"]
+    _, used_chars, _ = parse_visible_telegram_text(existing_draft)
+    remaining = available_chars - used_chars
+    status_line = (
+        f"• Доступный остаток: <b>{remaining}</b> симв. (использовано {used_chars} из {available_chars})\n"
+        if remaining >= 0
+        else f"⚠️ <b>Внимание:</b> Лимит превышен на {abs(remaining)} симв.!\n"
+    )
+
     await callback.message.edit_text(
-        "📝 <b>Описание мероприятия</b>\n\n"
-        "Отправьте новый текст. Следующие сообщения добавляются к черновику, чтобы сохранить описание длиннее 4096 символов. Поддерживается длинное описание без лимита caption; при доставке оно будет разделено безопасно.\n\n"
-        f"Текущий черновик:\n<blockquote>{truncate_html_preview(scen.description, 2800, allowed_tags={'b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a', 'tg-spoiler', 'strike'}) or '—'}</blockquote>",
+        f"📝 <b>Описание мероприятия: {_format_event_html_title(scen.title)}</b>\n\n"
+        f"• Формат доставки: <b>{_format_display_name(scen.media_format)}</b>\n"
+        f"{status_line}\n"
+        f"Отправьте текст сообщения. Каждое новое сообщение добавляется к черновику.\n\n"
+        f"Текущий черновик:\n<blockquote>{truncate_html_preview(existing_draft, 2800, allowed_tags=ALLOWED_EVENT_HTML_TAGS) or '—'}</blockquote>",
         parse_mode="HTML",
         reply_markup=_description_editor_keyboard(event_id),
     )
@@ -1039,14 +1323,35 @@ async def start_edit_description(callback: CallbackQuery, state: FSMContext) -> 
 
 @router.message(EventAdminStates.edit_description)
 async def process_edit_description(message: Message, state: FSMContext) -> None:
-    text = message.html_text or message.text or message.caption or ""
+    raw = message.html_text if isinstance(message.html_text, str) else (message.text or message.caption or "")
+    text = raw.strip()
     data = await state.get_data()
     event_id = data["edit_event_id"]
     previous = data.get("description_draft", "") if data.get("description_input_started") else ""
     combined = f"{previous}\n{text}" if previous and text else (previous or text)
     await state.update_data(description_draft=combined, description_input_started=True)
+
+    scen = await get_scenario_summary(async_session_maker, event_id)
+    m_fmt = scen.media_format if scen else MEDIA_FORMAT_SEPARATE_MEDIA_TOP
+    steps = await list_steps(async_session_maker, event_id, include_archived=False)
+    budgets = calculate_available_description_chars(
+        scen,
+        media_format=m_fmt,
+        steps=steps,
+    )
+    available_chars = budgets["conservative"]
+    _, used_chars, _ = parse_visible_telegram_text(combined)
+    remaining = available_chars - used_chars
+    status_line = (
+        f"• Доступный остаток: <b>{remaining}</b> симв. (использовано {used_chars} из {available_chars})\n"
+        if remaining >= 0
+        else f"⚠️ <b>Внимание:</b> Превышение лимита на {abs(remaining)} симв.!\n"
+    )
+
     await message.answer(
-        f"📝 Черновик обновлён ({len(combined)} символов).\n\n<blockquote>{truncate_html_preview(combined, 2800, allowed_tags={'b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a', 'tg-spoiler', 'strike'}) or '—'}</blockquote>",
+        f"📝 <b>Черновик обновлён</b> ({used_chars} симв.)\n"
+        f"{status_line}\n"
+        f"<blockquote>{truncate_html_preview(combined, 2800, allowed_tags=ALLOWED_EVENT_HTML_TAGS) or '—'}</blockquote>",
         parse_mode="HTML",
         reply_markup=_description_editor_keyboard(event_id),
     )
@@ -1056,18 +1361,35 @@ async def process_edit_description(message: Message, state: FSMContext) -> None:
 async def save_description(callback: CallbackQuery, state: FSMContext) -> None:
     event_id = int(callback.data.split("_")[-1])
     data = await state.get_data()
+    draft = data.get("description_draft", "")
+    list_back = data.get("event_list_back", "admin_events")
     try:
         scen = await update_scenario_fields(
             async_session_maker,
             event_id,
-            description=data.get("description_draft", ""),
+            description=draft,
         )
-        list_back = data.get("event_list_back", "admin_events")
         await state.clear()
         await callback.message.edit_text(
             "✅ Описание сохранено.",
             reply_markup=_scenario_card_keyboard(scen, list_back),
         )
+    except EventContentValidationError as err:
+        rec = f"\n\n💡 <b>Рекомендация:</b> {html.escape(err.recommendation)}" if err.recommendation else ""
+        error_msg = (
+            f"❌ <b>Невозможно сохранить описание!</b>\n\n"
+            f"• Платформа: <b>{err.platform.upper()}</b>\n"
+            f"• Фактическая длина: <b>{err.actual_length}</b> симв. (лимит: {err.limit_length})\n"
+            f"• Превышение: <b>{err.actual_length - err.limit_length}</b> симв.\n"
+            f"• Причина: {html.escape(err.message)}{rec}\n\n"
+            f"<i>Черновик сохранён. Вы можете отредактировать текст или изменить формат доставки.</i>"
+        )
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✏️ Продолжить редактирование", callback_data=f"admin_ev_edit_description_{event_id}")
+        kb.button(text="⚙️ Изменить формат доставки", callback_data=f"admin_ev_format_menu_{event_id}")
+        kb.button(text="❌ Отмена (сбросить черновик)", callback_data=f"admin_ev_edit_menu_{event_id}")
+        kb.adjust(1)
+        await callback.message.edit_text(error_msg, parse_mode="HTML", reply_markup=kb.as_markup())
     except Exception as exc:
         await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
 
@@ -1078,7 +1400,7 @@ async def delete_description(callback: CallbackQuery, state: FSMContext) -> None
     await state.update_data(edit_event_id=event_id, description_draft="", description_input_started=True)
     await state.set_state(EventAdminStates.edit_description)
     await callback.message.edit_text(
-        "🗑 Описание будет удалено после нажатия «Сохранить и выйти».",
+        "🗑 Описание очищено в черновике. Нажмите «Сохранить и выйти» для применения.",
         reply_markup=_description_editor_keyboard(event_id),
     )
 
@@ -1503,7 +1825,8 @@ async def process_offset_custom(message: Message, state: FSMContext) -> None:
 
 @router.message(EventAdminStates.step_text)
 async def process_step_text(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
+    raw = message.html_text if isinstance(message.html_text, str) else (message.text or "")
+    text = raw.strip()
     data = await state.get_data()
     event_id = data["step_event_id"]
     offset = data["step_offset"]
@@ -1521,7 +1844,7 @@ async def process_step_text(message: Message, state: FSMContext) -> None:
             f"🎉 <b>Шаг напоминания успешно добавлен!</b>\n\n"
             f"• Время: <b>{st.offset_display}</b>\n"
             f"• Версия: v{st.step_version}\n"
-            f"• Текст:\n<blockquote>{html.escape(st.message_text)}</blockquote>",
+            f"• Текст:\n<blockquote>{truncate_html_preview(st.message_text, 2800, allowed_tags=ALLOWED_EVENT_HTML_TAGS)}</blockquote>",
             parse_mode="HTML",
             reply_markup=_steps_list_keyboard(event_id, steps, scen.is_archived, back=list_back),
         )
@@ -1553,12 +1876,12 @@ async def _render_step_card_view(
 
     text = (
         f"📝 <b>Шаг напоминания {idx + 1} из {len(all_steps)}</b>\n\n"
-        f"• <b>Мероприятие:</b> {html.escape(scen.title)}\n"
+        f"• <b>Мероприятие:</b> {_format_event_html_title(scen.title)}\n"
         f"• <b>Время отправки:</b> <b>{step.offset_display}</b> ({step.offset_minutes} мин.)\n"
         f"• <b>Версия шага:</b> v{step.step_version}\n\n"
         f"• <b>Детали события:</b> {'включены' if step.include_event_details else 'выключены'}\n\n"
         f"<b>Текст сообщения:</b>\n"
-        f"<blockquote>{html.escape(step.message_text)}</blockquote>"
+        f"<blockquote>{truncate_html_preview(step.message_text, 2800, allowed_tags=ALLOWED_EVENT_HTML_TAGS)}</blockquote>"
     )
 
     if callback.message:
@@ -1617,7 +1940,7 @@ async def start_edit_step_text(callback: CallbackQuery, state: FSMContext) -> No
 
     await callback.message.edit_text(
         f"✏️ <b>Редактирование текста шага ({step.offset_display})</b>\n\n"
-        f"Текущий текст:\n<blockquote>{html.escape(step.message_text)}</blockquote>\n\n"
+        f"Текущий текст:\n<blockquote>{truncate_html_preview(step.message_text, 2800, allowed_tags=ALLOWED_EVENT_HTML_TAGS)}</blockquote>\n\n"
         f"Введите новый текст сообщения:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=f"admin_ev_step_{step_id}").as_markup(),
@@ -1626,7 +1949,8 @@ async def start_edit_step_text(callback: CallbackQuery, state: FSMContext) -> No
 
 @router.message(EventAdminStates.step_edit_text)
 async def process_edit_step_text(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
+    raw = message.html_text if isinstance(message.html_text, str) else (message.text or "")
+    text = raw.strip()
     data = await state.get_data()
     step_id = data["edit_step_id"]
     list_back = data.get("event_list_back", "admin_events")
@@ -1642,7 +1966,7 @@ async def process_edit_step_text(message: Message, state: FSMContext) -> None:
 
         await message.answer(
             f"✅ Текст шага обновлен (новая версия: v{updated.step_version})!\n\n"
-            f"<blockquote>{html.escape(updated.message_text)}</blockquote>",
+            f"<blockquote>{truncate_html_preview(updated.message_text, 2800, allowed_tags=ALLOWED_EVENT_HTML_TAGS)}</blockquote>",
             parse_mode="HTML",
             reply_markup=_step_card_keyboard(
                 updated.event_id,

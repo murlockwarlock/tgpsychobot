@@ -60,12 +60,34 @@ from event_admin_service import (
     validate_step_input,
 )
 from admin_html_preview import truncate_html_preview
+from event_content_validator import (
+    ALLOWED_EVENT_HTML_TAGS,
+    MEDIA_FORMAT_CAPTION,
+    MEDIA_FORMAT_LEGACY_AUTO,
+    MEDIA_FORMAT_SEPARATE_MEDIA_TOP,
+    MEDIA_FORMAT_SEPARATE_TEXT_TOP,
+    EventContentValidationError,
+    calculate_available_description_chars,
+    parse_visible_telegram_text,
+    render_plain_text_for_max,
+)
+from event_delivery_worker import build_test_delivery_plan
 from ..api import MaxApiClient
 from ..keyboards import callback_button, inline_keyboard
 from ..legacy import User, async_session_maker
 from ..storage import StateStore
 
 log = logging.getLogger(__name__)
+
+
+def _format_display_name(fmt: str) -> str:
+    if fmt == MEDIA_FORMAT_CAPTION:
+        return "💬 Фото/видео с текстом (подпись)"
+    if fmt == MEDIA_FORMAT_SEPARATE_TEXT_TOP:
+        return "📝 Текст отдельно, медиа ниже"
+    if fmt == MEDIA_FORMAT_SEPARATE_MEDIA_TOP:
+        return "🖼️ Текст отдельно, медиа выше"
+    return "Стандартный (авто)"
 
 MAX_EVENT_INPUT_STATES = frozenset({
     "max_event_create_code",
@@ -256,6 +278,12 @@ async def show_scenario(
     else:
         link_block = f"• <b>Код события:</b> <code>{s.code}</code>\n"
 
+    warning_block = (
+        f"⚠️ <b>Внимание:</b> {html.escape(s.content_warning)}\n"
+        if not s.is_content_valid and s.content_warning
+        else ""
+    )
+
     text = (
         f"📅 <b>Карточка мероприятия: {html.escape(s.title)}</b>\n\n"
         f"{link_block}"
@@ -267,7 +295,8 @@ async def show_scenario(
         f"• <b>Регистраций:</b> <b>{s.registrations_count}</b>\n"
         f"• <b>Ревизия:</b> {s.schedule_revision} (контент v{s.content_version})\n"
         f"• <b>Описание:</b> {html.escape((s.description or '—')[:160])}{'…' if s.description and len(s.description) > 160 else ''}\n"
-        f"• <b>Медиа:</b> {s.media_count} | порядок: {'медиа → текст' if s.media_order == 'media_top' else 'текст → медиа'}\n"
+        f"• <b>Медиа:</b> {s.media_count} | формат: {_format_display_name(s.media_format)}\n"
+        f"{warning_block}"
     )
 
     rows = []
@@ -600,6 +629,7 @@ async def _finish_scenario_create(
             duration_minutes=duration,
             place=place,
             link=link,
+            media_format=MEDIA_FORMAT_SEPARATE_MEDIA_TOP,
             is_active=False,
         )
         await states.clear(user_id)
@@ -628,9 +658,15 @@ async def show_edit_menu(client: MaxApiClient, chat_id: int, event_id: int, *, b
         [callback_button("📝 Описание", f"admin_ev_edit_description_{s.id}")],
         [callback_button("🖼 Медиа", f"admin_ev_edit_media_{s.id}")],
         [callback_button(
+            f"⚙️ Формат: {_format_display_name(s.media_format)}",
+            f"admin_ev_format_menu_{s.id}",
+        )],
+        [callback_button(
             f"↕️ Порядок: {'медиа → текст' if s.media_order == 'media_top' else 'текст → медиа'}",
             f"admin_ev_toggle_media_order_{s.id}",
         )],
+        [callback_button("👁 Предпросмотр Telegram", f"admin_ev_preview_tg_{s.id}")],
+        [callback_button("👁 Предпросмотр MAX", f"admin_ev_preview_max_{s.id}")],
     ]
     if s.event_type == "webinar":
         rows.append([callback_button("🔗 Изменить ссылку на вебинар", f"admin_ev_edit_link_{s.id}")])
@@ -643,6 +679,201 @@ async def show_edit_menu(client: MaxApiClient, chat_id: int, event_id: int, *, b
     await client.send_message(
         chat_id=chat_id,
         text=f"✏️ <b>Редактирование мероприятия: {html.escape(s.title)}</b>\n\nВыберите поле для изменения:",
+        attachments=inline_keyboard(rows),
+    )
+
+
+async def show_format_menu(client: MaxApiClient, chat_id: int, event_id: int, *, back: str = "admin_events") -> None:
+    s = await get_scenario_summary(async_session_maker, event_id)
+    if not s:
+        return
+    current_fmt = s.media_format
+    rows = [
+        [callback_button(
+            f"{'🔘 ' if current_fmt == MEDIA_FORMAT_SEPARATE_MEDIA_TOP else '⚪️ '}🖼️ Текст отдельно, медиа выше",
+            f"admin_ev_set_fmt_{event_id}_{MEDIA_FORMAT_SEPARATE_MEDIA_TOP}",
+        )],
+        [callback_button(
+            f"{'🔘 ' if current_fmt == MEDIA_FORMAT_SEPARATE_TEXT_TOP else '⚪️ '}📝 Текст отдельно, медиа ниже",
+            f"admin_ev_set_fmt_{event_id}_{MEDIA_FORMAT_SEPARATE_TEXT_TOP}",
+        )],
+        [callback_button(
+            f"{'🔘 ' if current_fmt == MEDIA_FORMAT_CAPTION else '⚪️ '}💬 Фото/видео с текстом (подпись)",
+            f"admin_ev_set_fmt_{event_id}_{MEDIA_FORMAT_CAPTION}",
+        )],
+        _back(f"admin_ev_edit_menu_{event_id}"),
+    ]
+    text = (
+        f"⚙️ <b>Формат доставки для: {html.escape(s.title)}</b>\n\n"
+        f"Текущий формат: <b>{_format_display_name(current_fmt)}</b>\n\n"
+        f"<b>Доступные форматы:</b>\n"
+        f"• <b>Текст отдельно, медиа выше:</b> отправка медиа, затем текст отдельным сообщением (до 3900 симв.).\n"
+        f"• <b>Текст отдельно, медиа ниже:</b> сначала текст сообщения (до 3900 симв.), затем медиа.\n"
+        f"• <b>Фото/видео с текстом (подпись):</b> одно медиа с подписью (до 900 симв. в TG, до 3900 в MAX).\n\n"
+        f"Выберите формат:"
+    )
+    await client.send_message(
+        chat_id=chat_id,
+        text=text,
+        attachments=inline_keyboard(rows),
+    )
+
+
+async def set_format_handler(
+    client: MaxApiClient,
+    states: StateStore,
+    chat_id: int,
+    user_id: int,
+    event_id: int,
+    new_fmt: str,
+) -> None:
+    snapshot = await states.get(user_id)
+    draft = snapshot.data.get("description_draft") if snapshot and snapshot.data.get("event_id") == event_id else None
+    list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+
+    try:
+        kwargs: dict[str, Any] = {"media_format": new_fmt}
+        if draft is not None:
+            kwargs["description"] = draft
+        s = await update_scenario_fields(
+            async_session_maker,
+            event_id,
+            **kwargs,
+        )
+        await client.send_message(chat_id=chat_id, text=f"✅ Формат изменён: {_format_display_name(s.media_format)}")
+        await show_edit_menu(client, chat_id, event_id, back=list_back)
+    except EventContentValidationError as err:
+        rec = f"\n\n💡 Рекомендация: {err.recommendation}" if err.recommendation else ""
+        await client.send_message(chat_id=chat_id, text=f"❌ Нельзя выбрать этот формат: {err.message}{rec}")
+    except Exception as exc:
+        await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
+
+
+async def show_telegram_preview(client: MaxApiClient, chat_id: int, event_id: int, user: Any = None) -> None:
+    s = await get_scenario_summary(async_session_maker, event_id)
+    if not s:
+        return
+    admin_user = user
+    if isinstance(user, int):
+        async with async_session_maker() as session:
+            admin_user = await session.get(User, user)
+    elif admin_user is None:
+        async with async_session_maker() as session:
+            admin_user = await session.get(User, 1)
+
+    plan = await build_test_delivery_plan(
+        async_session_maker,
+        event_id=event_id,
+        step_id=None,
+        admin_user=admin_user,
+    )
+    msg_count = len(plan)
+    order_lines = []
+    first_sample = ""
+    for idx, part in enumerate(plan, 1):
+        kind = part.get("kind")
+        if kind == "media_caption":
+            cap = part.get("caption", "")
+            first_sample = cap
+            order_lines.append(f"{idx}. Сообщение с медиа и подписью ({len(cap)} симв.)")
+        elif kind == "album":
+            m_cnt = len(part.get("media", []))
+            order_lines.append(f"{idx}. Альбом из {m_cnt} медиа")
+        elif kind == "single_media":
+            order_lines.append(f"{idx}. Одно медиа-сообщение")
+        elif kind == "text":
+            txt = part.get("text", "")
+            if not first_sample:
+                first_sample = txt
+            order_lines.append(f"{idx}. Текстовое сообщение ({len(txt)} симв.)")
+        elif kind == "control":
+            order_lines.append(f"{idx}. Кнопка управления регистрацией")
+
+    steps = await list_steps(async_session_maker, event_id, include_archived=False)
+    available_budget = calculate_available_description_chars(
+        s,
+        media_format=s.media_format,
+        steps=steps,
+    )["conservative"]
+    desc_len = len(s.description or "")
+
+    preview_body = (
+        f"👁 <b>Предпросмотр доставки (Telegram)</b>\n\n"
+        f"• <b>Формат:</b> {_format_display_name(s.media_format)}\n"
+        f"• <b>Сообщений к отправке:</b> {msg_count}\n"
+        f"• <b>Порядок доставки:</b>\n" + "\n".join(f"  {od}" for od in order_lines) + "\n\n"
+        f"• <b>Бюджет описания:</b> {desc_len} / {available_budget} симв. (остаток: {available_budget - desc_len})\n"
+        f"• <b>Статус валидации:</b> {'✅ Пройдена' if s.is_content_valid else f'❌ Превышение ({s.content_warning})'}\n\n"
+        f"<b>Пример текста первого сообщения:</b>\n"
+        f"<blockquote>{truncate_html_preview(first_sample, 1200, allowed_tags=ALLOWED_EVENT_HTML_TAGS) or '—'}</blockquote>"
+    )
+    rows = [_back(f"admin_ev_edit_menu_{event_id}")]
+    await client.send_message(
+        chat_id=chat_id,
+        text=preview_body,
+        attachments=inline_keyboard(rows),
+    )
+
+
+async def show_max_preview(client: MaxApiClient, chat_id: int, event_id: int, user: Any = None) -> None:
+    s = await get_scenario_summary(async_session_maker, event_id)
+    if not s:
+        return
+    admin_user = user
+    if isinstance(user, int):
+        async with async_session_maker() as session:
+            admin_user = await session.get(User, user)
+    elif admin_user is None:
+        async with async_session_maker() as session:
+            admin_user = await session.get(User, 1)
+
+    plan = await build_test_delivery_plan(
+        async_session_maker,
+        event_id=event_id,
+        step_id=None,
+        admin_user=admin_user,
+    )
+    msg_count = len(plan)
+    order_lines = []
+    first_sample = ""
+    for idx, part in enumerate(plan, 1):
+        kind = part.get("kind")
+        if kind == "media_caption":
+            cap = render_plain_text_for_max(part.get("caption", ""))
+            first_sample = cap
+            order_lines.append(f"{idx}. Сообщение с медиа и текстом ({len(cap)} симв.)")
+        elif kind == "album":
+            m_cnt = len(part.get("media", []))
+            order_lines.append(f"{idx}. Сообщение с {m_cnt} вложениями")
+        elif kind == "single_media":
+            order_lines.append(f"{idx}. Сообщение с 1 медиа-вложением")
+        elif kind == "text":
+            txt = render_plain_text_for_max(part.get("text", ""))
+            if not first_sample:
+                first_sample = txt
+            order_lines.append(f"{idx}. Текст ({len(txt)} симв.)")
+        elif kind == "control":
+            order_lines.append(f"{idx}. Кнопка управления (1 attachment)")
+
+    total_attachments = s.media_count + 1
+    plain_sample = html.escape(first_sample[:1200])
+
+    preview_body = (
+        f"👁 <b>Предпросмотр доставки (MAX)</b>\n\n"
+        f"• <b>Формат:</b> {_format_display_name(s.media_format)}\n"
+        f"• <b>Сообщений к отправке:</b> {msg_count}\n"
+        f"• <b>Порядок доставки:</b>\n" + "\n".join(f"  {od}" for od in order_lines) + "\n\n"
+        f"• <b>Ограничения MAX:</b>\n"
+        f"  - Вложений: {total_attachments} / 12 ({'✅ в норме' if total_attachments <= 12 else '❌ превышение!'})\n"
+        f"  - Лимит текста: до 3900 симв. ({'✅ в норме' if len(first_sample) <= 3900 else '❌ превышение!'})\n"
+        f"  - Rate limit: 2 сообщ./сек в один диалог (очередь с интервалом 0.5с)\n\n"
+        f"<b>Пример текста для MAX (plain text / без HTML):</b>\n"
+        f"<blockquote>{plain_sample or '—'}</blockquote>"
+    )
+    rows = [_back(f"admin_ev_edit_menu_{event_id}")]
+    await client.send_message(
+        chat_id=chat_id,
+        text=preview_body,
         attachments=inline_keyboard(rows),
     )
 
@@ -661,23 +892,45 @@ async def start_edit_description(client: MaxApiClient, states: StateStore, chat_
         return
     snapshot = await states.get(user_id)
     list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+    existing_draft = (
+        snapshot.data.get("description_draft")
+        if snapshot and snapshot.data.get("event_id") == event_id
+        else (s.description or "")
+    )
     await states.set(
         user_id,
         chat_id,
         "max_event_edit_description",
         {
             "event_id": event_id,
-            "description_draft": s.description or "",
+            "description_draft": existing_draft,
             "description_input_started": False,
             "event_list_back": list_back,
         },
     )
+
+    steps = await list_steps(async_session_maker, event_id, include_archived=False)
+    available_chars = calculate_available_description_chars(
+        s,
+        media_format=s.media_format,
+        steps=steps,
+    )["conservative"]
+    _, used_chars, _ = parse_visible_telegram_text(existing_draft)
+    remaining = available_chars - used_chars
+    status_line = (
+        f"• Доступный остаток: <b>{remaining}</b> симв. (использовано {used_chars} из {available_chars})\n"
+        if remaining >= 0
+        else f"⚠️ <b>Внимание:</b> Лимит превышен на {abs(remaining)} симв.!\n"
+    )
+
     await client.send_message(
         chat_id=chat_id,
         text=(
-            "📝 <b>Описание мероприятия</b>\n\n"
-            "Отправьте новый текст. Следующие сообщения добавляются к черновику, чтобы сохранить описание длиннее 4096 символов. При доставке длинный текст будет разделён безопасно.\n\n"
-            f"Текущий черновик:\n<blockquote>{truncate_html_preview(s.description, 2800, allowed_tags={'b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a', 'tg-spoiler', 'strike'}) or '—'}</blockquote>"
+            f"📝 <b>Описание мероприятия: {html.escape(s.title)}</b>\n\n"
+            f"• Формат доставки: <b>{_format_display_name(s.media_format)}</b>\n"
+            f"{status_line}\n"
+            "Отправьте текст сообщения. Каждое новое сообщение добавляется к черновику.\n\n"
+            f"Текущий черновик:\n<blockquote>{truncate_html_preview(existing_draft, 2800, allowed_tags=ALLOWED_EVENT_HTML_TAGS) or '—'}</blockquote>"
         ),
         attachments=inline_keyboard(_description_editor_keyboard(event_id)),
     )
@@ -687,12 +940,34 @@ async def receive_edit_description(client: MaxApiClient, states: StateStore, cha
     snapshot = await states.get(user_id)
     if not snapshot:
         return
+    event_id = snapshot.data["event_id"]
     previous = snapshot.data.get("description_draft", "") if snapshot.data.get("description_input_started") else ""
     combined = f"{previous}\n{raw_text}" if previous and raw_text else (previous or raw_text)
     await states.update(user_id, description_draft=combined, description_input_started=True)
+
+    s = await get_scenario_summary(async_session_maker, event_id)
+    m_fmt = s.media_format if s else MEDIA_FORMAT_SEPARATE_MEDIA_TOP
+    steps = await list_steps(async_session_maker, event_id, include_archived=False)
+    available_chars = calculate_available_description_chars(
+        s,
+        media_format=m_fmt,
+        steps=steps,
+    )["conservative"]
+    _, used_chars, _ = parse_visible_telegram_text(combined)
+    remaining = available_chars - used_chars
+    status_line = (
+        f"• Доступный остаток: <b>{remaining}</b> симв. (использовано {used_chars} из {available_chars})\n"
+        if remaining >= 0
+        else f"⚠️ <b>Внимание:</b> Превышение лимита на {abs(remaining)} симв.!\n"
+    )
+
     await client.send_message(
         chat_id=chat_id,
-        text=f"📝 Черновик обновлён ({len(combined)} символов).\n\n<blockquote>{truncate_html_preview(combined, 2800, allowed_tags={'b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a', 'tg-spoiler', 'strike'}) or '—'}</blockquote>",
+        text=(
+            f"📝 <b>Черновик обновлён</b> ({used_chars} симв.)\n"
+            f"{status_line}\n"
+            f"<blockquote>{truncate_html_preview(combined, 2800, allowed_tags=ALLOWED_EVENT_HTML_TAGS) or '—'}</blockquote>"
+        ),
         attachments=inline_keyboard(_description_editor_keyboard(snapshot.data["event_id"])),
     )
 
@@ -702,11 +977,36 @@ async def save_description(client: MaxApiClient, states: StateStore, chat_id: in
     if not snapshot:
         return
     event_id = snapshot.data["event_id"]
+    draft = snapshot.data.get("description_draft", "")
     list_back = snapshot.data.get("event_list_back", "admin_events")
     try:
-        s = await update_scenario_fields(async_session_maker, event_id, description=snapshot.data.get("description_draft", ""))
+        s = await update_scenario_fields(async_session_maker, event_id, description=draft)
         await states.clear(user_id)
-        await client.send_message(chat_id=chat_id, text="✅ Описание сохранено.", attachments=inline_keyboard([_back(_event_open_callback(s.id, list_back))]))
+        await client.send_message(
+            chat_id=chat_id,
+            text="✅ Описание сохранено.",
+            attachments=inline_keyboard([_back(_event_open_callback(s.id, list_back))]),
+        )
+    except EventContentValidationError as err:
+        rec = f"\n\n💡 Рекомендация: {err.recommendation}" if err.recommendation else ""
+        error_msg = (
+            f"❌ <b>Невозможно сохранить описание!</b>\n\n"
+            f"• Платформа: <b>{err.platform.upper()}</b>\n"
+            f"• Фактическая длина: <b>{err.actual_length}</b> симв. (лимит: {err.limit_length})\n"
+            f"• Превышение: <b>{err.actual_length - err.limit_length}</b> симв.\n"
+            f"• Причина: {html.escape(err.message)}{rec}\n\n"
+            f"<i>Черновик сохранён. Вы можете изменить текст или формат доставки.</i>"
+        )
+        rows = [
+            [callback_button("✏️ Редактировать текст", f"admin_ev_edit_description_{event_id}")],
+            [callback_button("⚙️ Изменить формат доставки", f"admin_ev_format_menu_{event_id}")],
+            _back(f"admin_ev_edit_menu_{event_id}"),
+        ]
+        await client.send_message(
+            chat_id=chat_id,
+            text=error_msg,
+            attachments=inline_keyboard(rows),
+        )
     except Exception as exc:
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
@@ -727,7 +1027,7 @@ async def delete_description(client: MaxApiClient, states: StateStore, chat_id: 
     )
     await client.send_message(
         chat_id=chat_id,
-        text="🗑 Описание будет удалено после нажатия «Сохранить и выйти».",
+        text="🗑 Описание очищено в черновике. Нажмите «Сохранить и выйти» для применения.",
         attachments=inline_keyboard(_description_editor_keyboard(event_id)),
     )
 

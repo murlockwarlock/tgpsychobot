@@ -2051,6 +2051,27 @@ class MaxBotApplication:
                     await self.states.set(user_id, chat_id, "max_event_edit_menu", {"event_id": event_id, "event_list_back": list_back})
                 await admin_events_service.show_edit_menu(self.client, chat_id, event_id, back=list_back)
                 return
+            if data.startswith("admin_ev_format_menu_"):
+                parts = data.split("_")
+                event_id = int(parts[4])
+                await admin_events_service.show_format_menu(self.client, chat_id, event_id)
+                return
+            if data.startswith("admin_ev_set_fmt_"):
+                parts = data.split("_")
+                event_id = int(parts[4])
+                new_fmt = "_".join(parts[5:])
+                await admin_events_service.set_format_handler(self.client, self.states, chat_id, user_id, event_id, new_fmt)
+                return
+            if data.startswith("admin_ev_preview_tg_"):
+                parts = data.split("_")
+                event_id = int(parts[4])
+                await admin_events_service.show_telegram_preview(self.client, chat_id, event_id, user_id)
+                return
+            if data.startswith("admin_ev_preview_max_"):
+                parts = data.split("_")
+                event_id = int(parts[4])
+                await admin_events_service.show_max_preview(self.client, chat_id, event_id, user_id)
+                return
             if data.startswith("admin_ev_edit_description_"):
                 event_id = int(data.split("_")[-1])
                 await admin_events_service.start_edit_description(self.client, self.states, chat_id, user_id, event_id)

@@ -220,6 +220,10 @@ _MAX_EVENT_BUTTON_CONTRACTS = (
     (re.compile(r"admin_ev_edit_duration_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_duration", "max_event_edit_duration"),
     (re.compile(r"admin_ev_edit_link_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_link", "max_event_edit_link"),
     (re.compile(r"admin_ev_edit_place_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_place", "max_event_edit_place"),
+    (re.compile(r"admin_ev_format_menu_\d+$"), "navigation", "events/edit-format", "max.events.edit", "show_format_menu", None),
+    (re.compile(r"admin_ev_set_fmt_\d+_[a-z_]+$"), "mutation", "events/edit-format", "max.events.edit", "set_format_handler", None),
+    (re.compile(r"admin_ev_preview_tg_\d+$"), "navigation", "events/preview-tg", "max.events.edit", "show_telegram_preview", None),
+    (re.compile(r"admin_ev_preview_max_\d+$"), "navigation", "events/preview-max", "max.events.edit", "show_max_preview", None),
     (re.compile(r"admin_ev_edit_description_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_description", "max_event_edit_description"),
     (re.compile(r"admin_ev_edit_media_\d+$"), "navigation", "events/edit-media", "max.description-media", "show_media_editor", "max_event_edit_media"),
     (re.compile(r"admin_ev_description_save_\d+$"), "mutation", "events/edit", "max.description-media", "save_description", None),
@@ -513,6 +517,7 @@ async def test_max_visible_event_buttons_dispatch_through_application_contract(d
         "start_edit_step_offset_custom", "step_move_up", "step_move_down", "ask_delete_step",
         "confirm_delete_step", "show_step", "show_stats", "show_problems", "show_problem_detail",
         "start_resolve", "show_test_send_menu", "do_test_send",
+        "show_format_menu", "set_format_handler", "show_telegram_preview", "show_max_preview",
     }
     routed: list[str] = []
 
@@ -675,6 +680,7 @@ async def test_max_visible_event_buttons_execute_real_application_journeys(db_se
         "start_edit_step_offset_custom", "step_move_up", "step_move_down", "ask_delete_step",
         "confirm_delete_step", "show_step", "show_stats", "show_problems", "show_problem_detail",
         "start_resolve", "show_test_send_menu", "do_test_send",
+        "show_format_menu", "set_format_handler", "show_telegram_preview", "show_max_preview",
     }
 
     def wrap_service(name: str, original):

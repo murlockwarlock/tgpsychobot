@@ -17,6 +17,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import func, select, text
@@ -44,6 +45,16 @@ from event_service import (
     render_event_message,
     render_event_template,
     reschedule_event,
+)
+from event_content_validator import (
+    MEDIA_FORMAT_CAPTION,
+    MEDIA_FORMAT_LEGACY_AUTO,
+    MEDIA_FORMAT_SEPARATE_MEDIA_TOP,
+    MEDIA_FORMAT_SEPARATE_TEXT_TOP,
+    EventContentValidationError,
+    get_media_format,
+    resolve_media_mode_and_order,
+    validate_scenario_content,
 )
 from max_messenger_bot.identity import is_max_user_id
 from time_helpers import MSK, format_msk, to_msk, utc_now
@@ -159,7 +170,12 @@ class ScenarioSummary:
     registrations_count: int
     description: str | None = None
     media_order: str = "media_top"
+    media_mode: str = "legacy_auto"
+    media_format: str = "legacy_auto"
     media_count: int = 0
+    is_content_valid: bool = True
+    content_warning: str | None = None
+    available_description_chars: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -482,6 +498,9 @@ async def list_scenarios(
         rows = (await session.execute(stmt)).all()
         result: list[ScenarioSummary] = []
         for scen, reg_count, media_count in rows:
+            m_mode = getattr(scen, "media_mode", "legacy_auto")
+            m_order = getattr(scen, "media_order", "media_top")
+            m_fmt = get_media_format(m_mode, m_order)
             result.append(
                 ScenarioSummary(
                     id=scen.id,
@@ -499,7 +518,9 @@ async def list_scenarios(
                     content_version=scen.content_version,
                     registrations_count=int(reg_count or 0),
                     description=scen.description,
-                    media_order=scen.media_order,
+                    media_order=m_order,
+                    media_mode=m_mode,
+                    media_format=m_fmt,
                     media_count=int(media_count or 0),
                 )
             )
@@ -525,6 +546,22 @@ async def get_scenario_summary(
         )
         if not scen:
             return None
+        steps = (await session.execute(
+            select(EventStep)
+            .where(EventStep.event_id == event_id, EventStep.is_archived.is_(False))
+            .order_by(EventStep.offset_minutes.asc(), EventStep.sort_order.asc(), EventStep.id.asc())
+        )).scalars().all()
+
+        m_mode = getattr(scen, "media_mode", "legacy_auto")
+        m_order = getattr(scen, "media_order", "media_top")
+        m_fmt = get_media_format(m_mode, m_order)
+        val_res = validate_scenario_content(
+            scen,
+            media_format=m_fmt,
+            media_count=int(media_count or 0),
+            steps=steps,
+        )
+
         return ScenarioSummary(
             id=scen.id,
             code=scen.code,
@@ -541,8 +578,13 @@ async def get_scenario_summary(
             content_version=scen.content_version,
             registrations_count=int(reg_count or 0),
             description=scen.description,
-            media_order=scen.media_order,
+            media_order=m_order,
+            media_mode=m_mode,
+            media_format=m_fmt,
             media_count=int(media_count or 0),
+            is_content_valid=val_res.is_valid,
+            content_warning=val_res.primary_error_message if not val_res.is_valid else None,
+            available_description_chars=val_res.available_description_chars,
         )
 
 
@@ -558,6 +600,8 @@ async def create_scenario(
     link: str | None = None,
     description: str | None = None,
     media_order: str = "media_top",
+    media_mode: str = "legacy_auto",
+    media_format: str | None = None,
     is_active: bool = False,
     now_utc: datetime | None = None,
 ) -> ScenarioSummary:
@@ -576,8 +620,15 @@ async def create_scenario(
         now_utc=now_utc,
     )
     norm_code = validate_event_code(code)
-    if media_order not in {"media_top", "text_top"}:
+    if media_format is not None:
+        effective_mode, effective_order = resolve_media_mode_and_order(media_format)
+    else:
+        effective_mode, effective_order = media_mode, media_order
+
+    if effective_order not in {"media_top", "text_top"}:
         raise ValueError("Порядок должен быть media_top или text_top.")
+    if effective_mode not in {"legacy_auto", "separate", "caption"}:
+        raise ValueError("Режим медиа должен быть legacy_auto, separate или caption.")
     eff_now = now_utc or utc_now()
 
     async with session_maker() as session:
@@ -606,12 +657,23 @@ async def create_scenario(
             schedule_revision=1,
             content_version=1,
             description=description.strip() if description and description.strip() else None,
-            media_order=media_order,
+            media_order=effective_order,
+            media_mode=effective_mode,
             created_at=eff_now,
             updated_at=eff_now,
         )
         session.add(scen)
         await session.flush()
+
+        # Validate complete scenario content before committing
+        val_res = validate_scenario_content(
+            scen,
+            media_format=get_media_format(effective_mode, effective_order),
+            media_count=0,
+            now=eff_now,
+        )
+        if not val_res.is_valid:
+            raise EventContentValidationError(val_res.primary_error_message, val_res)
 
         # Update reference_id on DeepLinkNamespace
         ns_entry = await session.get(DeepLinkNamespace, norm_code)
@@ -620,6 +682,7 @@ async def create_scenario(
 
         await session.commit()
 
+        fmt = get_media_format(effective_mode, effective_order)
         return ScenarioSummary(
             id=scen.id,
             code=scen.code,
@@ -636,8 +699,13 @@ async def create_scenario(
             content_version=scen.content_version,
             registrations_count=0,
             description=scen.description,
-            media_order=scen.media_order,
+            media_order=effective_order,
+            media_mode=effective_mode,
+            media_format=fmt,
             media_count=0,
+            is_content_valid=val_res.is_valid,
+            content_warning=None,
+            available_description_chars=val_res.available_description_chars,
         )
 
 
@@ -709,6 +777,35 @@ async def replace_scenario_media(
             raise ValueError(f"Сценарий {event_id} не найден.")
         if scenario.is_archived:
             raise ValueError("Нельзя редактировать архивный сценарий.")
+        m_mode = getattr(scenario, "media_mode", "legacy_auto")
+        m_order = getattr(scenario, "media_order", "media_top")
+        if m_mode == "caption":
+            if len(normalized) == 0:
+                # User removed all media in caption mode -> transition to separate mode to prevent dead end
+                scenario.media_mode = "separate"
+                m_mode = "separate"
+            elif len(normalized) > 1:
+                raise ValueError(
+                    f"В режиме «подпись к медиа» поддерживается ровно 1 файл (передано: {len(normalized)}). "
+                    "Удалите лишние файлы или выберите раздельный формат доставки."
+                )
+
+        steps = (await session.execute(
+            select(EventStep)
+            .where(EventStep.event_id == event_id, EventStep.is_archived.is_(False))
+            .order_by(EventStep.offset_minutes.asc(), EventStep.sort_order.asc(), EventStep.id.asc())
+        )).scalars().all()
+
+        val_res = validate_scenario_content(
+            scenario,
+            media_format=get_media_format(m_mode, m_order),
+            media_count=len(normalized),
+            steps=steps,
+            now=eff_now,
+        )
+        if not val_res.is_valid:
+            raise EventContentValidationError(val_res.primary_error_message, val_res)
+
         current = (
             await session.execute(
                 select(EventScenarioMedia).where(EventScenarioMedia.event_id == event_id)
@@ -767,6 +864,33 @@ async def set_step_event_details(
             raise ValueError("Нельзя редактировать архивный сценарий или шаг.")
         changed = bool(enabled) != bool(step.include_event_details)
         if changed:
+            existing_steps = (await session.execute(
+                select(EventStep)
+                .where(EventStep.event_id == scenario.id, EventStep.is_archived.is_(False), EventStep.id != step.id)
+            )).scalars().all()
+            probe_step = SimpleNamespace(
+                id=step.id,
+                event_id=step.event_id,
+                offset_minutes=step.offset_minutes,
+                message_text=step.message_text,
+                is_archived=False,
+                include_event_details=bool(enabled),
+            )
+            media_count = await session.scalar(
+                select(func.count(EventScenarioMedia.id)).where(EventScenarioMedia.event_id == scenario.id)
+            )
+            m_mode = getattr(scenario, "media_mode", "legacy_auto")
+            m_order = getattr(scenario, "media_order", "media_top")
+            val_res = validate_scenario_content(
+                scenario,
+                media_format=get_media_format(m_mode, m_order),
+                media_count=int(media_count or 0),
+                steps=[*existing_steps, probe_step],
+                now=eff_now,
+            )
+            if not val_res.is_valid:
+                raise EventContentValidationError(val_res.primary_error_message, val_res)
+
             step.include_event_details = bool(enabled)
             step.step_version += 1
             scenario.content_version += 1
@@ -793,6 +917,8 @@ async def update_scenario_fields(
     link: str | None = None,
     description: str | None | object = _UNSET,
     media_order: str | object = _UNSET,
+    media_mode: str | object = _UNSET,
+    media_format: str | object = _UNSET,
     now_utc: datetime | None = None,
 ) -> ScenarioSummary:
     """Updates content fields of a scenario in a short locked transaction, adjusting expiry for unsent immediate deliveries."""
@@ -825,9 +951,16 @@ async def update_scenario_fields(
             if description is not _UNSET
             else scen.description
         )
-        new_media_order = media_order if media_order is not _UNSET else scen.media_order
+        if media_format is not _UNSET and media_format is not None:
+            new_media_mode, new_media_order = resolve_media_mode_and_order(str(media_format))
+        else:
+            new_media_mode = media_mode if media_mode is not _UNSET else getattr(scen, "media_mode", "legacy_auto")
+            new_media_order = media_order if media_order is not _UNSET else getattr(scen, "media_order", "media_top")
+
         if new_media_order not in {"media_top", "text_top"}:
             raise ValueError("Порядок должен быть media_top или text_top.")
+        if new_media_mode not in {"legacy_auto", "separate", "caption"}:
+            raise ValueError("Режим медиа должен быть legacy_auto, separate или caption.")
 
         validate_scenario_input(
             code=scen.code,
@@ -841,6 +974,40 @@ async def update_scenario_fields(
             allow_ended=True,
         )
 
+        steps = (await session.execute(
+            select(EventStep)
+            .where(EventStep.event_id == event_id, EventStep.is_archived.is_(False))
+            .order_by(EventStep.offset_minutes.asc(), EventStep.sort_order.asc(), EventStep.id.asc())
+        )).scalars().all()
+
+        media_count = await session.scalar(
+            select(func.count(EventScenarioMedia.id)).where(EventScenarioMedia.event_id == event_id)
+        )
+
+        probe_scen = SimpleNamespace(
+            id=scen.id,
+            code=scen.code,
+            event_type=scen.event_type,
+            title=new_title,
+            starts_at=scen.starts_at,
+            duration_minutes=new_dur,
+            place=new_place,
+            link=new_link,
+            description=new_description,
+            media_mode=new_media_mode,
+            media_order=new_media_order,
+        )
+
+        val_res = validate_scenario_content(
+            probe_scen,
+            media_format=get_media_format(new_media_mode, new_media_order),
+            media_count=int(media_count or 0),
+            steps=steps,
+            now=eff_now,
+        )
+        if not val_res.is_valid:
+            raise EventContentValidationError(val_res.primary_error_message, val_res)
+
         duration_changed = (new_dur != scen.duration_minutes)
         content_changed = (
             new_title != scen.title
@@ -849,6 +1016,7 @@ async def update_scenario_fields(
             or new_link != scen.link
             or new_description != scen.description
             or new_media_order != scen.media_order
+            or new_media_mode != getattr(scen, "media_mode", None)
         )
 
         scen.title = new_title
@@ -857,6 +1025,7 @@ async def update_scenario_fields(
         scen.link = new_link if new_link else None
         scen.description = new_description
         scen.media_order = new_media_order
+        scen.media_mode = new_media_mode
         if content_changed:
             scen.content_version += 1
         scen.updated_at = eff_now
@@ -1093,6 +1262,11 @@ async def copy_scenario(
         # 1. Level 1: Reserve deep link namespace first
         await reserve_start_code(session, norm_code, kind="event")
 
+        target_mode = getattr(source, "media_mode", "legacy_auto")
+        if target_mode == "legacy_auto":
+            target_mode = "separate"
+        target_order = getattr(source, "media_order", "media_top")
+
         # 2. Level 3: Insert new EventScenario
         new_scen = EventScenario(
             code=norm_code,
@@ -1107,7 +1281,8 @@ async def copy_scenario(
             schedule_revision=1,
             content_version=1,
             description=source.description,
-            media_order=source.media_order,
+            media_order=target_order,
+            media_mode=target_mode,
         )
         session.add(new_scen)
         await session.flush()
@@ -1146,8 +1321,18 @@ async def copy_scenario(
                 sort_order=media.sort_order,
             ))
 
+        val_res = validate_scenario_content(
+            new_scen,
+            media_format=get_media_format(target_mode, target_order),
+            media_count=len(source_media),
+            steps=active_steps,
+        )
+        if not val_res.is_valid:
+            raise EventContentValidationError(val_res.primary_error_message, val_res)
+
         await session.commit()
 
+        fmt = get_media_format(target_mode, target_order)
         return ScenarioSummary(
             id=new_scen.id,
             code=new_scen.code,
@@ -1164,8 +1349,13 @@ async def copy_scenario(
             content_version=new_scen.content_version,
             registrations_count=0,
             description=new_scen.description,
-            media_order=new_scen.media_order,
+            media_order=target_order,
+            media_mode=target_mode,
+            media_format=fmt,
             media_count=len(source_media),
+            is_content_valid=val_res.is_valid,
+            content_warning=None,
+            available_description_chars=val_res.available_description_chars,
         )
 
 
@@ -1289,6 +1479,26 @@ async def add_step(
             is_archived=False,
             include_event_details=include_event_details,
         )
+
+        existing_steps = (await session.execute(
+            select(EventStep)
+            .where(EventStep.event_id == event_id, EventStep.is_archived.is_(False))
+        )).scalars().all()
+        media_count = await session.scalar(
+            select(func.count(EventScenarioMedia.id)).where(EventScenarioMedia.event_id == event_id)
+        )
+        m_mode = getattr(scen, "media_mode", "legacy_auto")
+        m_order = getattr(scen, "media_order", "media_top")
+        val_res = validate_scenario_content(
+            scen,
+            media_format=get_media_format(m_mode, m_order),
+            media_count=int(media_count or 0),
+            steps=[*existing_steps, step],
+            now=eff_now,
+        )
+        if not val_res.is_valid:
+            raise EventContentValidationError(val_res.primary_error_message, val_res)
+
         session.add(step)
         await session.flush()  # populate step.id
 
@@ -1409,6 +1619,33 @@ async def update_step(
             include_event_details if include_event_details is not None else step.include_event_details
         )
         validate_step_input(new_offset, new_text)
+
+        existing_steps = (await session.execute(
+            select(EventStep)
+            .where(EventStep.event_id == scen.id, EventStep.is_archived.is_(False), EventStep.id != step.id)
+        )).scalars().all()
+        probe_step = SimpleNamespace(
+            id=step.id,
+            event_id=step.event_id,
+            offset_minutes=new_offset,
+            message_text=new_text,
+            is_archived=False,
+            include_event_details=bool(new_include_event_details),
+        )
+        media_count = await session.scalar(
+            select(func.count(EventScenarioMedia.id)).where(EventScenarioMedia.event_id == scen.id)
+        )
+        m_mode = getattr(scen, "media_mode", "legacy_auto")
+        m_order = getattr(scen, "media_order", "media_top")
+        val_res = validate_scenario_content(
+            scen,
+            media_format=get_media_format(m_mode, m_order),
+            media_count=int(media_count or 0),
+            steps=[*existing_steps, probe_step],
+            now=eff_now,
+        )
+        if not val_res.is_valid:
+            raise EventContentValidationError(val_res.primary_error_message, val_res)
 
         offset_changed = (new_offset != step.offset_minutes)
         text_changed = new_text != step.message_text or bool(new_include_event_details) != bool(step.include_event_details)

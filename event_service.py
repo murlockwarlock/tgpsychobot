@@ -561,7 +561,7 @@ def render_event_template(
         scenario.description or "",
         max(len(scenario.description or "") + 1, 1),
         suffix="",
-        allowed_tags={"b", "strong", "i", "em", "s", "strike", "u", "code", "pre", "a", "blockquote", "tg-spoiler"},
+        allowed_tags={"b", "strong", "i", "em", "s", "strike", "u", "code", "pre", "a", "blockquote", "tg-spoiler", "tg-emoji"},
     )
     subs = {
         "name": html.escape(user_name, quote=False),
@@ -603,7 +603,7 @@ def render_event_details(scenario: EventScenario) -> str:
             scenario.description,
             max(len(scenario.description) + 1, 1),
             suffix="",
-            allowed_tags={"b", "strong", "i", "em", "s", "strike", "u", "code", "pre", "a", "blockquote", "tg-spoiler"},
+            allowed_tags={"b", "strong", "i", "em", "s", "strike", "u", "code", "pre", "a", "blockquote", "tg-spoiler", "tg-emoji"},
         )
         lines.extend(["", "📝 Описание:", description])
     return "\n".join(lines)
@@ -625,7 +625,7 @@ def render_event_message(
             scenario.description or "",
             max(len(scenario.description or "") + 1, 1),
             suffix="",
-            allowed_tags={"b", "strong", "i", "em", "s", "strike", "u", "code", "pre", "a", "blockquote", "tg-spoiler"},
+            allowed_tags={"b", "strong", "i", "em", "s", "strike", "u", "code", "pre", "a", "blockquote", "tg-spoiler", "tg-emoji"},
         )
         if description_value and description_value in rendered and "📝 Описание:" in detail_lines:
             detail_lines = detail_lines[:detail_lines.index("📝 Описание:")]
@@ -640,6 +640,9 @@ def render_event_message(
         details = "\n".join(detail_lines).strip()
         if details and details not in rendered:
             rendered = f"{rendered.rstrip()}\n\n{details}" if rendered.strip() else details
+    if platform == "max" and "<tg-emoji" in rendered:
+        from event_content_validator import strip_telegram_custom_emoji
+        return strip_telegram_custom_emoji(rendered)
     return rendered
 
 
