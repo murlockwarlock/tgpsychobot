@@ -38,6 +38,23 @@ def build_subscribe_keyboard(locale: str = "ru") -> InlineKeyboardMarkup:
     ])
 
 
+def build_robokassa_pending_keyboard(locale: str = "ru") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=translate("ui.subscription.check_status", locale, fallback="🔄 Проверить статус"),
+            callback_data="sub_retry_now",
+        )],
+        [InlineKeyboardButton(
+            text=translate("ui.subscription.cancel_retry", locale, fallback="🔄 Отменить и оформить заново"),
+            callback_data="sub_cancel_retry",
+        )],
+        [InlineKeyboardButton(
+            text=translate("ui.subscription.enter_promo", locale, fallback="🎁 Ввести промокод"),
+            callback_data="sub_enter_promo",
+        )],
+    ])
+
+
 async def send_notification_transport_result(
     bot: Bot,
     recipient_id: int,
@@ -53,8 +70,11 @@ async def send_notification_transport_result(
     Returns a delivery result. Terminal recipient failures are marked non-retryable.
     Never throws exceptions.
     """
-    if reply_markup is None and keyboard_type == "subscribe":
-        reply_markup = build_subscribe_keyboard()
+    if reply_markup is None:
+        if keyboard_type == "subscribe":
+            reply_markup = build_subscribe_keyboard()
+        elif keyboard_type == "robokassa_pending":
+            reply_markup = build_robokassa_pending_keyboard()
 
     if recipient_id < 100_000_000_000:
         try:

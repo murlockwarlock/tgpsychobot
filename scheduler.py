@@ -24,6 +24,7 @@ from uuid import uuid4
 import html
 import os
 import json
+from typing import Any
 from config import OWNER_IDS
 import keyboards as kb
 import aiohttp
@@ -259,6 +260,27 @@ def _was_recent_notification_logged(recipient_id: int, key: str, now: datetime, 
     return False
 
 
+def _subscription_notification_snapshot(
+    sub: UserSubscription,
+    reminder_bucket: str,
+    *,
+    pending_robokassa_invoice_id: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": sub.id,
+        "user_id": sub.user_id,
+        "end_date": sub.end_date.isoformat(),
+        "plan_id": sub.plan_id,
+        "payment_provider": sub.payment_provider,
+        "pending_robokassa_invoice_id": (
+            sub.pending_robokassa_invoice_id
+            if pending_robokassa_invoice_id is None
+            else pending_robokassa_invoice_id
+        ),
+        "reminder_bucket": reminder_bucket,
+    }
+
+
 async def _send_deduplicated_notification(
         bot: Bot,
         recipient_id: int,
@@ -269,10 +291,14 @@ async def _send_deduplicated_notification(
         reply_markup=None,
         window: timedelta = EXPIRATION_DEDUP_WINDOW,
         logger=None,
+        keyboard_type: str | None = None,
+        keyboard_locale: str | None = None,
+        subscription_snapshot: dict[str, Any] | None = None,
 ) -> bool:
     target_logger = logger or plog
     if _was_recent_notification_logged(recipient_id, key, now, window):
         return False
+    resolved_keyboard_locale = keyboard_locale
     if reply_markup and any(
         getattr(button, "callback_data", None) == "show_subscription_info_from_chat"
         for row in getattr(reply_markup, "inline_keyboard", ())
@@ -284,7 +310,16 @@ async def _send_deduplicated_notification(
                 recipient_id,
                 platform="max" if recipient_id >= 100_000_000_000 else "telegram",
             )
+        resolved_keyboard_locale = locale
         reply_markup = build_subscribe_keyboard(locale)
+
+    if reply_markup and not resolved_keyboard_locale and keyboard_type:
+        async with async_session_maker() as session:
+            resolved_keyboard_locale = await resolve_user_effective_locale(
+                session,
+                recipient_id,
+                platform="max" if recipient_id >= 100_000_000_000 else "telegram",
+            )
 
     raw_key = f"scheduler:notification:{recipient_id}:{key}"
     if len(raw_key) > 255:
@@ -292,8 +327,11 @@ async def _send_deduplicated_notification(
     payload = {
         "text": text,
         "parse_mode": None,
-        "keyboard_type": "subscribe" if reply_markup else None,
+        "keyboard_type": keyboard_type or ("subscribe" if reply_markup else None),
+        "keyboard_locale": resolved_keyboard_locale,
     }
+    if subscription_snapshot is not None:
+        payload["subscription_snapshot"] = subscription_snapshot
 
     try:
         async with async_session_maker() as session:
@@ -302,7 +340,7 @@ async def _send_deduplicated_notification(
                 .where(PaymentNotificationOutbox.unique_key == raw_key)
             )
             if row is not None:
-                if row.status in {"delivered", "failed_terminal"}:
+                if row.status in {"delivered", "failed_terminal", "cancelled"}:
                     return False
                 if row.status == "pending" and row.next_retry_at and row.next_retry_at > now:
                     return False
@@ -1056,6 +1094,7 @@ async def check_subscriptions(bot: Bot):
                             now,
                             reply_markup=reply_markup,
                             window=timedelta(hours=3),
+                            subscription_snapshot=_subscription_notification_snapshot(sub, reminder_bucket),
                         )
                     except Exception:
                         pass
@@ -1081,6 +1120,7 @@ async def check_subscriptions(bot: Bot):
                                         now,
                                         reply_markup=user_subscribe_kb,
                                         window=timedelta(hours=6),
+                                        subscription_snapshot=_subscription_notification_snapshot(sub, "trial_finished"),
                                     )
                                 except Exception:
                                     pass
@@ -1110,6 +1150,7 @@ async def check_subscriptions(bot: Bot):
                                         f"expired:{sub.id}:{plan_name_exp}",
                                         now,
                                         reply_markup=user_subscribe_kb,
+                                        subscription_snapshot=_subscription_notification_snapshot(sub, "expired"),
                                     )
                                 except Exception:
                                     pass
@@ -1748,6 +1789,13 @@ async def check_subscriptions(bot: Bot):
                                     now,
                                     reply_markup=kb.subscription_pending_keyboard(user_locale),
                                     window=timedelta(days=1),
+                                    keyboard_type="robokassa_pending",
+                                    keyboard_locale=user_locale,
+                                    subscription_snapshot=_subscription_notification_snapshot(
+                                        sub,
+                                        "robokassa_pending",
+                                        pending_robokassa_invoice_id=new_payment.id,
+                                    ),
                                 )
                             except Exception:
                                 pass
