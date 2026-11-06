@@ -25,7 +25,7 @@ import max_messenger_bot.ai as max_ai
 import max_messenger_bot.app as max_app
 from database import AIConfig, MediaLibrary, Topic, User, Message as DBMessage, media_collection_items
 from media_template_renderer import TemplateRenderError, TemplateRenderInvariantError, bind_source, normalized_source, render_template, validate_config, validate_pixels, validate_fonts
-from media_templates import extract_template_directive, format_template_sources, render_media_template, validate_rendered_template
+from media_templates import extract_template_directive, format_template_sources, render_media_template, validate_rendered_template, current_issue_date, synchronize_template_caption
 from media_template_admin import BUTTON_CONTRACTS, TemplateAdminState, field_form
 from tests.test_media_image_edit import async_engine, session_factory, clean_runtime, setup_tg_user, media_setup, TelegramTransport, MaxTransport
 from tests.test_hide_empty_media_prompt import LEGACY_SERVICE_PROMPT_TEMPLATE
@@ -571,3 +571,266 @@ def test_renderer_catches_corruption_before_png_delivery(monkeypatch):
     monkeypatch.setattr(Image.Image, 'save', corrupt)
     with pytest.raises(TemplateRenderInvariantError):
         render_template(source, template_config(source), VALUES)
+
+
+# ==============================================================================
+# Certificate Date Guarantee & Caption Formatting Regression Tests
+# ==============================================================================
+
+@pytest.mark.parametrize('utc_time,expected_msk_date', [
+    (datetime(2026, 11, 6, 12, 0, 0, tzinfo=timezone.utc), '06.11.2026'),
+    # Midnight transition: 20:59:59 UTC = 23:59:59 MSK
+    (datetime(2026, 11, 6, 20, 59, 59, tzinfo=timezone.utc), '06.11.2026'),
+    # Midnight transition: 21:00:00 UTC = 00:00:00 MSK next day
+    (datetime(2026, 11, 6, 21, 0, 0, tzinfo=timezone.utc), '07.11.2026'),
+    # Month & Year rollover: 31 Dec 2026 21:00:00 UTC = 01 Jan 2027 00:00:00 MSK
+    (datetime(2026, 12, 31, 21, 0, 0, tzinfo=timezone.utc), '01.01.2027'),
+    # Leap year boundary: 28 Feb 2028 21:00:00 UTC = 29 Feb 2028 00:00:00 MSK
+    (datetime(2028, 2, 28, 21, 0, 0, tzinfo=timezone.utc), '29.02.2028'),
+])
+def test_certificate_issue_date_clock_and_timezone_guarantee(utc_time, expected_msk_date):
+    assert current_issue_date(now=utc_time) == expected_msk_date
+
+
+@pytest.mark.parametrize('caption_input,issue_date,expected_output', [
+    (
+        "**Сертификат готов**\n\n- Получатель: Денис Солдатов\n- Дата выдачи: 11.06.2025",
+        "06.11.2026",
+        "**Сертификат готов**\n\n- Получатель: Денис Солдатов\n- Дата выдачи: 06.11.2026",
+    ),
+    (
+        "Сертификат готов\n• Получатель: Иван Солдатов\n• Дата выдачи: проставляется автоматически сервером",
+        "06.11.2026",
+        "Сертификат готов\n• Получатель: Иван Солдатов\n• Дата выдачи: 06.11.2026",
+    ),
+    (
+        "Сертификат готов\n• Получатель: Иван Солдатов\n• Дата выдачи: проставляется автоматически при формировании",
+        "06.11.2026",
+        "Сертификат готов\n• Получатель: Иван Солдатов\n• Дата выдачи: 06.11.2026",
+    ),
+    (
+        "Сертификат готов\n• Получатель: Денис Солдатов",
+        "06.11.2026",
+        "Сертификат готов\n• Получатель: Денис Солдатов\n• Дата выдачи: 06.11.2026",
+    ),
+    (
+        "Сертификат готов для Дениса!",
+        None,
+        "Сертификат готов для Дениса!",
+    ),
+])
+def test_synchronize_template_caption_replaces_stubs_and_hallucinations(caption_input, issue_date, expected_output):
+    assert synchronize_template_caption(caption_input, issue_date) == expected_output
+
+
+@pytest.mark.asyncio
+async def test_admin_replace_image_bind_toggle_lifecycle(session_factory, media_setup, monkeypatch):
+    """Lifecycle: image replacement -> bind source -> toggle enable -> verify enabled status."""
+    from aiogram.types import File
+    source, config = await seed_template(session_factory)
+    new_source = source_png(size=(720, 1080))
+    monkeypatch.setattr(handlers, 'is_admin', AsyncMock(return_value=True))
+
+    class LifecycleTransport(TelegramTransport):
+        async def make_request(self, bot, method, timeout=None):
+            if isinstance(method, GetFile):
+                self.calls.append(method)
+                return File(file_id=method.file_id, file_unique_id='unique_20k', file_path='photos/new_20k.jpg')
+            return await super().make_request(bot, method, timeout)
+
+    transport = LifecycleTransport()
+    async def stream(*args, **kwargs): yield new_source
+    monkeypatch.setattr(transport, 'stream_content', stream)
+
+    # 1. Admin replaces image file bytes
+    async with session_factory() as session:
+        media = await session.get(MediaLibrary, 3)
+        media.source_image_bytes = new_source
+        media.file_id = "replaced_20k_file_id"
+        await session.commit()
+
+    bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+    handlers.router._parent_router = None
+    dispatcher = Dispatcher()
+    dispatcher.include_router(handlers.router)
+    state = dispatcher.fsm.get_context(bot=bot, chat_id=media_setup, user_id=media_setup)
+    await state.update_data(authoring_locale='ru')
+
+    latest = None
+    async def click(data):
+        nonlocal latest
+        start = len(transport.calls)
+        cb = CallbackQuery(
+            id=str(start),
+            from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Admin'),
+            chat_instance='ci',
+            data=data,
+            message=Message(message_id=6000 + start, date=datetime.now(timezone.utc), chat=Chat(id=media_setup, type='private'), text='screen')
+        )
+        await dispatcher.feed_update(bot, Update(update_id=6000 + start, callback_query=cb))
+        screens = [call for call in transport.calls[start:] if getattr(call, 'reply_markup', None)]
+        if screens:
+            latest = screens[-1]
+        return latest
+
+    try:
+        # Open template menu for media 3
+        latest = await click('mt:home:3:1:0:0:-1')
+        assert latest is not None
+        assert 'выключен' in latest.text or 'включен' in latest.text
+
+        # Click "Настроить источник" (bind)
+        latest = await click('mt:bind:3:1:0:0:-1')
+        assert 'выключен' in latest.text
+        async with session_factory() as session:
+            media = await session.get(MediaLibrary, 3)
+            assert not media.render_template_enabled
+            assert media.render_template_config['canvas'] == {'width': 720, 'height': 1080}
+
+        # Click "Включить" (toggle)
+        latest = await click('mt:toggle:3:1:0:0:-1')
+        assert 'включен' in latest.text
+        async with session_factory() as session:
+            media = await session.get(MediaLibrary, 3)
+            assert media.render_template_enabled
+
+        # Verify Back button returns to collection media view (no old interface leak)
+        latest = await click('mt:back:3:1:0:0:-1')
+        assert 'admin_coll_files_1_0_0' in str(latest.reply_markup)
+    finally:
+        dispatcher.sub_routers.clear()
+        handlers.router._parent_router = None
+        await bot.session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.ui_journey
+async def test_telegram_certificate_delivery_journey_date_and_formatting(session_factory, media_setup, monkeypatch):
+    """User dialogue: delivers certificate.png with server-guaranteed date, escaped FIO, and valid HTML caption."""
+    source, config = await seed_template(session_factory)
+    fixed_time = datetime(2026, 11, 6, 21, 5, 0, tzinfo=timezone.utc)  # 07.11.2026 in MSK!
+    monkeypatch.setattr(media_templates, '_TEST_CLOCK', lambda: fixed_time)
+
+    # Hallucinated response from model with wrong date 11.06.2025 and raw markdown
+    fio_special = "Денис & Ко <Младший>"
+    raw_markdown_caption = f"**Сертификат готов**\n\n- Получатель: {fio_special}\n- Дата выдачи: 11.06.2025"
+    ai_response = f"{raw_markdown_caption}\n[RENDER_IMG_MEDIA: panda_certificate | {{\"recipient\": \"{fio_special}\", \"issue_date\": \"11.06.2025\"}}]"
+
+    model = AsyncMock(return_value=ai_response)
+    monkeypatch.setattr(ai_integration, '_call_gemini_api', model)
+    transport = TelegramTransport()
+    async def stream(*args, **kwargs): yield source
+    monkeypatch.setattr(transport, 'stream_content', stream)
+
+    bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+    handlers.router._parent_router = None
+    dispatcher = Dispatcher()
+    dispatcher.include_router(handlers.router)
+
+    try:
+        await dispatcher.feed_update(
+            bot,
+            Update(
+                update_id=9001,
+                message=Message(
+                    message_id=9001,
+                    date=datetime.now(timezone.utc),
+                    chat=Chat(id=media_setup, type='private'),
+                    from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Denis'),
+                    text=f'{fio_special}, привет',
+                ),
+            ),
+        )
+        if media_setup in handlers.user_processing_tasks:
+            await handlers.user_processing_tasks[media_setup]
+
+        documents = [c for c in transport.calls if isinstance(c, SendDocument)]
+        assert len(documents) == 1, f"Expected 1 document, got {len(documents)}"
+        doc = SendDocument.model_validate(documents[0].model_dump())
+
+        # 1. Output format check: certificate.png, not raw blank JPG
+        assert doc.document.filename == 'certificate.png'
+        assert doc.document.data != source
+        assert_pixels(source, doc.document.data, config)
+
+        # 2. Caption HTML formatting: NO raw markdown, parse_mode="HTML"
+        assert doc.parse_mode == "HTML"
+        assert "**" not in doc.caption
+        assert "<b>Сертификат готов</b>" in doc.caption
+        # 3. HTML escaping of special characters in name
+        assert "Денис &amp; Ко &lt;Младший&gt;" in doc.caption
+        # 4. Server date guarantee: 07.11.2026 (MSK after midnight), NOT 11.06.2025
+        assert "11.06.2025" not in doc.caption
+        assert "07.11.2026" in doc.caption
+        assert "• Дата выдачи: 07.11.2026" in doc.caption
+        assert "проставляется автоматически" not in doc.caption
+    finally:
+        dispatcher.sub_routers.clear()
+        handlers.router._parent_router = None
+        await bot.session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.ui_journey
+async def test_max_certificate_delivery_journey_date_and_formatting(session_factory, media_setup, monkeypatch):
+    """MAX user dialogue: delivers certificate.png with server-guaranteed date and valid HTML formatting."""
+    source, config = await seed_template(session_factory)
+    fixed_time = datetime(2026, 11, 6, 15, 0, 0, tzinfo=timezone.utc)  # 06.11.2026 in MSK
+    monkeypatch.setattr(media_templates, '_TEST_CLOCK', lambda: fixed_time)
+
+    raw_response = (
+        "**Сертификат готов**\n\n"
+        "- Получатель: Денис Солдатов\n"
+        "- Дата выдачи: проставляется автоматически сервером\n"
+        "[RENDER_IMG_MEDIA: panda_certificate | {\"recipient\": \"Денис Солдатов\", \"issue_date\": \"проставляется автоматически сервером\"}]"
+    )
+    model = AsyncMock(return_value=raw_response)
+    monkeypatch.setattr(max_ai, '_dispatch_provider', model)
+
+    client = MaxTransport()
+    monkeypatch.setattr(client, 'download_attachment_url', AsyncMock(return_value=source))
+
+    # Rename media library items for MAX scope
+    async with session_factory() as session:
+        (await session.get(MediaLibrary, 3)).file_name = 'telegram-template'
+        max_media = await session.get(MediaLibrary, 40)
+        max_media.file_name = 'panda_certificate'
+        max_media.render_template_enabled = True
+        max_media.render_template_config = config
+        await session.commit()
+
+    application = max_app.MaxBotApplication(client)
+    try:
+        await application.handle_update({
+            'update_type': 'message_created',
+            'update_id': 'template-max-date',
+            'message': {
+                'sender': {'user_id': 7, 'name': 'Denis'},
+                'recipient': {'chat_id': 100},
+                'body': {'mid': 'msg-1', 'text': 'Денис Солдатов'},
+            },
+        })
+        if application.background_tasks:
+            await asyncio.gather(*list(application.background_tasks))
+
+        # Check uploaded file is certificate.png with modified pixels
+        assert len(client.uploads) == 1
+        assert client.uploads[0][0] == 'file'
+        assert client.uploads[0][1] != source
+        assert_pixels(source, client.uploads[0][1], config)
+
+        # Check wire payload sent to MAX
+        sent_messages = [kwargs for _, _, kwargs in client.wire if kwargs.get('json_data', {}).get('attachments')]
+        assert len(sent_messages) == 1
+        payload = sent_messages[0]['json_data']
+        assert payload.get('format') == 'html'
+        text = payload.get('text', '')
+
+        # HTML formatting without raw markdown
+        assert "**" not in text
+        assert "<b>Сертификат готов</b>" in text
+        assert "• Дата выдачи: 06.11.2026" in text
+        assert "проставляется автоматически" not in text
+        assert "11.06.2025" not in text
+    finally:
+        pass
