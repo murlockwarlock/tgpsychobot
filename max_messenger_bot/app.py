@@ -121,6 +121,27 @@ async def _reject_unavailable_system_message_locale(
     return True
 
 
+async def _reject_foreign_event_draft_callback(
+    app: "MaxBotApplication",
+    callback: IncomingCallback,
+    event_id: int,
+) -> bool:
+    """Keep stale event buttons from changing another event's draft.
+
+    MAX keyboards can remain visible after a newer edit flow has started.  A
+    callback carrying a different event id must therefore be rejected before
+    any service call can clear state or mutate the database.
+    """
+    snapshot = await app.states.get(callback.sender.user_id)
+    if admin_events_service.has_foreign_event_draft(snapshot, event_id):
+        await app.client.answer_callback(
+            callback.callback_id,
+            notification="Сначала завершите или отмените текущее редактирование.",
+        )
+        return True
+    return False
+
+
 async def _return_to_max_system_message_ru_list(
     app: "MaxBotApplication",
     callback: IncomingCallback,
@@ -1979,6 +2000,13 @@ class MaxBotApplication:
                 parts = data.split("_")
                 event_id = int(parts[3])
                 back = f"admin_ev_page_{parts[4]}_{parts[5]}" if len(parts) >= 6 else "admin_events"
+                snapshot = await self.states.get(user_id)
+                if admin_events_service.has_foreign_event_draft(snapshot, event_id):
+                    await self.client.answer_callback(
+                        callback.callback_id,
+                        notification="Сначала завершите или отмените текущее редактирование.",
+                    )
+                    return
                 await self.states.clear(user_id)
                 await self.states.set(
                     user_id,
@@ -1992,14 +2020,19 @@ class MaxBotApplication:
                 snapshot = await self.states.get(user_id)
                 list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
                 if data.startswith("admin_ev_toggle_media_order_"):
+                    event_id = int(data.split("_")[-1])
+                    if await _reject_foreign_event_draft_callback(self, callback, event_id):
+                        return
                     await admin_events_service.toggle_media_order(
                         self.client,
                         chat_id,
-                        int(data.split("_")[-1]),
+                        event_id,
                         back=list_back,
                     )
                     return
                 event_id = int(data.split("_")[-1])
+                if await _reject_foreign_event_draft_callback(self, callback, event_id):
+                    return
                 await admin_events_service.toggle_scenario(
                     self.client,
                     chat_id,
@@ -2009,6 +2042,8 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_ev_archive_ask_"):
                 event_id = int(data.split("_")[-1])
+                if await _reject_foreign_event_draft_callback(self, callback, event_id):
+                    return
                 snapshot = await self.states.get(user_id)
                 list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
                 await admin_events_service.archive_scenario_ask(
@@ -2020,6 +2055,8 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_ev_archive_yes_"):
                 event_id = int(data.split("_")[-1])
+                if await _reject_foreign_event_draft_callback(self, callback, event_id):
+                    return
                 snapshot = await self.states.get(user_id)
                 list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
                 await admin_events_service.archive_scenario_confirm(
@@ -2040,21 +2077,59 @@ class MaxBotApplication:
                 return
             if data.startswith("admin_ev_edit_menu_"):
                 snapshot = await self.states.get(user_id)
-                list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
-                await self.states.clear(user_id)
                 parts = data.split("_")
                 event_id = int(parts[4])
-                if len(parts) >= 7:
-                    list_back = f"admin_ev_page_{parts[5]}_{parts[6]}"
-                has_list_context = list_back != "admin_events"
-                if has_list_context:
-                    await self.states.set(user_id, chat_id, "max_event_edit_menu", {"event_id": event_id, "event_list_back": list_back})
-                await admin_events_service.show_edit_menu(self.client, chat_id, event_id, back=list_back)
+                if admin_events_service.has_foreign_event_draft(snapshot, event_id):
+                    await self.client.answer_callback(
+                        callback.callback_id,
+                        notification="Это старое меню другого мероприятия. Сначала завершите или отмените текущее редактирование.",
+                    )
+                    return
+                list_back = (
+                    f"admin_ev_page_{parts[5]}_{parts[6]}"
+                    if len(parts) >= 7
+                    else (snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events")
+                )
+                same_event_context = bool(
+                    snapshot
+                    and snapshot.data.get("event_id") == event_id
+                    and admin_events_service.has_active_event_draft(snapshot)
+                )
+                if same_event_context:
+                    state_data = dict(snapshot.data)
+                    state_data["event_list_back"] = list_back
+                    await self.states.set(user_id, chat_id, snapshot.state or "max_event_edit_menu", state_data)
+                else:
+                    await self.states.clear(user_id)
+                    data_to_store = {"event_id": event_id, "event_list_back": list_back}
+                    if snapshot and snapshot.data.get("locale"):
+                        data_to_store["locale"] = snapshot.data["locale"]
+                    await self.states.set(user_id, chat_id, "max_event_edit_menu", data_to_store)
+                show_menu_kwargs = {"back": list_back}
+                preserve_content_screen = bool(
+                    same_event_context
+                    and any(
+                        snapshot.data.get(key) is not None
+                        for key in ("description_draft", "draft_title", "draft_format")
+                    )
+                )
+                if preserve_content_screen:
+                    show_menu_kwargs.update(states=self.states, user_id=user_id)
+                await admin_events_service.show_edit_menu(
+                    self.client,
+                    chat_id,
+                    event_id,
+                    **show_menu_kwargs,
+                )
                 return
             if data.startswith("admin_ev_format_menu_"):
                 parts = data.split("_")
                 event_id = int(parts[4])
-                await admin_events_service.show_format_menu(self.client, chat_id, event_id, states=self.states, user_id=user_id)
+                if await _reject_foreign_event_draft_callback(self, callback, event_id):
+                    return
+                snapshot = await self.states.get(user_id)
+                back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.show_format_menu(self.client, chat_id, event_id, back=back, states=self.states, user_id=user_id)
                 return
             if data.startswith("admin_ev_set_fmt_"):
                 parts = data.split("_")
@@ -2065,19 +2140,28 @@ class MaxBotApplication:
             if data.startswith("admin_ev_preview_tg_"):
                 parts = data.split("_")
                 event_id = int(parts[4])
-                await admin_events_service.show_telegram_preview(self.client, chat_id, event_id, user_id)
+                if await _reject_foreign_event_draft_callback(self, callback, event_id):
+                    return
+                snapshot = await self.states.get(user_id)
+                back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.show_telegram_preview(self.client, chat_id, event_id, user_id, back=back)
                 return
             if data.startswith("admin_ev_preview_max_"):
                 parts = data.split("_")
                 event_id = int(parts[4])
-                await admin_events_service.show_max_preview(self.client, chat_id, event_id, user_id)
+                if await _reject_foreign_event_draft_callback(self, callback, event_id):
+                    return
+                snapshot = await self.states.get(user_id)
+                back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+                await admin_events_service.show_max_preview(self.client, chat_id, event_id, user_id, back=back)
                 return
             if data.startswith("admin_ev_edit_description_"):
                 event_id = int(data.split("_")[-1])
                 await admin_events_service.start_edit_description(self.client, self.states, chat_id, user_id, event_id)
                 return
             if data.startswith("admin_ev_description_save_"):
-                await admin_events_service.save_description(self.client, self.states, chat_id, user_id)
+                event_id = int(data.split("_")[-1])
+                await admin_events_service.save_description(self.client, self.states, chat_id, user_id, event_id=event_id)
                 return
             if data.startswith("admin_ev_cancel_draft_"):
                 event_id = int(data.split("_")[-1])
@@ -2139,6 +2223,8 @@ class MaxBotApplication:
                 snapshot = await self.states.get(user_id)
                 parts = data.split("_")
                 event_id = int(parts[3])
+                if await _reject_foreign_event_draft_callback(self, callback, event_id):
+                    return
                 back = (
                     f"admin_ev_page_{parts[4]}_{parts[5]}"
                     if len(parts) >= 6

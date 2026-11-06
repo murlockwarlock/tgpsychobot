@@ -299,6 +299,30 @@ async def test_update_scenario_fields_atomic_validation_rollback(test_session_ma
     assert summary.description is None or summary.description == ""
 
 
+@pytest.mark.asyncio
+async def test_max_save_rejects_html_transport_overflow_even_when_visible_text_fits(test_session_maker):
+    scen = await create_scenario(
+        test_session_maker,
+        code="max_html_transport_boundary",
+        event_type="webinar",
+        title="HTML boundary",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/html-boundary",
+        media_format=MEDIA_FORMAT_SEPARATE_MEDIA_TOP,
+    )
+    raw_html = "<b>x</b>" * 520
+    assert len(raw_html) > MAX_TEXT_LIMIT_TECHNICAL
+    assert len("x" * 520) < MAX_TEXT_LIMIT_TECHNICAL
+
+    with pytest.raises(EventContentValidationError) as exc_info:
+        await update_scenario_fields(test_session_maker, scen.id, description=raw_html)
+
+    assert "MAX" in str(exc_info.value)
+    assert "разметкой" in str(exc_info.value)
+    summary = await get_scenario_summary(test_session_maker, scen.id)
+    assert summary.description is None
+
+
 def test_delivery_plan_modes_a_b_c():
     scen_a = SimpleNamespace(
         id=1,

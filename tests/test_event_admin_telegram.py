@@ -18,7 +18,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
-from aiogram.types import CallbackQuery, Chat, Message, Update, User as TgUser
+from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, Update, User as TgUser
 from sqlalchemy import select
 
 from database import (
@@ -1426,6 +1426,10 @@ async def test_telegram_media_back_preserves_draft_and_cancel_discards_it(db_ses
     assert await state.get_state() == event_admin_telegram.EventAdminStates.edit_media.state
 
     await event_admin_telegram.show_edit_menu(_make_callback(f"admin_ev_edit_menu_{scen.id}"), state)
+    assert await state.get_state() == event_admin_telegram.EventAdminStates.edit_media.state
+    preserved = await state.get_data()
+    assert preserved["media_draft"][0]["file_id"] == "draft-photo"
+    await event_admin_telegram.cancel_draft_handler(_make_callback(f"admin_ev_cancel_draft_{scen.id}"), state)
     assert await state.get_state() is None
     reopen_callback = _make_callback(f"admin_ev_edit_media_{scen.id}")
     await event_admin_telegram.start_edit_media(reopen_callback, state)
@@ -1461,7 +1465,7 @@ async def test_telegram_paginated_edit_roundtrip_and_delete_stays_draft(db_sessi
     await event_admin_telegram.start_edit_description(rendered, state)
     description_markup = rendered.message.edit_text.call_args.kwargs["reply_markup"]
     description_callbacks = [button.callback_data for row in description_markup.inline_keyboard for button in row]
-    assert description_callbacks[-1] == f"admin_ev_edit_menu_{scen.id}"
+    assert description_callbacks[-1] == f"admin_ev_edit_menu_{scen.id}_2_1"
 
     delete_callback = _make_callback(f"admin_ev_description_delete_{scen.id}")
     await event_admin_telegram.delete_description(delete_callback, state)
@@ -1477,6 +1481,184 @@ async def test_telegram_paginated_edit_roundtrip_and_delete_stays_draft(db_sessi
     saved_markup = save_callback.message.edit_text.call_args.kwargs["reply_markup"]
     saved_callbacks = [button.callback_data for row in saved_markup.inline_keyboard for button in row]
     assert "admin_ev_page_2_1" in saved_callbacks
+
+
+@pytest.mark.asyncio
+async def test_telegram_real_paginated_format_save_cancel_journey_preserves_page_filter(db_session_maker, monkeypatch):
+    """Real Dispatcher journey: page 2 -> card -> format -> draft -> cancel/save -> page 2."""
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+    import handlers
+
+    base_start = datetime.utcnow() + timedelta(days=2)
+    target = await create_scenario(
+        db_session_maker,
+        code="telegram_real_page_two_target",
+        event_type="webinar",
+        title="Page two target",
+        starts_at_utc=base_start,
+        link="https://example.test/page-two-target",
+    )
+    for index in range(event_admin_telegram.SCENARIOS_PAGE_SIZE):
+        await create_scenario(
+            db_session_maker,
+            code=f"telegram_real_page_two_fill_{index}",
+            event_type="webinar",
+            title=f"Page two filler {index}",
+            starts_at_utc=base_start + timedelta(days=index + 1),
+            link=f"https://example.test/page-two/{index}",
+        )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {router: router._parent_router for router in routers}
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    def visible_callback(methods, prefix: str) -> str:
+        for method in methods:
+            if not isinstance(method, (EditMessageText, SendMessage)) or method.reply_markup is None:
+                continue
+            for row in method.reply_markup.inline_keyboard:
+                for button in row:
+                    if button.callback_data and button.callback_data.startswith(prefix):
+                        return button.callback_data
+        raise AssertionError(f"No visible Telegram callback with prefix {prefix!r}")
+
+    async def feed_callback(data: str):
+        methods = await _feed_callback(dp, bot, data)
+        for method in methods:
+            if hasattr(method, "model_dump"):
+                method.__class__.model_validate(method.model_dump())
+        return methods
+
+    async def feed_message(text: str):
+        methods = await _feed_message(dp, bot, text)
+        for method in methods:
+            if hasattr(method, "model_dump"):
+                method.__class__.model_validate(method.model_dump())
+        return methods
+
+    try:
+        methods = await feed_callback("admin_events")
+        listing = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "страница 1 из 2" in listing.text
+        page_two_callback = visible_callback(methods, "admin_ev_page_1_0")
+
+        methods = await feed_callback(page_two_callback)
+        listing = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "страница 2 из 2" in listing.text
+        target_callback = visible_callback(methods, f"admin_ev_open_{target.id}_1_0")
+
+        methods = await feed_callback(target_callback)
+        edit_menu_callback = visible_callback(methods, f"admin_ev_edit_menu_{target.id}_1_0")
+        methods = await feed_callback(edit_menu_callback)
+        format_callback = visible_callback(methods, f"admin_ev_format_menu_{target.id}")
+
+        methods = await feed_callback(format_callback)
+        format_back = visible_callback(methods, f"admin_ev_edit_menu_{target.id}_1_0")
+        methods = await feed_callback(format_back)
+        description_callback = visible_callback(methods, f"admin_ev_edit_description_{target.id}")
+
+        await feed_callback(description_callback)
+        methods = await feed_message("Описание для отмены")
+        draft_back = visible_callback(methods, f"admin_ev_edit_menu_{target.id}")
+        assert draft_back == f"admin_ev_edit_menu_{target.id}_1_0"
+        methods = await feed_callback(draft_back)
+        cancel_callback = visible_callback(methods, f"admin_ev_cancel_draft_{target.id}")
+        methods = await feed_callback(cancel_callback)
+        card = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "Карточка мероприятия" in card.text
+        assert "Описание для отмены" not in card.text
+        async with db_session_maker() as session:
+            assert (await session.get(EventScenario, target.id)).description is None
+
+        edit_menu_callback = visible_callback(methods, f"admin_ev_edit_menu_{target.id}_1_0")
+        methods = await feed_callback(edit_menu_callback)
+        description_callback = visible_callback(methods, f"admin_ev_edit_description_{target.id}")
+        await feed_callback(description_callback)
+        methods = await feed_message("Описание для сохранения")
+        save_callback = visible_callback(methods, f"admin_ev_description_save_{target.id}")
+        methods = await feed_callback(save_callback)
+        card = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "Описание для сохранения" in card.text
+        async with db_session_maker() as session:
+            assert (await session.get(EventScenario, target.id)).description == "Описание для сохранения"
+
+        methods = await feed_callback(visible_callback(methods, "admin_ev_page_1_0"))
+        listing = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "страница 2 из 2" in listing.text
+        assert "telegram_real_page_two_target" in listing.text
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_stale_mutation_callback_cannot_touch_other_event_draft(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    event_a = await create_scenario(
+        db_session_maker,
+        code="telegram_stale_event_a",
+        event_type="webinar",
+        title="Event A",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/stale-a",
+        description="A original",
+    )
+    event_b = await create_scenario(
+        db_session_maker,
+        code="telegram_stale_event_b",
+        event_type="webinar",
+        title="Event B",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/stale-b",
+        description="B original",
+    )
+
+    storage = MemoryStorage()
+    state = FSMContext(storage=storage, key=StorageKey(bot_id=123456789, chat_id=12345, user_id=12345))
+    await state.update_data(
+        edit_event_id=event_a.id,
+        description_draft="A draft that must remain isolated",
+        description_input_started=True,
+        event_list_back="admin_ev_page_1_0",
+    )
+    await state.set_state(event_admin_telegram.EventAdminStates.edit_description)
+
+    routers = (event_admin_router,)
+    original_parents = {router: router._parent_router for router in routers}
+    for router in routers:
+        router._parent_router = None
+    dp = Dispatcher(storage=storage)
+    dp.include_router(event_admin_router)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    try:
+        methods = await _feed_callback(dp, bot, f"admin_ev_description_save_{event_b.id}")
+        assert any(isinstance(method, AnswerCallbackQuery) and method.show_alert for method in methods)
+        methods = await _feed_callback(dp, bot, f"admin_ev_cancel_draft_{event_b.id}")
+        assert any(isinstance(method, AnswerCallbackQuery) and method.show_alert for method in methods)
+        snapshot = await state.get_data()
+        assert snapshot["edit_event_id"] == event_a.id
+        assert snapshot["description_draft"] == "A draft that must remain isolated"
+
+        async with db_session_maker() as session:
+            saved_a = await session.get(EventScenario, event_a.id)
+            saved_b = await session.get(EventScenario, event_b.id)
+            assert saved_a.description == "A original"
+            assert saved_b.description == "B original"
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
 
 
 @pytest.mark.asyncio
@@ -2547,10 +2729,23 @@ async def test_telegram_real_dispatcher_custom_emoji_title_journey(db_session_ma
         methods = await _feed_callback(dp, bot, f"admin_ev_edit_title_{scen.id}")
         assert any(isinstance(m, EditMessageText) for m in methods)
 
-        # Send title containing custom emoji tag (input may use id="...", output normalizes to emoji-id="...")
-        emoji_title = '<tg-emoji id="5368324170671202286">🔥</tg-emoji> Горячий вебинар'
+        # Send a real Telegram custom-emoji entity, as Bot API delivers it.
+        emoji_id = "5368324170671202286"
+        emoji_title = "🔥 Горячий вебинар"
         normalized_title = '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Горячий вебинар'
-        methods = await _feed_message(dp, bot, emoji_title)
+        user = _make_tg_user()
+        chat = Chat(id=user.id, type="private")
+        entity_message = Message(
+            message_id=101,
+            date=datetime.now(),
+            chat=chat,
+            from_user=user,
+            text=emoji_title,
+            entities=[MessageEntity(type="custom_emoji", offset=0, length=2, custom_emoji_id=emoji_id)],
+        )
+        bot.reset_mock()
+        await dp.feed_update(bot, Update(update_id=3, message=entity_message))
+        methods = [call.args[0] for call in bot.call_args_list if call.args and hasattr(call.args[0], "__class__")]
         saved_msg = next(m for m in methods if isinstance(m, SendMessage))
         # Must preserve <tg-emoji> with normalized emoji-id without escaping into &lt;tg-emoji&gt;
         assert normalized_title in saved_msg.text
@@ -2565,6 +2760,252 @@ async def test_telegram_real_dispatcher_custom_emoji_title_journey(db_session_ma
             db_scen = await session.get(EventScenario, scen.id)
             assert db_scen.title == normalized_title
             assert len(db_scen.title) <= 1000
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_pagination_page_2_edit_menu_back_roundtrip_journey(db_session_maker, monkeypatch):
+    """Full journey:
+    List page 2 -> card -> edit menu -> format menu -> Back -> Save/Cancel draft -> card -> To list = original page 2 with original filter.
+    """
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    now = datetime.utcnow()
+    # Create 8 events (PAGE_SIZE=6 -> 2 pages)
+    scenarios = []
+    for i in range(8):
+        scen = await create_scenario(
+            db_session_maker,
+            code=f"tg_page2_ev_{i:02d}",
+            event_type="webinar",
+            title=f"Вебинар {i:02d}",
+            starts_at_utc=now + timedelta(days=i + 1),
+            link=f"https://example.test/{i}",
+            media_format="separate_media_top",
+        )
+        scenarios.append(scen)
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    def find_callback(methods, prefix):
+        for m in methods:
+            if isinstance(m, (EditMessageText, SendMessage)) and m.reply_markup is not None:
+                for row in m.reply_markup.inline_keyboard:
+                    for b in row:
+                        if b.callback_data and b.callback_data.startswith(prefix):
+                            return b.callback_data
+        raise AssertionError(f"Button with prefix {prefix!r} not found in methods")
+
+    try:
+        # Step 1: Open list
+        methods = await _feed_callback(dp, bot, "admin_events")
+        listing = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "страница 1 из 2" in listing.text
+
+        # Step 2: Navigate to Page 2 (0-indexed page 1)
+        page2_cb = find_callback(methods, "admin_ev_page_1_0")
+        methods = await _feed_callback(dp, bot, page2_cb)
+        listing = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "страница 2 из 2" in listing.text
+
+        # Find target scenario from page 2 (index 0 or 1 because list is sorted by starts_at desc)
+        target = scenarios[0]
+        open_cb = find_callback(methods, f"admin_ev_open_{target.id}_1_0")
+
+        # Step 3: Open card from page 2
+        methods = await _feed_callback(dp, bot, open_cb)
+        card = next(m for m in methods if isinstance(m, EditMessageText))
+        assert target.title in card.text
+
+        # Step 4: Open edit menu from card
+        edit_cb = find_callback(methods, f"admin_ev_edit_menu_{target.id}_1_0")
+        methods = await _feed_callback(dp, bot, edit_cb)
+        edit_menu = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "Редактирование мероприятия" in edit_menu.text
+
+        # Step 5: Open format menu
+        fmt_cb = find_callback(methods, f"admin_ev_format_menu_{target.id}")
+        methods = await _feed_callback(dp, bot, fmt_cb)
+        fmt_menu = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "Формат доставки" in fmt_menu.text
+
+        # Step 6: Back from format menu -> returns to edit menu with pagination intact
+        back_to_edit = find_callback(methods, f"admin_ev_edit_menu_{target.id}_1_0")
+        methods = await _feed_callback(dp, bot, back_to_edit)
+        edit_menu = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "Редактирование мероприятия" in edit_menu.text
+
+        # Step 7: Back from edit menu to card -> returns to card with page 2 back intact
+        back_to_card = find_callback(methods, f"admin_ev_open_{target.id}_1_0")
+        methods = await _feed_callback(dp, bot, back_to_card)
+        card = next(m for m in methods if isinstance(m, EditMessageText))
+        assert target.title in card.text
+
+        # Step 8: Back from card to list -> returns to original Page 2
+        back_to_list = find_callback(methods, "admin_ev_page_1_0")
+        methods = await _feed_callback(dp, bot, back_to_list)
+        listing = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "страница 2 из 2" in listing.text
+
+        # Step 9: Full cycle with description + format draft change and Save
+        # Re-open card and edit menu
+        methods = await _feed_callback(dp, bot, open_cb)
+        methods = await _feed_callback(dp, bot, edit_cb)
+        # Start description draft
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_description_{target.id}")
+        await _feed_message(dp, bot, "Новое описание в черновике для страницы 2")
+        # Now open format menu while draft exists
+        methods = await _feed_callback(dp, bot, fmt_cb)
+        set_fmt_cb = find_callback(methods, f"admin_ev_set_fmt_{target.id}_separate_text_top")
+        methods = await _feed_callback(dp, bot, set_fmt_cb)
+        draft_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "Черновик ещё не сохранён" in draft_msg.text
+
+        # First verify Cancel draft returns to card preserving pagination back
+        cancel_draft_cb = find_callback(methods, f"admin_ev_cancel_draft_{target.id}")
+        methods = await _feed_callback(dp, bot, cancel_draft_cb)
+        card = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "Черновик сброшен" in card.text
+        assert find_callback(methods, "admin_ev_page_1_0") == "admin_ev_page_1_0"
+
+        # Now re-create draft and Save
+        methods = await _feed_callback(dp, bot, edit_cb)
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_description_{target.id}")
+        await _feed_message(dp, bot, "Сохранённое описание для страницы 2")
+        methods = await _feed_callback(dp, bot, fmt_cb)
+        methods = await _feed_callback(dp, bot, set_fmt_cb)
+        save_cb = find_callback(methods, f"admin_ev_description_save_{target.id}")
+        methods = await _feed_callback(dp, bot, save_cb)
+        card = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "сохранены" in card.text
+
+        # Back to list -> returns to original Page 2
+        back_to_list = find_callback(methods, "admin_ev_page_1_0")
+        methods = await _feed_callback(dp, bot, back_to_list)
+        listing = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "страница 2 из 2" in listing.text
+        assert target.code in listing.text
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_cross_event_draft_stale_callback_rejection_journey(db_session_maker, monkeypatch):
+    """Negative journey:
+    Admin has active draft for Event A.
+    Stale callback buttons for Event B must NOT save, reset, or transfer draft of Event A.
+    DB records for both events remain completely unchanged.
+    """
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    now = datetime.utcnow()
+    event_a = await create_scenario(
+        db_session_maker,
+        code="tg_draft_event_a",
+        event_type="webinar",
+        title="Event A Title",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/a",
+        description="Original Event A Description",
+        media_format="separate_media_top",
+    )
+    event_b = await create_scenario(
+        db_session_maker,
+        code="tg_draft_event_b",
+        event_type="webinar",
+        title="Event B Title",
+        starts_at_utc=now + timedelta(days=3),
+        link="https://example.test/b",
+        description="Original Event B Description",
+        media_format="separate_media_top",
+    )
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    try:
+        # Step 1: Open description editor for Event A and type new draft
+        await _feed_callback(dp, bot, f"admin_ev_edit_description_{event_a.id}")
+        draft_text = "Новый незафиксированный черновик для Мероприятия А"
+        await _feed_message(dp, bot, draft_text)
+
+        # Step 2: Send STALE Save callback from Event B
+        methods = await _feed_callback(dp, bot, f"admin_ev_description_save_{event_b.id}")
+        answer = next(m for m in methods if isinstance(m, AnswerCallbackQuery))
+        assert answer.show_alert is True
+        assert "Черновик принадлежит другому мероприятию" in answer.text
+
+        # Verify DB for both events is UNCHANGED
+        async with db_session_maker() as session:
+            ea = await session.get(EventScenario, event_a.id)
+            eb = await session.get(EventScenario, event_b.id)
+            assert ea.description == "Original Event A Description"
+            assert eb.description == "Original Event B Description"
+
+        # Step 3: Send STALE Cancel callback from Event B
+        methods = await _feed_callback(dp, bot, f"admin_ev_cancel_draft_{event_b.id}")
+        answer = next(m for m in methods if isinstance(m, AnswerCallbackQuery))
+        assert answer.show_alert is True
+        assert "Сначала завершите или отмените" in answer.text
+
+        # Verify DB and draft still unchanged
+        async with db_session_maker() as session:
+            ea = await session.get(EventScenario, event_a.id)
+            eb = await session.get(EventScenario, event_b.id)
+            assert ea.description == "Original Event A Description"
+            assert eb.description == "Original Event B Description"
+
+        # Step 4: Send STALE Format callback from Event B
+        methods = await _feed_callback(dp, bot, f"admin_ev_set_fmt_{event_b.id}_caption")
+        answer = next(m for m in methods if isinstance(m, AnswerCallbackQuery))
+        assert answer.show_alert is True
+        assert "Сначала завершите или отмените" in answer.text
+
+        async with db_session_maker() as session:
+            eb = await session.get(EventScenario, event_b.id)
+            assert eb.media_format == "separate_media_top"
+
+        # Step 5: Send STALE Edit Title callback from Event B
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_title_{event_b.id}")
+        answer = next(m for m in methods if isinstance(m, AnswerCallbackQuery))
+        assert answer.show_alert is True
+        assert "Сначала завершите или отмените" in answer.text
+
+        # Step 6: Now send VALID Save callback for Event A
+        methods = await _feed_callback(dp, bot, f"admin_ev_description_save_{event_a.id}")
+        edit_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "сохранены" in edit_msg.text
+
+        # Verify Event A in DB is updated, Event B remains unchanged
+        async with db_session_maker() as session:
+            ea = await session.get(EventScenario, event_a.id)
+            eb = await session.get(EventScenario, event_b.id)
+            assert ea.description == draft_text
+            assert eb.description == "Original Event B Description"
     finally:
         for router in routers:
             router._parent_router = original_parents[router]

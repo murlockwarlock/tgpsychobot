@@ -4,6 +4,7 @@ import html
 import re
 
 MAX_MESSAGE_TEXT_LEN = 3900
+MAX_TRANSPORT_TEXT_LEN = 4000
 
 
 def markdown_to_html(text: str | None) -> str:

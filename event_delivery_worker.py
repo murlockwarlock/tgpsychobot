@@ -57,6 +57,7 @@ from event_service import (
     render_event_message,
 )
 from max_messenger_bot.api import MaxApiClient, MaxApiError
+from max_messenger_bot.formatting import MAX_TRANSPORT_TEXT_LEN
 from max_messenger_bot.identity import is_max_user_id, raw_max_user_id
 from max_messenger_bot.keyboards import callback_button, inline_keyboard
 from max_messenger_bot.models import extract_sent_message_id
@@ -741,9 +742,9 @@ async def _send_delivery_part(
         else:
             raw_text = payload.get("text") or "Управление мероприятием:"
             clean_text = strip_telegram_custom_emoji(raw_text)
-            if len(clean_text) > 4000:
+            if len(clean_text) > MAX_TRANSPORT_TEXT_LEN:
                 raise PreTransmissionError(
-                    f"Итоговый текст сообщения в MAX превышает лимит ({len(clean_text)} > 4000 симв.)"
+                    f"Итоговый текст сообщения в MAX превышает лимит ({len(clean_text)} > {MAX_TRANSPORT_TEXT_LEN} симв.)"
                 )
             response = await max_client.send_message(
                 user_id=raw_max_user_id(user_id) if is_max_user_id(user_id) else user_id,
@@ -1489,6 +1490,10 @@ async def process_single_delivery(
 
             from event_content_validator import strip_telegram_custom_emoji
             clean_text = strip_telegram_custom_emoji(rendered_text)
+            if len(clean_text) > 4000:
+                raise PreTransmissionError(
+                    f"Итоговый текст сообщения в MAX превышает лимит ({len(clean_text)} > 4000 симв.)"
+                )
 
             attachments = inline_keyboard([
                 [callback_button("❌ Не смогу прийти", f"ev_cancel:{event_id}")]

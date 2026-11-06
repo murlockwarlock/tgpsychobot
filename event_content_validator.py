@@ -661,8 +661,9 @@ def validate_scenario_content(
                 include_event_details=inc_details,
                 now=now,
             )
+            max_to_send = strip_telegram_custom_emoji(max_rendered)
             max_plain = render_plain_text_for_max(max_rendered)
-            max_len = len(max_plain)
+            max_len = len(max_to_send)
             max_limit = MAX_TEXT_LIMIT_CONSERVATIVE
 
             max_valid = True
@@ -674,9 +675,17 @@ def validate_scenario_content(
                 excess = max_len - max_limit
                 max_err = (
                     f"Сообщение '{path_id}' превышает рабочий лимит MAX ({max_limit} симв.): "
-                    f"фактическая длина {max_len} (превышение: {excess} симв.)"
+                    f"фактическая длина с разметкой {max_len} (превышение: {excess} симв.)"
                 )
-                max_rec = "Сократите текст описания или текст шага напоминания."
+                max_rec = "Сократите текст описания или уменьшите HTML-разметку."
+            elif max_len > MAX_TEXT_LIMIT_TECHNICAL and effective_format != MEDIA_FORMAT_LEGACY_AUTO:
+                max_valid = False
+                excess = max_len - MAX_TEXT_LIMIT_TECHNICAL
+                max_err = (
+                    f"Сообщение '{path_id}' превышает технический лимит MAX ({MAX_TEXT_LIMIT_TECHNICAL} симв.): "
+                    f"фактическая длина с разметкой {max_len} (превышение: {excess} симв.)"
+                )
+                max_rec = "Сократите текст описания или уменьшите HTML-разметку."
 
             # MAX attachments count check
             # For caption: 1 media attachment + 1 keyboard attachment = 2 <= 12
@@ -795,8 +804,8 @@ def calculate_available_description_chars(
             include_event_details=inc_details,
             now=now,
         )
-        max_plain = render_plain_text_for_max(max_base)
-        max_rem = max_limit - (len(max_plain) + desc_wrapper_overhead)
+        max_to_send = strip_telegram_custom_emoji(max_base)
+        max_rem = max_limit - (len(max_to_send) + desc_wrapper_overhead)
         if max_rem < min_max_remaining:
             min_max_remaining = max_rem
 
