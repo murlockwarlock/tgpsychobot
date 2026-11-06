@@ -61,7 +61,7 @@ from database import (async_session_maker, User, Message as DBMessage, AIConfig,
 from aiogram.types import LabeledPrice
 import keyboards as kb
 from kie_image_inputs import ImageGeometryError
-from media_templates import extract_template_directive, render_media_template, validate_rendered_template
+from media_templates import extract_template_directive, render_media_template, validate_rendered_template, synchronize_template_caption
 from media_template_renderer import TemplateRenderError
 from file_parser import parse_file, parse_formulas_file, parse_questions_file
 from ai_integration import (
@@ -2210,12 +2210,32 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id)
         if not rendered or not await current():
             return MediaEditDelivery(None)
         await validate_rendered_template(async_session_maker, rendered, topic_id)
+        clean = synchronize_template_caption(clean, rendered.actual_issue_date)
         clean, rows = extract_response_buttons(clean)
         presentation = await _prepare_telegram_response_buttons(user_id, rows)
         await validate_rendered_template(async_session_maker, rendered, topic_id)
         if not await current():
             return MediaEditDelivery(None)
-        await bot.send_document(chat_id=user_id, document=BufferedInputFile(rendered.image_bytes, filename='certificate.png'), caption=clean[:1024] or None, parse_mode=None, reply_markup=_telegram_response_text_markup(presentation))
+        html_caption = markdown_to_html(clean) if clean else ""
+        if html_caption:
+            html_caption = truncate_html_preview(html_caption, 1024)
+            await _safe_send_html(
+                lambda text, pm: bot.send_document(
+                    chat_id=user_id,
+                    document=BufferedInputFile(rendered.image_bytes, filename='certificate.png'),
+                    caption=text or None,
+                    parse_mode=pm,
+                    reply_markup=_telegram_response_text_markup(presentation),
+                ),
+                html_caption,
+            )
+        else:
+            await bot.send_document(
+                chat_id=user_id,
+                document=BufferedInputFile(rendered.image_bytes, filename='certificate.png'),
+                caption=None,
+                reply_markup=_telegram_response_text_markup(presentation),
+            )
         return MediaEditDelivery(clean or '[Шаблон изображения]')
     except Exception as exc:
         if not await current():

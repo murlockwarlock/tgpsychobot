@@ -42,7 +42,7 @@ from result_history import is_topic_welcome_shown, record_topic_welcome_shown
 from telegram_client import create_telegram_bot
 from telegram_start_service import grant_subscription_days
 from kie_image_inputs import ImageGeometryError
-from media_templates import extract_template_directive, render_media_template, validate_rendered_template
+from media_templates import extract_template_directive, render_media_template, validate_rendered_template, synchronize_template_caption
 from media_template_renderer import TemplateRenderError
 from media_image_edit import extract_media_edit_directive, edit_media_image, media_edit_context_is_current, validate_edited_media_source, MediaSourceError
 from system_messages import limit_callback_answer, resolve_system_text
@@ -995,7 +995,11 @@ async def _deliver_media_template(client, chat_id, user_id, response, dialogue_i
         if not await current():
             return True
         clean, buttons = extract_response_buttons(clean)
-        await client.send_media_attachment(chat_id=chat_id, media_type='file', token=token, caption=html.escape(clean[:1024]) or 'certificate.png')
+        clean = synchronize_template_caption(clean, rendered.actual_issue_date)
+        max_caption = markdown_to_html(clean) if clean else ""
+        if max_caption:
+            max_caption = split_text(max_caption, 1024)[0]
+        await client.send_media_attachment(chat_id=chat_id, media_type='file', token=token, caption=max_caption or 'certificate.png')
         await save_ai_message(user_id, clean or '[Шаблон изображения]', dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)
     except Exception as exc:
         if await current():
