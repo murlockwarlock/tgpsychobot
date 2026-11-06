@@ -74,6 +74,7 @@ jobs:
           python -m pytest -q -rs
           tests/test_event_chains_db.py::test_real_postgresql_init_and_schema_verification
           tests/test_event_chains_db.py::test_real_postgresql_migration_backfills_delivery_content_version_snapshot
+          tests/test_event_chains_db.py::test_real_postgresql_media_mode_migration_and_constraints
           tests/test_event_chains_db.py::test_real_postgresql_structural_invariants_and_retry_model
           tests/test_event_chains_db.py::test_real_postgresql_update_step_vs_reschedule_concurrency
           tests/test_event_chains_db.py::test_real_postgresql_claimed_update_step_vs_presend_barrier

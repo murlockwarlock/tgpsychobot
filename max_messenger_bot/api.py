@@ -9,6 +9,7 @@ from typing import Any
 import aiohttp
 
 from .logging_utils import configure_logging, get_max_logger
+from .formatting import MAX_TRANSPORT_TEXT_LEN
 
 configure_logging()
 log = get_max_logger("api")
@@ -184,7 +185,13 @@ class MaxApiClient:
         if chat_id is not None:
             params["chat_id"] = chat_id
         # MAX uses \n for line breaks (not <br/>); HTML format is only for bold/italic tags
-        normalized_text = (text or "")
+        from event_content_validator import strip_telegram_custom_emoji
+
+        normalized_text = strip_telegram_custom_emoji(text or "")
+        if len(normalized_text) > MAX_TRANSPORT_TEXT_LEN:
+            raise MaxApiError(
+                f"MAX message text exceeds the transport limit ({len(normalized_text)} > {MAX_TRANSPORT_TEXT_LEN})"
+            )
         body: dict[str, Any] = {"text": normalized_text}
         if attachments is not None:
             body["attachments"] = attachments
@@ -208,9 +215,16 @@ class MaxApiClient:
         attachments: list[dict[str, Any]] | None = None,
         format_: str = "html",
     ) -> dict[str, Any]:
+        from event_content_validator import strip_telegram_custom_emoji
+
+        normalized_text = strip_telegram_custom_emoji(text) if text is not None else None
+        if normalized_text is not None and len(normalized_text) > MAX_TRANSPORT_TEXT_LEN:
+            raise MaxApiError(
+                f"MAX message text exceeds the transport limit ({len(normalized_text)} > {MAX_TRANSPORT_TEXT_LEN})"
+            )
         body: dict[str, Any] = {}
-        if text is not None:
-            body["text"] = text
+        if normalized_text is not None:
+            body["text"] = normalized_text
         if attachments is not None:
             body["attachments"] = attachments
         if format_:

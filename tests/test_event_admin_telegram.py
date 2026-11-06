@@ -2,6 +2,7 @@ import os
 import re
 import json
 import html
+from typing import Any
 from functools import wraps
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -18,7 +19,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
-from aiogram.types import CallbackQuery, Chat, Message, Update, User as TgUser
+from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, Update, User as TgUser
 from sqlalchemy import select
 
 from database import (
@@ -197,9 +198,14 @@ _TELEGRAM_EVENT_BUTTON_CONTRACTS = (
     (re.compile(r"admin_ev_edit_duration_\d+$"), "mutation", "events/edit", "telegram.events.edit", "start_edit_duration", "EventAdminStates.edit_duration"),
     (re.compile(r"admin_ev_edit_link_\d+$"), "mutation", "events/edit", "telegram.events.edit", "start_edit_link", "EventAdminStates.edit_link"),
     (re.compile(r"admin_ev_edit_place_\d+$"), "mutation", "events/edit", "telegram.events.edit", "start_edit_place", "EventAdminStates.edit_place"),
+    (re.compile(r"admin_ev_format_menu_\d+$"), "navigation", "events/edit-format", "telegram.events.edit", "show_format_menu", None),
+    (re.compile(r"admin_ev_set_fmt_\d+_[a-z_]+$"), "mutation", "events/edit-format", "telegram.events.edit", "set_format_handler", None),
+    (re.compile(r"admin_ev_preview_tg_\d+$"), "navigation", "events/preview-tg", "telegram.events.edit", "show_telegram_preview", None),
+    (re.compile(r"admin_ev_preview_max_\d+$"), "navigation", "events/preview-max", "telegram.events.edit", "show_max_preview", None),
     (re.compile(r"admin_ev_edit_description_\d+$"), "mutation", "events/edit", "telegram.events.edit", "start_edit_description", "EventAdminStates.edit_description"),
     (re.compile(r"admin_ev_edit_media_\d+$"), "navigation", "events/edit-media", "telegram.description-media", "start_edit_media", "EventAdminStates.edit_media"),
     (re.compile(r"admin_ev_description_save_\d+$"), "mutation", "events/edit", "telegram.description-media", "save_description", None),
+    (re.compile(r"admin_ev_cancel_draft_\d+$"), "destructive", "events/edit", "telegram.events.edit", "cancel_draft_handler", None),
     (re.compile(r"admin_ev_description_delete_\d+$"), "destructive", "events/edit", "telegram.description-media", "delete_description", "EventAdminStates.edit_description"),
     (re.compile(r"admin_ev_media_add_\d+$"), "navigation", "events/edit-media", "telegram.description-media", "start_add_media", "EventAdminStates.edit_media_add"),
     (re.compile(r"admin_ev_media_save_\d+$"), "mutation", "events/edit-media", "telegram.description-media", "save_media", None),
@@ -1257,6 +1263,7 @@ async def test_telegram_dispatcher_description_chunks_save_reopen_and_runtime_sp
         title="Telegram dispatcher description",
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://example.test/dispatcher-description",
+        media_mode="legacy_auto",
     )
     event_admin_router._parent_router = None
     dp = Dispatcher(storage=MemoryStorage())
@@ -1420,6 +1427,10 @@ async def test_telegram_media_back_preserves_draft_and_cancel_discards_it(db_ses
     assert await state.get_state() == event_admin_telegram.EventAdminStates.edit_media.state
 
     await event_admin_telegram.show_edit_menu(_make_callback(f"admin_ev_edit_menu_{scen.id}"), state)
+    assert await state.get_state() == event_admin_telegram.EventAdminStates.edit_media.state
+    preserved = await state.get_data()
+    assert preserved["media_draft"][0]["file_id"] == "draft-photo"
+    await event_admin_telegram.cancel_draft_handler(_make_callback(f"admin_ev_cancel_draft_{scen.id}"), state)
     assert await state.get_state() is None
     reopen_callback = _make_callback(f"admin_ev_edit_media_{scen.id}")
     await event_admin_telegram.start_edit_media(reopen_callback, state)
@@ -1455,7 +1466,7 @@ async def test_telegram_paginated_edit_roundtrip_and_delete_stays_draft(db_sessi
     await event_admin_telegram.start_edit_description(rendered, state)
     description_markup = rendered.message.edit_text.call_args.kwargs["reply_markup"]
     description_callbacks = [button.callback_data for row in description_markup.inline_keyboard for button in row]
-    assert description_callbacks[-1] == f"admin_ev_edit_menu_{scen.id}"
+    assert description_callbacks[-1] == f"admin_ev_edit_menu_{scen.id}_2_1"
 
     delete_callback = _make_callback(f"admin_ev_description_delete_{scen.id}")
     await event_admin_telegram.delete_description(delete_callback, state)
@@ -1474,6 +1485,184 @@ async def test_telegram_paginated_edit_roundtrip_and_delete_stays_draft(db_sessi
 
 
 @pytest.mark.asyncio
+async def test_telegram_real_paginated_format_save_cancel_journey_preserves_page_filter(db_session_maker, monkeypatch):
+    """Real Dispatcher journey: page 2 -> card -> format -> draft -> cancel/save -> page 2."""
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+    import handlers
+
+    base_start = datetime.utcnow() + timedelta(days=2)
+    target = await create_scenario(
+        db_session_maker,
+        code="telegram_real_page_two_target",
+        event_type="webinar",
+        title="Page two target",
+        starts_at_utc=base_start,
+        link="https://example.test/page-two-target",
+    )
+    for index in range(event_admin_telegram.SCENARIOS_PAGE_SIZE):
+        await create_scenario(
+            db_session_maker,
+            code=f"telegram_real_page_two_fill_{index}",
+            event_type="webinar",
+            title=f"Page two filler {index}",
+            starts_at_utc=base_start + timedelta(days=index + 1),
+            link=f"https://example.test/page-two/{index}",
+        )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {router: router._parent_router for router in routers}
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    def visible_callback(methods, prefix: str) -> str:
+        for method in methods:
+            if not isinstance(method, (EditMessageText, SendMessage)) or method.reply_markup is None:
+                continue
+            for row in method.reply_markup.inline_keyboard:
+                for button in row:
+                    if button.callback_data and button.callback_data.startswith(prefix):
+                        return button.callback_data
+        raise AssertionError(f"No visible Telegram callback with prefix {prefix!r}")
+
+    async def feed_callback(data: str):
+        methods = await _feed_callback(dp, bot, data)
+        for method in methods:
+            if hasattr(method, "model_dump"):
+                method.__class__.model_validate(method.model_dump())
+        return methods
+
+    async def feed_message(text: str):
+        methods = await _feed_message(dp, bot, text)
+        for method in methods:
+            if hasattr(method, "model_dump"):
+                method.__class__.model_validate(method.model_dump())
+        return methods
+
+    try:
+        methods = await feed_callback("admin_events")
+        listing = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "страница 1 из 2" in listing.text
+        page_two_callback = visible_callback(methods, "admin_ev_page_1_0")
+
+        methods = await feed_callback(page_two_callback)
+        listing = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "страница 2 из 2" in listing.text
+        target_callback = visible_callback(methods, f"admin_ev_open_{target.id}_1_0")
+
+        methods = await feed_callback(target_callback)
+        edit_menu_callback = visible_callback(methods, f"admin_ev_edit_menu_{target.id}_1_0")
+        methods = await feed_callback(edit_menu_callback)
+        format_callback = visible_callback(methods, f"admin_ev_format_menu_{target.id}")
+
+        methods = await feed_callback(format_callback)
+        format_back = visible_callback(methods, f"admin_ev_edit_menu_{target.id}_1_0")
+        methods = await feed_callback(format_back)
+        description_callback = visible_callback(methods, f"admin_ev_edit_description_{target.id}")
+
+        await feed_callback(description_callback)
+        methods = await feed_message("Описание для отмены")
+        draft_back = visible_callback(methods, f"admin_ev_edit_menu_{target.id}")
+        assert draft_back == f"admin_ev_edit_menu_{target.id}_1_0"
+        methods = await feed_callback(draft_back)
+        cancel_callback = visible_callback(methods, f"admin_ev_cancel_draft_{target.id}")
+        methods = await feed_callback(cancel_callback)
+        card = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "Карточка мероприятия" in card.text
+        assert "Описание для отмены" not in card.text
+        async with db_session_maker() as session:
+            assert (await session.get(EventScenario, target.id)).description is None
+
+        edit_menu_callback = visible_callback(methods, f"admin_ev_edit_menu_{target.id}_1_0")
+        methods = await feed_callback(edit_menu_callback)
+        description_callback = visible_callback(methods, f"admin_ev_edit_description_{target.id}")
+        await feed_callback(description_callback)
+        methods = await feed_message("Описание для сохранения")
+        save_callback = visible_callback(methods, f"admin_ev_description_save_{target.id}")
+        methods = await feed_callback(save_callback)
+        card = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "Описание для сохранения" in card.text
+        async with db_session_maker() as session:
+            assert (await session.get(EventScenario, target.id)).description == "Описание для сохранения"
+
+        methods = await feed_callback(visible_callback(methods, "admin_ev_page_1_0"))
+        listing = next(method for method in methods if isinstance(method, EditMessageText))
+        assert "страница 2 из 2" in listing.text
+        assert "telegram_real_page_two_target" in listing.text
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_stale_mutation_callback_cannot_touch_other_event_draft(db_session_maker, monkeypatch):
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    event_a = await create_scenario(
+        db_session_maker,
+        code="telegram_stale_event_a",
+        event_type="webinar",
+        title="Event A",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/stale-a",
+        description="A original",
+    )
+    event_b = await create_scenario(
+        db_session_maker,
+        code="telegram_stale_event_b",
+        event_type="webinar",
+        title="Event B",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/stale-b",
+        description="B original",
+    )
+
+    storage = MemoryStorage()
+    state = FSMContext(storage=storage, key=StorageKey(bot_id=123456789, chat_id=12345, user_id=12345))
+    await state.update_data(
+        edit_event_id=event_a.id,
+        description_draft="A draft that must remain isolated",
+        description_input_started=True,
+        event_list_back="admin_ev_page_1_0",
+    )
+    await state.set_state(event_admin_telegram.EventAdminStates.edit_description)
+
+    routers = (event_admin_router,)
+    original_parents = {router: router._parent_router for router in routers}
+    for router in routers:
+        router._parent_router = None
+    dp = Dispatcher(storage=storage)
+    dp.include_router(event_admin_router)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    try:
+        methods = await _feed_callback(dp, bot, f"admin_ev_description_save_{event_b.id}")
+        assert any(isinstance(method, AnswerCallbackQuery) and method.show_alert for method in methods)
+        methods = await _feed_callback(dp, bot, f"admin_ev_cancel_draft_{event_b.id}")
+        assert any(isinstance(method, AnswerCallbackQuery) and method.show_alert for method in methods)
+        snapshot = await state.get_data()
+        assert snapshot["edit_event_id"] == event_a.id
+        assert snapshot["description_draft"] == "A draft that must remain isolated"
+
+        async with db_session_maker() as session:
+            saved_a = await session.get(EventScenario, event_a.id)
+            saved_b = await session.get(EventScenario, event_b.id)
+            assert saved_a.description == "A original"
+            assert saved_b.description == "B original"
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
 async def test_telegram_long_description_preview_is_bounded(db_session_maker, monkeypatch):
     monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
     from event_admin_service import create_scenario
@@ -1486,6 +1675,7 @@ async def test_telegram_long_description_preview_is_bounded(db_session_maker, mo
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://example.test/long-preview",
         description="x" * 5000,
+        media_mode="legacy_auto",
     )
     storage = MemoryStorage()
     state = FSMContext(storage=storage, key=MagicMock(bot_id=1, chat_id=12345, user_id=12345))
@@ -1508,6 +1698,7 @@ async def test_telegram_description_chunks_append_and_runtime_split_after_save(d
         title="Chunked Telegram description",
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://example.test/chunks",
+        media_mode="legacy_auto",
     )
     storage = MemoryStorage()
     state = FSMContext(storage=storage, key=MagicMock(bot_id=1, chat_id=12345, user_id=12345))
@@ -1871,10 +2062,26 @@ async def _feed_callback(dp: Dispatcher, bot: Bot, data: str, user_id: int = 123
     return [call.args[0] for call in bot.call_args_list if call.args and hasattr(call.args[0], "__class__")]
 
 
-async def _feed_message(dp: Dispatcher, bot: Bot, text: str, user_id: int = 12345, message_id: int = 101):
+async def _feed_message(
+    dp: Dispatcher,
+    bot: Bot,
+    text: str = "",
+    user_id: int = 12345,
+    message_id: int = 101,
+    photo: Any | None = None,
+    video: Any | None = None,
+):
     user = TgUser(id=user_id, is_bot=False, first_name="Admin", username="admin_user")
     chat = Chat(id=user_id, type="private")
-    msg = Message(message_id=message_id, date=datetime.now(), chat=chat, text=text, from_user=user)
+    msg = Message(
+        message_id=message_id,
+        date=datetime.now(),
+        chat=chat,
+        text=text,
+        from_user=user,
+        photo=photo,
+        video=video,
+    )
     update = Update(update_id=2, message=msg)
     bot.reset_mock()
     await dp.feed_update(bot, update)
@@ -2396,3 +2603,1098 @@ async def test_telegram_long_title_navigation_preserves_page_and_archive_context
     finally:
         for router in routers:
             router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_real_dispatcher_limits_error_screen_edit_and_reopen_journey(db_session_maker, monkeypatch):
+    """Full A -> Z -> A real dispatcher journey:
+    1. Enter description exceeding limit
+    2. Click Save
+    3. Get validated outgoing error screen explaining excess without AttributeError
+    4. See working edit buttons
+    5. Fix text
+    6. Save successfully
+    7. Reopen event and verify updated description in DB and card.
+    """
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+    from database import EventScenarioMedia
+
+    now = datetime.utcnow()
+    scen = await create_scenario(
+        db_session_maker,
+        code="tg_journey_limits",
+        event_type="webinar",
+        title="Journey Limits Webinar",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/journey",
+        media_format="separate_media_top",
+    )
+    async with db_session_maker() as session:
+        session.add(EventScenarioMedia(
+            event_id=scen.id,
+            file_type="photo",
+            file_id="tg_photo_1",
+            sort_order=0,
+        ))
+        await session.commit()
+    from event_admin_service import update_scenario_fields
+    await update_scenario_fields(db_session_maker, scen.id, media_format="caption")
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    def extract_buttons(methods):
+        for m in methods:
+            if isinstance(m, (EditMessageText, SendMessage)) and m.reply_markup is not None:
+                return [b.callback_data for row in m.reply_markup.inline_keyboard for b in row if b.callback_data]
+        return []
+
+    try:
+        # Step 1: Open description editor
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_description_{scen.id}")
+        assert any(isinstance(m, EditMessageText) for m in methods)
+
+        # Step 2: Feed long description exceeding caption limit (950 chars > 900)
+        long_desc = "Д" * 950
+        methods = await _feed_message(dp, bot, long_desc)
+        assert any(isinstance(m, SendMessage) for m in methods)
+
+        # Step 3: Click Save
+        methods = await _feed_callback(dp, bot, f"admin_ev_description_save_{scen.id}")
+        error_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        # Verify validated outgoing message explaining excess
+        assert "Невозможно сохранить" in error_msg.text
+        assert "TELEGRAM" in error_msg.text
+        assert "Фактическая длина:" in error_msg.text
+        assert "лимит:" in error_msg.text
+        assert "Превышение:" in error_msg.text
+
+        # Step 4: Verify working edit buttons on error screen
+        buttons = extract_buttons([error_msg])
+        assert f"admin_ev_edit_description_{scen.id}" in buttons
+        assert f"admin_ev_edit_title_{scen.id}" in buttons
+        assert f"admin_ev_format_menu_{scen.id}" in buttons
+        assert f"admin_ev_description_save_{scen.id}" in buttons
+        assert f"admin_ev_cancel_draft_{scen.id}" in buttons
+
+        # Step 5: Click edit description button
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_description_{scen.id}")
+        assert any(isinstance(m, EditMessageText) for m in methods)
+
+        # Step 6: Fix text to valid length
+        valid_desc = "Корректное описание вебинара для проверки сохранения."
+        methods = await _feed_message(dp, bot, valid_desc)
+
+        # Step 7: Click Save
+        methods = await _feed_callback(dp, bot, f"admin_ev_description_save_{scen.id}")
+        success_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "сохранены" in success_msg.text
+
+        # Step 8: Reopen event card and check result
+        methods = await _feed_callback(dp, bot, f"admin_ev_open_{scen.id}")
+        card = next(m for m in methods if isinstance(m, EditMessageText))
+        assert valid_desc in card.text
+
+        async with db_session_maker() as session:
+            refreshed = await session.get(EventScenario, scen.id)
+            assert refreshed.description == valid_desc
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_real_dispatcher_custom_emoji_title_journey(db_session_maker, monkeypatch):
+    """Real dispatcher journey for custom emoji support in title."""
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    now = datetime.utcnow()
+    scen = await create_scenario(
+        db_session_maker,
+        code="tg_journey_custom_emoji",
+        event_type="webinar",
+        title="Обычное название",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/emoji",
+    )
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    try:
+        # Start edit title
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_title_{scen.id}")
+        assert any(isinstance(m, EditMessageText) for m in methods)
+
+        # Send a real Telegram custom-emoji entity, as Bot API delivers it.
+        emoji_id = "5368324170671202286"
+        emoji_title = "🔥 Горячий вебинар"
+        normalized_title = '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Горячий вебинар'
+        user = _make_tg_user()
+        chat = Chat(id=user.id, type="private")
+        entity_message = Message(
+            message_id=101,
+            date=datetime.now(),
+            chat=chat,
+            from_user=user,
+            text=emoji_title,
+            entities=[MessageEntity(type="custom_emoji", offset=0, length=2, custom_emoji_id=emoji_id)],
+        )
+        bot.reset_mock()
+        await dp.feed_update(bot, Update(update_id=3, message=entity_message))
+        methods = [call.args[0] for call in bot.call_args_list if call.args and hasattr(call.args[0], "__class__")]
+        saved_msg = next(m for m in methods if isinstance(m, SendMessage))
+        # Must preserve <tg-emoji> with normalized emoji-id without escaping into &lt;tg-emoji&gt;
+        assert normalized_title in saved_msg.text
+        assert '&lt;tg-emoji' not in saved_msg.text
+
+        # Reopen card
+        methods = await _feed_callback(dp, bot, f"admin_ev_open_{scen.id}")
+        card = next(m for m in methods if isinstance(m, EditMessageText))
+        assert normalized_title in card.text
+
+        async with db_session_maker() as session:
+            db_scen = await session.get(EventScenario, scen.id)
+            assert db_scen.title == normalized_title
+            assert len(db_scen.title) <= 1000
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_pagination_page_2_edit_menu_back_roundtrip_journey(db_session_maker, monkeypatch):
+    """Full journey:
+    List page 2 -> card -> edit menu -> format menu -> Back -> Save/Cancel draft -> card -> To list = original page 2 with original filter.
+    """
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    now = datetime.utcnow()
+    # Create 8 events (PAGE_SIZE=6 -> 2 pages)
+    scenarios = []
+    for i in range(8):
+        scen = await create_scenario(
+            db_session_maker,
+            code=f"tg_page2_ev_{i:02d}",
+            event_type="webinar",
+            title=f"Вебинар {i:02d}",
+            starts_at_utc=now + timedelta(days=i + 1),
+            link=f"https://example.test/{i}",
+            media_format="separate_media_top",
+        )
+        scenarios.append(scen)
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    def find_callback(methods, prefix):
+        for m in methods:
+            if isinstance(m, (EditMessageText, SendMessage)) and m.reply_markup is not None:
+                for row in m.reply_markup.inline_keyboard:
+                    for b in row:
+                        if b.callback_data and b.callback_data.startswith(prefix):
+                            return b.callback_data
+        raise AssertionError(f"Button with prefix {prefix!r} not found in methods")
+
+    try:
+        # Step 1: Open list
+        methods = await _feed_callback(dp, bot, "admin_events")
+        listing = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "страница 1 из 2" in listing.text
+
+        # Step 2: Navigate to Page 2 (0-indexed page 1)
+        page2_cb = find_callback(methods, "admin_ev_page_1_0")
+        methods = await _feed_callback(dp, bot, page2_cb)
+        listing = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "страница 2 из 2" in listing.text
+
+        # Find target scenario from page 2 (index 0 or 1 because list is sorted by starts_at desc)
+        target = scenarios[0]
+        open_cb = find_callback(methods, f"admin_ev_open_{target.id}_1_0")
+
+        # Step 3: Open card from page 2
+        methods = await _feed_callback(dp, bot, open_cb)
+        card = next(m for m in methods if isinstance(m, EditMessageText))
+        assert target.title in card.text
+
+        # Step 4: Open edit menu from card
+        edit_cb = find_callback(methods, f"admin_ev_edit_menu_{target.id}_1_0")
+        methods = await _feed_callback(dp, bot, edit_cb)
+        edit_menu = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "Редактирование мероприятия" in edit_menu.text
+
+        # Step 5: Open format menu
+        fmt_cb = find_callback(methods, f"admin_ev_format_menu_{target.id}")
+        methods = await _feed_callback(dp, bot, fmt_cb)
+        fmt_menu = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "Формат доставки" in fmt_menu.text
+
+        # Step 6: Back from format menu -> returns to edit menu with pagination intact
+        back_to_edit = find_callback(methods, f"admin_ev_edit_menu_{target.id}_1_0")
+        methods = await _feed_callback(dp, bot, back_to_edit)
+        edit_menu = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "Редактирование мероприятия" in edit_menu.text
+
+        # Step 7: Back from edit menu to card -> returns to card with page 2 back intact
+        back_to_card = find_callback(methods, f"admin_ev_open_{target.id}_1_0")
+        methods = await _feed_callback(dp, bot, back_to_card)
+        card = next(m for m in methods if isinstance(m, EditMessageText))
+        assert target.title in card.text
+
+        # Step 8: Back from card to list -> returns to original Page 2
+        back_to_list = find_callback(methods, "admin_ev_page_1_0")
+        methods = await _feed_callback(dp, bot, back_to_list)
+        listing = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "страница 2 из 2" in listing.text
+
+        # Step 9: Full cycle with description + format draft change and Save
+        # Re-open card and edit menu
+        methods = await _feed_callback(dp, bot, open_cb)
+        methods = await _feed_callback(dp, bot, edit_cb)
+        # Start description draft
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_description_{target.id}")
+        await _feed_message(dp, bot, "Новое описание в черновике для страницы 2")
+        # Now open format menu while draft exists
+        methods = await _feed_callback(dp, bot, fmt_cb)
+        set_fmt_cb = find_callback(methods, f"admin_ev_set_fmt_{target.id}_separate_text_top")
+        methods = await _feed_callback(dp, bot, set_fmt_cb)
+        draft_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "Черновик ещё не сохранён" in draft_msg.text
+
+        # First verify Cancel draft returns to card preserving pagination back
+        cancel_draft_cb = find_callback(methods, f"admin_ev_cancel_draft_{target.id}")
+        methods = await _feed_callback(dp, bot, cancel_draft_cb)
+        card = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "Черновик сброшен" in card.text
+        assert find_callback(methods, "admin_ev_page_1_0") == "admin_ev_page_1_0"
+
+        # Now re-create draft and Save
+        methods = await _feed_callback(dp, bot, edit_cb)
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_description_{target.id}")
+        await _feed_message(dp, bot, "Сохранённое описание для страницы 2")
+        methods = await _feed_callback(dp, bot, fmt_cb)
+        methods = await _feed_callback(dp, bot, set_fmt_cb)
+        save_cb = find_callback(methods, f"admin_ev_description_save_{target.id}")
+        methods = await _feed_callback(dp, bot, save_cb)
+        card = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "сохранены" in card.text
+
+        # Back to list -> returns to original Page 2
+        back_to_list = find_callback(methods, "admin_ev_page_1_0")
+        methods = await _feed_callback(dp, bot, back_to_list)
+        listing = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "страница 2 из 2" in listing.text
+        assert target.code in listing.text
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_cross_event_draft_stale_callback_rejection_journey(db_session_maker, monkeypatch):
+    """Negative journey:
+    Admin has active draft for Event A.
+    Stale callback buttons for Event B must NOT save, reset, or transfer draft of Event A.
+    DB records for both events remain completely unchanged.
+    """
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    now = datetime.utcnow()
+    event_a = await create_scenario(
+        db_session_maker,
+        code="tg_draft_event_a",
+        event_type="webinar",
+        title="Event A Title",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/a",
+        description="Original Event A Description",
+        media_format="separate_media_top",
+    )
+    event_b = await create_scenario(
+        db_session_maker,
+        code="tg_draft_event_b",
+        event_type="webinar",
+        title="Event B Title",
+        starts_at_utc=now + timedelta(days=3),
+        link="https://example.test/b",
+        description="Original Event B Description",
+        media_format="separate_media_top",
+    )
+
+    import handlers
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    try:
+        # Step 1: Open description editor for Event A and type new draft
+        await _feed_callback(dp, bot, f"admin_ev_edit_description_{event_a.id}")
+        draft_text = "Новый незафиксированный черновик для Мероприятия А"
+        await _feed_message(dp, bot, draft_text)
+
+        # Step 2: Send STALE Save callback from Event B
+        methods = await _feed_callback(dp, bot, f"admin_ev_description_save_{event_b.id}")
+        answer = next(m for m in methods if isinstance(m, AnswerCallbackQuery))
+        assert answer.show_alert is True
+        assert "Черновик принадлежит другому мероприятию" in answer.text
+
+        # Verify DB for both events is UNCHANGED
+        async with db_session_maker() as session:
+            ea = await session.get(EventScenario, event_a.id)
+            eb = await session.get(EventScenario, event_b.id)
+            assert ea.description == "Original Event A Description"
+            assert eb.description == "Original Event B Description"
+
+        # Step 3: Send STALE Cancel callback from Event B
+        methods = await _feed_callback(dp, bot, f"admin_ev_cancel_draft_{event_b.id}")
+        answer = next(m for m in methods if isinstance(m, AnswerCallbackQuery))
+        assert answer.show_alert is True
+        assert "Сначала завершите или отмените" in answer.text
+
+        # Verify DB and draft still unchanged
+        async with db_session_maker() as session:
+            ea = await session.get(EventScenario, event_a.id)
+            eb = await session.get(EventScenario, event_b.id)
+            assert ea.description == "Original Event A Description"
+            assert eb.description == "Original Event B Description"
+
+        # Step 4: Send STALE Format callback from Event B
+        methods = await _feed_callback(dp, bot, f"admin_ev_set_fmt_{event_b.id}_caption")
+        answer = next(m for m in methods if isinstance(m, AnswerCallbackQuery))
+        assert answer.show_alert is True
+        assert "Сначала завершите или отмените" in answer.text
+
+        async with db_session_maker() as session:
+            eb = await session.get(EventScenario, event_b.id)
+            assert eb.media_format == "separate_media_top"
+
+        # Step 5: Send STALE Edit Title callback from Event B
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_title_{event_b.id}")
+        answer = next(m for m in methods if isinstance(m, AnswerCallbackQuery))
+        assert answer.show_alert is True
+        assert "Сначала завершите или отмените" in answer.text
+
+        # Step 6: Now send VALID Save callback for Event A
+        methods = await _feed_callback(dp, bot, f"admin_ev_description_save_{event_a.id}")
+        edit_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "сохранены" in edit_msg.text
+
+        # Verify Event A in DB is updated, Event B remains unchanged
+        async with db_session_maker() as session:
+            ea = await session.get(EventScenario, event_a.id)
+            eb = await session.get(EventScenario, event_b.id)
+            assert ea.description == draft_text
+            assert eb.description == "Original Event B Description"
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_holistic_draft_media_save_journey(db_session_maker, monkeypatch):
+    """Holistic A -> Я -> A journey:
+    1. Start from scenario card callback
+    2. Inspect visible keyboard to navigate to edit menu
+    3. Modify description, title with entities/custom-emoji, format, add photo + video, reorder
+    4. Cancel draft -> verify DB untouched, reopen card
+    5. Phase 2: Repeat modifications through Dispatcher, execute Save Media
+    6. Validate all outgoing aiogram method calls via Pydantic model_validate
+    7. Verify DB atomically committed with media provenance (source_platform, source_file_id)
+    8. Reopen card -> verify clean rendering without double escaping
+    9. Execute runtime delivery plan -> verify correct message order and delivery
+    """
+    import handlers
+    from aiogram.types import PhotoSize, Video
+    from aiogram.methods import SendMessage, EditMessageText, AnswerCallbackQuery
+    from database import EventScenario, EventScenarioMedia
+    from event_admin_service import create_scenario, list_scenario_media
+    from event_delivery_worker import _build_delivery_plan, _send_delivery_part
+    from sqlalchemy.orm import selectinload
+
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="tg_holistic_draft",
+        event_type="webinar",
+        title="Initial TG Title",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/tg-draft",
+        description="Initial TG Description",
+        media_format="separate_media_top",
+    )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    async def feed_callback(data: str):
+        methods = await _feed_callback(dp, bot, data)
+        for method in methods:
+            if hasattr(method, "model_dump"):
+                method.__class__.model_validate(method.model_dump())
+        return methods
+
+    async def feed_message(text: str, **kwargs):
+        methods = await _feed_message(dp, bot, text, **kwargs)
+        for method in methods:
+            if hasattr(method, "model_dump"):
+                method.__class__.model_validate(method.model_dump())
+        return methods
+
+    def find_button(methods, prefix: str) -> str:
+        for method in methods:
+            if not isinstance(method, (EditMessageText, SendMessage)) or method.reply_markup is None:
+                continue
+            for row in method.reply_markup.inline_keyboard:
+                for button in row:
+                    if button.callback_data and button.callback_data.startswith(prefix):
+                        return button.callback_data
+        raise AssertionError(f"Button with prefix '{prefix}' not found in methods: {methods}")
+
+    try:
+        # Step 1: Open card
+        methods = await feed_callback(f"admin_ev_open_{scen.id}_0_1")
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+
+        # Phase 1: Modify description, title, format, media, then CANCEL
+        # 1. Edit description
+        methods = await feed_callback(edit_menu_cb)
+        desc_btn_cb = find_button(methods, f"admin_ev_edit_description_{scen.id}")
+        methods = await feed_callback(desc_btn_cb)
+        methods = await feed_message("Pending Draft Description")
+        assert any("Pending Draft Description" in (m.text or "") for m in methods if isinstance(m, (SendMessage, EditMessageText)))
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_menu_cb)
+
+        # 2. Edit title with custom emoji
+        title_btn_cb = find_button(methods, f"admin_ev_edit_title_{scen.id}")
+        methods = await feed_callback(title_btn_cb)
+        methods = await feed_message('Draft Title & <tg-emoji emoji-id="111">⭐</tg-emoji> <Pending>')
+        # Verify no double escaping in response
+        assert not any("&amp;amp;" in (m.text or "") for m in methods if isinstance(m, (SendMessage, EditMessageText)))
+
+        # 3. Change format
+        fmt_btn_cb = find_button(methods, f"admin_ev_format_menu_{scen.id}")
+        methods = await feed_callback(fmt_btn_cb)
+        set_fmt_cb = find_button(methods, f"admin_ev_set_fmt_{scen.id}_separate_text_top")
+        methods = await feed_callback(set_fmt_cb)
+        assert any("Выбран формат" in (m.text or "") for m in methods if isinstance(m, (SendMessage, EditMessageText)))
+
+        # Reopen format menu to verify radio button indicator
+        fmt_btn_cb = find_button(methods, f"admin_ev_format_menu_{scen.id}")
+        methods = await feed_callback(fmt_btn_cb)
+        assert any("🔘" in b.text for m in methods if hasattr(m, "reply_markup") and m.reply_markup for row in m.reply_markup.inline_keyboard for b in row if "медиа ниже" in b.text.lower())
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_menu_cb)
+
+        # 4. Add media
+        media_btn_cb = find_button(methods, f"admin_ev_edit_media_{scen.id}")
+        methods = await feed_callback(media_btn_cb)
+        add_media_cb = find_button(methods, f"admin_ev_media_add_{scen.id}")
+        methods = await feed_callback(add_media_cb)
+        mock_photo = [PhotoSize(file_id="tg_photo_draft_1", file_unique_id="u1", width=100, height=100)]
+        methods = await feed_message("", photo=mock_photo)
+        assert any("В черновике: <b>1</b>" in (m.text or "") for m in methods if isinstance(m, (SendMessage, EditMessageText)))
+
+        # 5. Cancel draft
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_menu_cb)
+        cancel_cb = find_button(methods, f"admin_ev_cancel_draft_{scen.id}")
+        methods = await feed_callback(cancel_cb)
+
+        # Verify DB is completely untouched
+        async with db_session_maker() as session:
+            s_after_cancel = await session.get(EventScenario, scen.id)
+            assert s_after_cancel.title == "Initial TG Title"
+            assert s_after_cancel.description == "Initial TG Description"
+            assert s_after_cancel.media_format == "separate_media_top"
+        media_after_cancel = await list_scenario_media(db_session_maker, scen.id)
+        assert len(media_after_cancel) == 0
+
+        # Phase 2: Modify description, title, format, media, and SAVE MEDIA
+        methods = await feed_callback(f"admin_ev_open_{scen.id}_0_1")
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_menu_cb)
+
+        # 1. Edit description
+        desc_btn_cb = find_button(methods, f"admin_ev_edit_description_{scen.id}")
+        methods = await feed_callback(desc_btn_cb)
+        methods = await feed_message("Final Saved Description")
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_menu_cb)
+
+        # 2. Edit title with custom emoji and HTML entities
+        title_btn_cb = find_button(methods, f"admin_ev_edit_title_{scen.id}")
+        methods = await feed_callback(title_btn_cb)
+        methods = await feed_message('Final Title & <tg-emoji emoji-id="222">🚀</tg-emoji> <Final>')
+
+        # 3. Change format to separate_text_top
+        fmt_btn_cb = find_button(methods, f"admin_ev_format_menu_{scen.id}")
+        methods = await feed_callback(fmt_btn_cb)
+        set_fmt_cb = find_button(methods, f"admin_ev_set_fmt_{scen.id}_separate_text_top")
+        methods = await feed_callback(set_fmt_cb)
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_menu_cb)
+
+        # 4. Add media 1 (photo)
+        media_btn_cb = find_button(methods, f"admin_ev_edit_media_{scen.id}")
+        methods = await feed_callback(media_btn_cb)
+        add_media_cb = find_button(methods, f"admin_ev_media_add_{scen.id}")
+        methods = await feed_callback(add_media_cb)
+        mock_photo = [PhotoSize(file_id="tg_photo_final_1", file_unique_id="u2", width=200, height=200)]
+        methods = await feed_message("", photo=mock_photo)
+
+        # Add media 2 (video)
+        add_media_cb = find_button(methods, f"admin_ev_media_add_{scen.id}")
+        methods = await feed_callback(add_media_cb)
+        mock_video = Video(file_id="tg_video_final_2", file_unique_id="u3", width=200, height=200, duration=10)
+        methods = await feed_message("", video=mock_video)
+        assert any("В черновике: <b>2</b>" in (m.text or "") for m in methods if isinstance(m, (SendMessage, EditMessageText)))
+
+        # 5. Reorder media: move item 2 up to position 0
+        move_up_cb = find_button(methods, f"admin_ev_media_up_{scen.id}_1")
+        methods = await feed_callback(move_up_cb)
+
+        # 6. Click Save Media (admin_ev_media_save_{scen.id})
+        save_media_cb = find_button(methods, f"admin_ev_media_save_{scen.id}")
+        methods = await feed_callback(save_media_cb)
+        assert any(
+            isinstance(m, (SendMessage, EditMessageText)) and "сохранены" in (m.text or "")
+            for m in methods
+        )
+
+        # 7. Verify DB is atomically updated with ALL changes and media provenance
+        async with db_session_maker() as session:
+            s_final = await session.get(EventScenario, scen.id)
+            assert s_final.title == 'Final Title &amp; <tg-emoji emoji-id="222">🚀</tg-emoji> &lt;Final&gt;'
+            assert s_final.description == "Final Saved Description"
+            assert s_final.media_format == "separate_text_top"
+        media_final = await list_scenario_media(db_session_maker, scen.id)
+        assert len(media_final) == 2
+        # First item was moved up: video
+        assert media_final[0].file_id == "tg_video_final_2"
+        assert media_final[0].file_type == "video"
+        assert media_final[0].source_platform == "telegram"
+        assert media_final[0].source_file_id == "tg_video_final_2"
+        # Second item: photo
+        assert media_final[1].file_id == "tg_photo_final_1"
+        assert media_final[1].file_type == "photo"
+        assert media_final[1].source_platform == "telegram"
+        assert media_final[1].source_file_id == "tg_photo_final_1"
+
+        # 8. Reopen card callback and verify clean rendered card
+        methods = await feed_callback(f"admin_ev_open_{scen.id}_0_1")
+        card_msg = next(m for m in methods if isinstance(m, (SendMessage, EditMessageText)))
+        assert "&amp;amp;" not in card_msg.text
+        assert "&amp;lt;" not in card_msg.text
+        assert "Final Title &amp;" in card_msg.text
+        assert "Медиа:</b> 2" in card_msg.text
+
+        # 9. Test runtime delivery plan execution
+        async with db_session_maker() as session:
+            scen_delivery = (await session.execute(
+                select(EventScenario).where(EventScenario.id == scen.id).options(selectinload(EventScenario.media))
+            )).scalar_one()
+
+        plan = _build_delivery_plan(scen_delivery, scen.id, "Runtime announcement", include_media=True)
+        # Because format is separate_text_top: text first, media second
+        assert len(plan) >= 2
+        assert plan[0]["kind"] == "text"
+        assert plan[1]["kind"] == "media"
+        assert len(plan[1]["items"]) == 2
+
+        # Send text part
+        bot_delivery = AsyncMock(spec=Bot)
+        bot_delivery.send_message = AsyncMock(return_value=MagicMock(message_id=501))
+        bot_delivery.send_media_group = AsyncMock(return_value=[MagicMock(message_id=502), MagicMock(message_id=503)])
+
+        sent_text_id = await _send_delivery_part(
+            plan[0],
+            platform="telegram",
+            user_id=8888,
+            event_id=scen.id,
+            is_last=False,
+            bot=bot_delivery,
+            max_client=None,
+        )
+        assert sent_text_id == "501"
+
+        sent_media_id = await _send_delivery_part(
+            plan[1],
+            platform="telegram",
+            user_id=8888,
+            event_id=scen.id,
+            is_last=True,
+            bot=bot_delivery,
+            max_client=None,
+        )
+        assert sent_media_id == "502,503"
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_format_menu_draft_reflection_and_back(db_session_maker, monkeypatch):
+    """Verifies show_format_menu marks active draft_format with radio button and preserves it across Back."""
+    import handlers
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="tg_fmt_draft",
+        event_type="webinar",
+        title="Format Draft Event",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/fmt-draft",
+        description="Format Draft Description",
+        media_format="separate_media_top",
+    )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    try:
+        # Open format menu initially - should reflect separate_media_top
+        methods = await _feed_callback(dp, bot, f"admin_ev_format_menu_{scen.id}")
+        msg = next(m for m in methods if isinstance(m, (EditMessageText, SendMessage)))
+        button_texts = [b.text for row in msg.reply_markup.inline_keyboard for b in row]
+        assert any("🔘 🖼️ Текст отдельно, медиа выше" in t for t in button_texts)
+
+        # Set draft format to separate_text_top
+        await _feed_callback(dp, bot, f"admin_ev_set_fmt_{scen.id}_separate_text_top")
+
+        # Reopen format menu - should now reflect draft_format (separate_text_top)
+        methods = await _feed_callback(dp, bot, f"admin_ev_format_menu_{scen.id}")
+        msg = next(m for m in methods if isinstance(m, (EditMessageText, SendMessage)))
+        button_texts = [b.text for row in msg.reply_markup.inline_keyboard for b in row]
+        assert any("🔘 📝 Текст отдельно, медиа ниже" in t for t in button_texts)
+        assert any("⚪️ 🖼️ Текст отдельно, медиа выше" in t for t in button_texts)
+
+        # Navigate Back to edit menu
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_menu_{scen.id}")
+        edit_msg = next(m for m in methods if isinstance(m, (EditMessageText, SendMessage)))
+        edit_button_texts = [b.text for row in edit_msg.reply_markup.inline_keyboard for b in row]
+        assert any("Формат:" in t and "Текст отдельно, медиа ниже" in t for t in edit_button_texts)
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_visiting_editor_does_not_block_foreign_events(db_session_maker, monkeypatch):
+    """Merely opening edit menu, description editor or media editor without dirty changes does not block foreign events."""
+    import handlers
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    event_a = await create_scenario(
+        db_session_maker,
+        code="tg_visit_a",
+        event_type="webinar",
+        title="Event A",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/a",
+    )
+    event_b = await create_scenario(
+        db_session_maker,
+        code="tg_visit_b",
+        event_type="webinar",
+        title="Event B",
+        starts_at_utc=datetime.utcnow() + timedelta(days=4),
+        link="https://example.test/b",
+    )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    try:
+        # 1. Visit Event A edit menu
+        await _feed_callback(dp, bot, f"admin_ev_edit_menu_{event_a.id}")
+
+        # 2. Visit Event A description editor (do NOT enter any text)
+        await _feed_callback(dp, bot, f"admin_ev_edit_description_{event_a.id}")
+
+        # 3. Visit Event A media editor (do NOT add or remove media)
+        await _feed_callback(dp, bot, f"admin_ev_edit_media_{event_a.id}")
+
+        # 4. Now open Event B card
+        methods = await _feed_callback(dp, bot, f"admin_ev_open_{event_b.id}")
+        assert not any(isinstance(m, AnswerCallbackQuery) and m.show_alert for m in methods)
+        card_msg = next(m for m in methods if isinstance(m, (EditMessageText, SendMessage)))
+        assert "Event B" in card_msg.text
+
+        # 5. Open Event B edit menu
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_menu_{event_b.id}")
+        assert not any(isinstance(m, AnswerCallbackQuery) and m.show_alert for m in methods)
+        menu_msg = next(m for m in methods if isinstance(m, (EditMessageText, SendMessage)))
+        assert "Event B" in menu_msg.text
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_title_length_visible_and_storage_validation(db_session_maker, monkeypatch):
+    """Verifies that visible text limit (1000) and raw storage limit (1000) are both validated with informative errors."""
+    import handlers
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="tg_title_limits",
+        event_type="webinar",
+        title="Initial Valid Title",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/limits",
+    )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    try:
+        # Start editing title
+        await _feed_callback(dp, bot, f"admin_ev_edit_title_{scen.id}")
+
+        # 1. Send title with visible text > 1000 chars
+        invalid_visible = "X" * 1005
+        methods = await _feed_message(dp, bot, invalid_visible)
+        msg = next(m for m in methods if isinstance(m, SendMessage))
+        assert "1000 символов" in msg.text
+        assert "1005" in msg.text
+
+        # 2. Send title with visible text <= 1000 chars, but raw HTML with tg-emoji tags > 1000 chars
+        emojis = '<tg-emoji emoji-id="1234567890123456789">🔥</tg-emoji>' * 25
+        raw_storage_overflow = ("Y" * 50) + emojis
+        methods = await _feed_message(dp, bot, raw_storage_overflow)
+        msg = next(m for m in methods if isinstance(m, SendMessage))
+        assert "предел хранения (1000 символов)" in msg.text
+
+        # 3. Send valid title with custom emoji
+        valid_with_emoji = '<tg-emoji emoji-id="1234567890123456789">🔥</tg-emoji> Valid Emoji Title'
+        methods = await _feed_message(dp, bot, valid_with_emoji)
+        assert any(isinstance(m, (SendMessage, EditMessageText)) and "обновлено" in (m.text or "") for m in methods)
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_premium_emoji_paginated_journey_a_to_ya_to_a(db_session_maker, monkeypatch):
+    """Full journey A -> Я -> A:
+    Paginated list (page 2) -> real button with clean title & Unicode emoji -> card with custom emoji in HTML ->
+    nested screens (archive, reschedule, copy, steps, monitoring) without &amp;amp; or literal <tg-emoji> ->
+    Back -> original list page 2 with original filter.
+    Every outgoing Telegram method is strictly validated through its Pydantic model.
+    """
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+    from database import EventStep
+    import handlers
+
+    now = datetime.utcnow()
+    # 6 filler scenarios on page 1 so target scenario lands on page 2 (0-indexed page 1)
+    base_start = now + timedelta(days=20)
+    for idx in range(6):
+        await create_scenario(
+            db_session_maker,
+            code=f"tg_prem_filler_{idx}",
+            event_type="webinar",
+            title=f"Filler Event {idx}",
+            starts_at_utc=base_start + timedelta(days=idx + 1),
+            link=f"https://example.test/filler/{idx}",
+        )
+
+    target_title = '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Premium Q&amp;A &lt;Special Event&gt; with Long Title for Truncation Testing'
+    target = await create_scenario(
+        db_session_maker,
+        code="tg_prem_target",
+        event_type="webinar",
+        title=target_title,
+        starts_at_utc=base_start - timedelta(days=2),
+        link="https://example.test/target",
+        description="Описание целевого мероприятия с <b>HTML</b>",
+        media_format="separate_media_top",
+    )
+
+    async with db_session_maker() as session:
+        step = EventStep(
+            event_id=target.id,
+            offset_minutes=60,
+            message_text="Напоминание о вебинаре",
+        )
+        session.add(step)
+        await session.commit()
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    def validate_methods(methods):
+        for m in methods:
+            m.__class__.model_validate(m.model_dump())
+        return methods
+
+    def find_button(methods, prefix):
+        for m in methods:
+            if isinstance(m, (EditMessageText, SendMessage)) and m.reply_markup is not None:
+                for row in m.reply_markup.inline_keyboard:
+                    for b in row:
+                        if b.callback_data and b.callback_data.startswith(prefix):
+                            return b
+        raise AssertionError(f"Button with prefix {prefix!r} not found in methods")
+
+    try:
+        # 1. Open list (Page 1)
+        methods = validate_methods(await _feed_callback(dp, bot, "admin_events"))
+        # Navigate to Page 2 (0-indexed page 1)
+        page2_btn = find_button(methods, "admin_ev_page_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, page2_btn.callback_data))
+        listing_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "страница 2 из 2" in listing_msg.text
+
+        # 2. Inspect target button in list: plain text, Unicode fallback emoji, no raw HTML tags
+        target_btn = find_button(methods, f"admin_ev_open_{target.id}_1_0")
+        assert "<tg-emoji" not in target_btn.text
+        assert "</tg-emoji>" not in target_btn.text
+        assert "&amp;" not in target_btn.text
+        assert "&lt;" not in target_btn.text
+        assert "🔥" in target_btn.text
+        assert "Premium Q&A <Special Event>" in target_btn.text
+        assert target_btn.text.endswith("… (" + target.starts_at_msk[:10] + ")")
+
+        # 3. Open scenario card
+        methods = validate_methods(await _feed_callback(dp, bot, target_btn.callback_data))
+        card_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        # Card preserves custom emoji in HTML, without double-escaping &amp;amp;
+        assert '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>' in card_msg.text
+        assert "&amp;amp;" not in card_msg.text
+        assert "&amp;lt;" not in card_msg.text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in card_msg.text
+
+        # 4. Nested screen: Archive
+        archive_btn = find_button(methods, f"admin_ev_archive_ask_{target.id}")
+        methods = validate_methods(await _feed_callback(dp, bot, archive_btn.callback_data))
+        archive_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>' in archive_msg.text
+        assert "&amp;amp;" not in archive_msg.text
+        assert "&lt;tg-emoji" not in archive_msg.text
+        # Back to card
+        card_back_btn = find_button(methods, f"admin_ev_open_{target.id}_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, card_back_btn.callback_data))
+
+        # 5. Nested screen: Reschedule
+        resched_btn = find_button(methods, f"admin_ev_reschedule_{target.id}")
+        methods = validate_methods(await _feed_callback(dp, bot, resched_btn.callback_data))
+        resched_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>' in resched_msg.text
+        assert "&amp;amp;" not in resched_msg.text
+        assert "&lt;tg-emoji" not in resched_msg.text
+        # Back to card
+        card_back_btn = find_button(methods, f"admin_ev_open_{target.id}_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, card_back_btn.callback_data))
+
+        # 6. Nested screen: Copy
+        copy_btn = find_button(methods, f"admin_ev_copy_{target.id}")
+        methods = validate_methods(await _feed_callback(dp, bot, copy_btn.callback_data))
+        copy_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>' in copy_msg.text
+        assert "&amp;amp;" not in copy_msg.text
+        assert "&lt;tg-emoji" not in copy_msg.text
+        # Back to card
+        card_back_btn = find_button(methods, f"admin_ev_open_{target.id}_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, card_back_btn.callback_data))
+
+        # 7. Nested screen: Steps
+        steps_btn = find_button(methods, f"admin_ev_steps_{target.id}")
+        methods = validate_methods(await _feed_callback(dp, bot, steps_btn.callback_data))
+        steps_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>' in steps_msg.text
+        assert "&amp;amp;" not in steps_msg.text
+        assert "&lt;tg-emoji" not in steps_msg.text
+        # Back to card
+        card_back_btn = find_button(methods, f"admin_ev_open_{target.id}_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, card_back_btn.callback_data))
+
+        # 8. Nested screen: Monitoring / Stats
+        stats_btn = find_button(methods, f"admin_ev_stats_{target.id}")
+        methods = validate_methods(await _feed_callback(dp, bot, stats_btn.callback_data))
+        stats_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>' in stats_msg.text
+        assert "&amp;amp;" not in stats_msg.text
+        assert "&lt;tg-emoji" not in stats_msg.text
+        # Back to card
+        card_back_btn = find_button(methods, f"admin_ev_open_{target.id}_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, card_back_btn.callback_data))
+
+        # 9. Return to list (Page 2) with original filter
+        to_list_btn = find_button(methods, "admin_ev_page_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, to_list_btn.callback_data))
+        final_listing = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "страница 2 из 2" in final_listing.text
+        assert find_button(methods, f"admin_ev_open_{target.id}_1_0") is not None
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_scenarios_list_button_preserves_raw_legacy_and_escaped_titles(db_session_maker, monkeypatch):
+    """
+    Verifies that Telegram scenario list buttons preserve literal angle brackets like '<Новый сезон>'
+    both for raw legacy titles and HTML-escaped titles, convert custom emojis to Unicode fallback,
+    and strip only allowed markup tags.
+    """
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+    import handlers
+
+    now = datetime.utcnow()
+    # 1. Raw legacy scenario with literal angle brackets
+    scen_raw = await create_scenario(
+        db_session_maker,
+        code="tg_raw_legacy",
+        event_type="webinar",
+        title="Презентация <Новый сезон>",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/raw",
+    )
+    # 2. Escaped scenario with HTML entities
+    scen_escaped = await create_scenario(
+        db_session_maker,
+        code="tg_escaped_title",
+        event_type="webinar",
+        title="Презентация &lt;Новый сезон&gt;",
+        starts_at_utc=now + timedelta(days=3),
+        link="https://example.test/escaped",
+    )
+    # 3. Custom emoji with literal angle brackets
+    scen_emoji = await create_scenario(
+        db_session_maker,
+        code="tg_emoji_raw",
+        event_type="webinar",
+        title='<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Презентация &lt;Новый сезон&gt;',
+        starts_at_utc=now + timedelta(days=4),
+        link="https://example.test/emoji",
+    )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    def find_button(methods, prefix):
+        for m in methods:
+            if isinstance(m, (EditMessageText, SendMessage)) and m.reply_markup is not None:
+                for row in m.reply_markup.inline_keyboard:
+                    for b in row:
+                        if b.callback_data and b.callback_data.startswith(prefix):
+                            return b
+        raise AssertionError(f"Button with prefix {prefix!r} not found in methods")
+
+    try:
+        methods = await _feed_callback(dp, bot, "admin_events")
+        for m in methods:
+            m.__class__.model_validate(m.model_dump())
+
+        # Raw legacy button check
+        btn_raw = find_button(methods, f"admin_ev_open_{scen_raw.id}")
+        assert "<Новый сезон>" in btn_raw.text
+        assert "Презентация <Новый сезон>" in btn_raw.text
+
+        # Escaped button check
+        btn_escaped = find_button(methods, f"admin_ev_open_{scen_escaped.id}")
+        assert "<Новый сезон>" in btn_escaped.text
+        assert "Презентация <Новый сезон>" in btn_escaped.text
+        assert "&lt;" not in btn_escaped.text
+        assert "&gt;" not in btn_escaped.text
+
+        # Emoji + raw angle brackets button check
+        btn_emoji = find_button(methods, f"admin_ev_open_{scen_emoji.id}")
+        assert "🔥" in btn_emoji.text
+        assert "<Новый сезон>" in btn_emoji.text
+        assert "<tg-emoji" not in btn_emoji.text
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+

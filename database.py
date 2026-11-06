@@ -1274,7 +1274,7 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
         "event_scenarios": {
             "required_not_null": {
                 "id", "code", "event_type", "title", "starts_at", "duration_minutes",
-                "is_active", "is_archived", "schedule_revision", "content_version", "media_order",
+                "is_active", "is_archived", "schedule_revision", "content_version", "media_order", "media_mode",
                 "created_at", "updated_at",
             },
             "optional_nullable": {"place", "link", "archived_at", "description"},
@@ -1332,6 +1332,7 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
 
     if not new_schema_available:
         table_column_specs["event_scenarios"]["required_not_null"].discard("media_order")
+        table_column_specs["event_scenarios"]["required_not_null"].discard("media_mode")
         table_column_specs["event_scenarios"]["optional_nullable"].discard("description")
         table_column_specs["event_steps"]["required_not_null"].discard("include_event_details")
         table_column_specs["event_deliveries"]["required_not_null"].discard("content_version_snapshot")
@@ -1484,6 +1485,7 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
             "ck_event_scenarios_content_version",
             "ck_event_scenarios_location",
             "ck_event_scenarios_media_order",
+            "ck_event_scenarios_media_mode",
         },
         "event_steps": {
             "ck_event_steps_step_version",
@@ -1519,6 +1521,7 @@ def verify_event_reminder_chains_schema(sync_conn) -> None:
     }
     if not new_schema_available:
         expected_check_constraints["event_scenarios"].discard("ck_event_scenarios_media_order")
+        expected_check_constraints["event_scenarios"].discard("ck_event_scenarios_media_mode")
         expected_check_constraints["event_deliveries"].discard("ck_event_deliveries_content_version")
         expected_check_constraints.pop("event_scenario_media", None)
         expected_check_constraints.pop("event_delivery_parts", None)
@@ -2139,6 +2142,12 @@ async def init_db():
                     "CONSTRAINT ck_event_scenarios_media_order CHECK (media_order IN ('media_top', 'text_top'))"
                 ))
             sync_conn.execute(text("UPDATE event_scenarios SET media_order = 'media_top' WHERE media_order IS NULL OR media_order NOT IN ('media_top', 'text_top')"))
+            if 'media_mode' not in event_scenario_columns:
+                sync_conn.execute(text(
+                    "ALTER TABLE event_scenarios ADD COLUMN media_mode VARCHAR(16) DEFAULT 'legacy_auto' NOT NULL "
+                    "CONSTRAINT ck_event_scenarios_media_mode CHECK (media_mode IN ('legacy_auto', 'separate', 'caption'))"
+                ))
+            sync_conn.execute(text("UPDATE event_scenarios SET media_mode = 'legacy_auto' WHERE media_mode IS NULL OR media_mode NOT IN ('legacy_auto', 'separate', 'caption')"))
             EventStep.__table__.create(sync_conn, checkfirst=True)
             event_step_columns = {c['name'] for c in insp.get_columns('event_steps')}
             if 'include_event_details' not in event_step_columns:
@@ -2924,6 +2933,7 @@ class EventScenario(Base):
         CheckConstraint("schedule_revision >= 1", name="ck_event_scenarios_revision"),
         CheckConstraint("content_version >= 1", name="ck_event_scenarios_content_version"),
         CheckConstraint("media_order IN ('media_top', 'text_top')", name="ck_event_scenarios_media_order"),
+        CheckConstraint("media_mode IN ('legacy_auto', 'separate', 'caption')", name="ck_event_scenarios_media_mode"),
         CheckConstraint(
             "((event_type = 'webinar' AND link IS NOT NULL AND length(trim(link)) > 0 AND place IS NULL) "
             "OR (event_type = 'meeting' AND place IS NOT NULL AND length(trim(place)) > 0))",
@@ -2946,6 +2956,7 @@ class EventScenario(Base):
     content_version = Column(Integer, default=1, nullable=False)
     description = Column(Text, nullable=True)
     media_order = Column(String(16), default='media_top', nullable=False)
+    media_mode = Column(String(16), default='legacy_auto', nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -2953,6 +2964,15 @@ class EventScenario(Base):
     registrations = relationship("EventRegistration", back_populates="event")
     deliveries = relationship("EventDelivery", back_populates="event")
     media = relationship("EventScenarioMedia", back_populates="event", cascade="all, delete-orphan", order_by="EventScenarioMedia.sort_order")
+
+    @property
+    def media_format(self) -> str:
+        """Derive explicit media format from media_mode and media_order."""
+        if self.media_mode == "caption":
+            return "caption"
+        if self.media_mode == "separate":
+            return "separate_text_top" if self.media_order == "text_top" else "separate_media_top"
+        return "legacy_auto"
 
     @validates("code")
     def _validate_code_immutable(self, key, value):

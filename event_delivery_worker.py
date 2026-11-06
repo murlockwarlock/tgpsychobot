@@ -57,6 +57,7 @@ from event_service import (
     render_event_message,
 )
 from max_messenger_bot.api import MaxApiClient, MaxApiError
+from max_messenger_bot.formatting import MAX_TRANSPORT_TEXT_LEN
 from max_messenger_bot.identity import is_max_user_id, raw_max_user_id
 from max_messenger_bot.keyboards import callback_button, inline_keyboard
 from max_messenger_bot.models import extract_sent_message_id
@@ -195,37 +196,66 @@ def _build_delivery_plan(
     include_media: bool = True,
 ) -> list[dict[str, Any]]:
     media = (
-        sorted(getattr(scenario, "media", ()) or (), key=lambda item: (item.sort_order, item.id))
+        sorted(
+            getattr(scenario, "media", ()) or (),
+            key=lambda item: (getattr(item, "sort_order", 0), getattr(item, "id", 0)),
+        )
         if include_media
         else []
     )
     if not media and len(rendered_text) <= 4000:
         return []
 
-    text_chunks = _split_html_text(rendered_text, 4000)
     media_parts: list[dict[str, Any]] = []
     for start in range(0, len(media), 10):
         items = []
         for item in media[start:start + 10]:
             items.append({
-                "file_type": item.file_type,
-                "file_id": item.file_id,
-                "max_token": item.max_token,
+                "file_type": getattr(item, "file_type", "photo"),
+                "file_id": getattr(item, "file_id", ""),
+                "max_token": getattr(item, "max_token", None),
                 "source_platform": getattr(item, "source_platform", None),
+                "source_file_id": getattr(item, "source_file_id", None),
             })
         media_parts.append({"kind": "media", "items": items})
 
-    if len(media) == 1 and text_chunks and len(rendered_text) <= 900 and scenario.media_order == "media_top":
-        plan = [{"kind": "media_caption", "items": [{
-            "file_type": media[0].file_type,
-            "file_id": media[0].file_id,
-            "max_token": media[0].max_token,
-            "source_platform": getattr(media[0], "source_platform", None),
-        }], "caption": rendered_text}]
+    media_mode = getattr(scenario, "media_mode", "legacy_auto")
+    media_order = getattr(scenario, "media_order", "media_top")
+    text_parts: list[dict[str, Any]] = []
+
+    if media_mode == "caption":
+        if len(media) == 1:
+            plan = [{"kind": "media_caption", "items": [{
+                "file_type": getattr(media[0], "file_type", "photo"),
+                "file_id": getattr(media[0], "file_id", ""),
+                "max_token": getattr(media[0], "max_token", None),
+                "source_platform": getattr(media[0], "source_platform", None),
+                "source_file_id": getattr(media[0], "source_file_id", None),
+            }], "caption": rendered_text}]
+        else:
+            text_parts = [{"kind": "text", "text": rendered_text}]
+            plan = text_parts
+    elif media_mode == "legacy_auto":
+        text_chunks = _split_html_text(rendered_text, 4000)
+        if len(media) == 1 and text_chunks and len(rendered_text) <= 900 and media_order == "media_top":
+            plan = [{"kind": "media_caption", "items": [{
+                "file_type": getattr(media[0], "file_type", "photo"),
+                "file_id": getattr(media[0], "file_id", ""),
+                "max_token": getattr(media[0], "max_token", None),
+                "source_platform": getattr(media[0], "source_platform", None),
+                "source_file_id": getattr(media[0], "source_file_id", None),
+            }], "caption": rendered_text}]
+        else:
+            text_parts = [{"kind": "text", "text": chunk} for chunk in text_chunks]
+            plan = media_parts + text_parts if media_order == "media_top" else text_parts + media_parts
     else:
-        text_parts = [{"kind": "text", "text": chunk} for chunk in text_chunks]
-        plan = media_parts + text_parts if scenario.media_order == "media_top" else text_parts + media_parts
-    if media and (not text_chunks or scenario.media_order == "text_top"):
+        # Explicit separate mode (separate_media_top or separate_text_top)
+        # Never performs automatic multipart splitting
+        text_parts = [{"kind": "text", "text": rendered_text}]
+        plan = media_parts + text_parts if media_order == "media_top" else text_parts + media_parts
+
+    has_caption = any(item.get("kind") == "media_caption" for item in plan)
+    if media and not has_caption and (not text_parts or media_order == "text_top"):
         plan.append({"kind": "control", "text": ""})
     return plan
 
@@ -308,6 +338,8 @@ async def send_test_delivery_plan(
     sent_ids: list[str | None] = []
     preview_parts = [payload for payload in plan if payload.get("kind") != "control"]
     for index, payload in enumerate(preview_parts):
+        if platform == "max" and index > 0:
+            await asyncio.sleep(0.5)
         sent_ids.append(
             await _send_delivery_part(
                 payload,
@@ -576,7 +608,7 @@ async def _send_delivery_part(
         async def telegram_media_reference(item: dict[str, Any], index: int) -> Any:
             if item.get("source_platform") != "max":
                 return item["file_id"]
-            token = item.get("max_token") or item.get("file_id")
+            token = item.get("max_token") or item.get("source_file_id") or item.get("file_id")
             if not token:
                 raise MediaMaterializationRequired("MAX media has no download token for Telegram delivery")
             if max_client is None:
@@ -598,24 +630,68 @@ async def _send_delivery_part(
             inline_keyboard=[[InlineKeyboardButton(text="❌ Не смогу прийти", callback_data=f"ev_cancel:{event_id}")]]
         ) if is_last and include_controls else None
         kind = payload.get("kind")
-        if kind == "text" or kind == "control":
-            message = await bot.send_message(
-                chat_id=user_id,
-                text=payload.get("text") or "Управление мероприятием:",
-                parse_mode="HTML",
-                reply_markup=markup,
+        try:
+            from event_content_validator import (
+                TELEGRAM_CAPTION_LIMIT_TECHNICAL,
+                TELEGRAM_TEXT_LIMIT_TECHNICAL,
+                normalize_telegram_custom_emoji_tags,
+                parse_visible_telegram_text,
             )
-            return str(message.message_id)
-        items = payload.get("items") or []
-        if kind == "media_caption":
-            item = items[0]
-            media_reference = await telegram_media_reference(item, 0)
-            kwargs = {"chat_id": user_id, "caption": payload.get("caption") or "", "parse_mode": "HTML", "reply_markup": markup}
-            if item["file_type"] == "photo":
-                message = await bot.send_photo(photo=media_reference, **kwargs)
-            else:
-                message = await bot.send_video(video=media_reference, **kwargs)
-            return str(message.message_id)
+
+            if kind == "text" or kind == "control":
+                text_to_send = normalize_telegram_custom_emoji_tags(payload.get("text") or "Управление мероприятием:")
+                _, utf16_len, _ = parse_visible_telegram_text(text_to_send)
+                if utf16_len > TELEGRAM_TEXT_LIMIT_TECHNICAL:
+                    raise PreTransmissionError(
+                        f"Итоговый текст сообщения превышает технический лимит Telegram ({utf16_len} > {TELEGRAM_TEXT_LIMIT_TECHNICAL} UTF-16 code units)"
+                    )
+                message = await bot.send_message(
+                    chat_id=user_id,
+                    text=text_to_send,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+                return str(message.message_id)
+            items = payload.get("items") or []
+            if kind == "media_caption":
+                item = items[0]
+                media_reference = await telegram_media_reference(item, 0)
+                cap = normalize_telegram_custom_emoji_tags(payload.get("caption") or "")
+                _, utf16_len, _ = parse_visible_telegram_text(cap)
+                if utf16_len > TELEGRAM_CAPTION_LIMIT_TECHNICAL:
+                    raise PreTransmissionError(
+                        f"Итоговая подпись к медиа превышает технический лимит Telegram ({utf16_len} > {TELEGRAM_CAPTION_LIMIT_TECHNICAL} UTF-16 code units)"
+                    )
+                kwargs = {"chat_id": user_id, "caption": cap, "parse_mode": "HTML", "reply_markup": markup}
+                if item["file_type"] == "photo":
+                    message = await bot.send_photo(photo=media_reference, **kwargs)
+                else:
+                    message = await bot.send_video(video=media_reference, **kwargs)
+                return str(message.message_id)
+        except TelegramBadRequest as exc:
+            err_lower = str(exc).lower()
+            if "custom emoji" in err_lower or "emoji" in err_lower or "entity" in err_lower:
+                from event_content_validator import strip_telegram_custom_emoji
+                if kind == "text" or kind == "control":
+                    message = await bot.send_message(
+                        chat_id=user_id,
+                        text=strip_telegram_custom_emoji(payload.get("text") or "Управление мероприятием:"),
+                        parse_mode="HTML",
+                        reply_markup=markup,
+                    )
+                    return str(message.message_id)
+                elif kind == "media_caption":
+                    item = items[0]
+                    media_reference = await telegram_media_reference(item, 0)
+                    fb_cap = strip_telegram_custom_emoji(payload.get("caption") or "")
+                    kwargs = {"chat_id": user_id, "caption": fb_cap, "parse_mode": "HTML", "reply_markup": markup}
+                    if item["file_type"] == "photo":
+                        message = await bot.send_photo(photo=media_reference, **kwargs)
+                    else:
+                        message = await bot.send_video(video=media_reference, **kwargs)
+                    return str(message.message_id)
+            raise
+
         if len(items) == 1:
             item = items[0]
             media_reference = await telegram_media_reference(item, 0)
@@ -637,6 +713,7 @@ async def _send_delivery_part(
     if platform == "max":
         if max_client is None:
             raise PreTransmissionError("MAX client transport is not configured")
+        from event_content_validator import strip_telegram_custom_emoji
         markup = inline_keyboard([[callback_button("❌ Не смогу прийти", f"ev_cancel:{event_id}")]]) if is_last and include_controls else []
         kind = payload.get("kind")
         if kind in {"media", "media_caption"}:
@@ -649,16 +726,32 @@ async def _send_delivery_part(
                     "type": "image" if item["file_type"] == "photo" else "video",
                     "payload": {"token": token},
                 })
-            text = payload.get("caption") or " "
+            raw_text = payload.get("caption") or " "
+            clean_text = strip_telegram_custom_emoji(raw_text) or " "
+            total_attachments = attachments + markup
+            if len(total_attachments) > 12:
+                raise PreTransmissionError(
+                    f"Превышено максимальное число вложений в одном сообщении MAX ({len(total_attachments)} > 12)"
+                )
+            if len(clean_text) > MAX_TRANSPORT_TEXT_LEN:
+                raise PreTransmissionError(
+                    f"Итоговый текст подписи в MAX превышает лимит ({len(clean_text)} > {MAX_TRANSPORT_TEXT_LEN} симв.)"
+                )
             response = await max_client.send_message(
                 user_id=raw_max_user_id(user_id) if is_max_user_id(user_id) else user_id,
-                text=text,
-                attachments=attachments + markup,
+                text=clean_text,
+                attachments=total_attachments,
             )
         else:
+            raw_text = payload.get("text") or "Управление мероприятием:"
+            clean_text = strip_telegram_custom_emoji(raw_text)
+            if len(clean_text) > MAX_TRANSPORT_TEXT_LEN:
+                raise PreTransmissionError(
+                    f"Итоговый текст сообщения в MAX превышает лимит ({len(clean_text)} > {MAX_TRANSPORT_TEXT_LEN} симв.)"
+                )
             response = await max_client.send_message(
                 user_id=raw_max_user_id(user_id) if is_max_user_id(user_id) else user_id,
-                text=payload.get("text") or "Управление мероприятием:",
+                text=clean_text,
                 attachments=markup,
             )
         return extract_sent_message_id(response) or (
@@ -1272,6 +1365,8 @@ async def process_single_delivery(
                 part_claim_lost = True
                 continue
             try:
+                if platform == "max" and part.part_index > 0:
+                    await asyncio.sleep(0.5)
                 payload = json.loads(part.payload_json)
                 external_id = await _send_delivery_part(
                     payload,
@@ -1371,24 +1466,44 @@ async def process_single_delivery(
                     [InlineKeyboardButton(text="❌ Не смогу прийти", callback_data=f"ev_cancel:{event_id}")]
                 ]
             )
-            msg = await bot.send_message(
-                chat_id=user_id,
-                text=rendered_text,
-                parse_mode="HTML",
-                reply_markup=markup,
-            )
+            try:
+                msg = await bot.send_message(
+                    chat_id=user_id,
+                    text=rendered_text,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+            except TelegramBadRequest as exc:
+                err_lower = str(exc).lower()
+                if "custom emoji" in err_lower or "emoji" in err_lower or "entity" in err_lower:
+                    from event_content_validator import strip_telegram_custom_emoji
+                    msg = await bot.send_message(
+                        chat_id=user_id,
+                        text=strip_telegram_custom_emoji(rendered_text),
+                        parse_mode="HTML",
+                        reply_markup=markup,
+                    )
+                else:
+                    raise
             external_id = str(msg.message_id)
 
         elif platform == "max":
             if max_client is None:
                 raise PreTransmissionError("MAX client transport is not configured")
 
+            from event_content_validator import strip_telegram_custom_emoji
+            clean_text = strip_telegram_custom_emoji(rendered_text)
+            if len(clean_text) > MAX_TRANSPORT_TEXT_LEN:
+                raise PreTransmissionError(
+                    f"Итоговый текст сообщения в MAX превышает лимит ({len(clean_text)} > {MAX_TRANSPORT_TEXT_LEN} симв.)"
+                )
+
             attachments = inline_keyboard([
                 [callback_button("❌ Не смогу прийти", f"ev_cancel:{event_id}")]
             ])
             sent_resp = await max_client.send_message(
                 user_id=raw_max_user_id(user_id),
-                text=rendered_text,
+                text=clean_text,
                 attachments=attachments,
             )
             external_id = extract_sent_message_id(sent_resp) or (

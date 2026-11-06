@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from max_messenger_bot.api import MaxApiClient
+from max_messenger_bot.api import MaxApiClient, MaxApiError
 from max_messenger_bot.settings import clear_settings_cache, get_settings
 
 
@@ -64,6 +64,36 @@ async def test_answer_callback_keeps_explicit_notification():
     await client.answer_callback("callback-id", notification="Сохранено")
 
     assert session.requests[0][2]["json"] == {"notification": "Сохранено"}
+
+
+@pytest.mark.asyncio
+async def test_send_message_rejects_html_transport_overflow_before_http():
+    client = MaxApiClient("test-token", "https://max.test")
+    session = _Session([])
+    client._session = session
+
+    raw_html = "<b>x</b>" * 520
+    assert len(raw_html) > 4000
+    assert len("x" * 520) < 4000
+
+    with pytest.raises(MaxApiError, match="transport limit"):
+        await client.send_message(chat_id=123, text=raw_html)
+
+    assert session.requests == []
+
+
+@pytest.mark.asyncio
+async def test_send_message_converts_telegram_custom_emoji_to_max_unicode_fallback():
+    client = MaxApiClient("test-token", "https://max.test")
+    session = _Session([_Response(body='{"message":{}}', content_type="application/json")])
+    client._session = session
+
+    await client.send_message(
+        chat_id=123,
+        text='<b>Горячий</b> <tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>',
+    )
+
+    assert session.requests[0][2]["json"]["text"] == "<b>Горячий</b> 🔥"
 
 
 @pytest.mark.asyncio

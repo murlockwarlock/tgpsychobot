@@ -24,6 +24,7 @@ from database import (
     EventDeliveryResolution,
     EventRegistration,
     EventScenario,
+    EventScenarioMedia,
     EventStep,
     User,
     create_event_delivery_force_retry,
@@ -1968,6 +1969,134 @@ async def test_real_postgresql_migration_backfills_delivery_content_version_snap
                 select(EventDelivery.status).where(EventDelivery.id.in_(delivery_ids[1:])).order_by(EventDelivery.id)
             )).scalars().all()
             assert history == ["sent", "uncertain"]
+    finally:
+        await pg_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_real_postgresql_media_mode_migration_and_constraints():
+    """Real PostgreSQL migration test: verifies media_mode column addition, backfill, CHECK constraints, and idempotence."""
+    pg_engine, skip_reason = await _get_safe_postgres_engine()
+    if pg_engine is None:
+        pytest.skip(skip_reason)
+
+    try:
+        async with pg_engine.begin() as conn:
+            await conn.execute(text("DROP SCHEMA public CASCADE;"))
+            await conn.execute(text("CREATE SCHEMA public;"))
+            await conn.run_sync(Base.metadata.create_all)
+
+        # Emulate pre-migration schema: drop media_mode and its constraint
+        async with pg_engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE event_scenarios DROP CONSTRAINT IF EXISTS ck_event_scenarios_media_mode"))
+            await conn.execute(text("ALTER TABLE event_scenarios DROP COLUMN IF EXISTS media_mode"))
+
+        base_now = datetime.utcnow()
+        async with pg_engine.begin() as conn:
+            # Seed legacy user with all NOT NULL columns populated
+            await conn.execute(text(
+                "INSERT INTO users (id, first_name, response_length, can_view_history, accepted_disclaimer, ai_debug_enabled, current_dialogue_id, metadata_json) "
+                "VALUES (8888, 'Legacy User', 'normal', false, false, false, 1, '{}')"
+            ))
+            # Seed legacy webinar with valid non-empty link (ck_event_scenarios_location)
+            await conn.execute(text(
+                "INSERT INTO event_scenarios (id, code, event_type, title, starts_at, duration_minutes, is_active, is_archived, schedule_revision, content_version, media_order, link, created_at, updated_at) "
+                "VALUES (101, 'legacy_event_1', 'webinar', 'Historical Webinar', :starts_at, 120, true, false, 1, 1, 'media_top', 'https://example.test/legacy-webinar', :base_now, :base_now)"
+            ), {"starts_at": base_now + timedelta(days=1), "base_now": base_now})
+            # Seed legacy event step
+            await conn.execute(text(
+                "INSERT INTO event_steps (id, event_id, offset_minutes, message_text, step_version, sort_order, is_archived, include_event_details, created_at, updated_at) "
+                "VALUES (401, 101, 0, 'Legacy step template', 1, 0, false, false, :base_now, :base_now)"
+            ), {"base_now": base_now})
+            # Seed registration and delivery with step_id matching event_steps (ck_event_deliveries_step_kind)
+            await conn.execute(text(
+                "INSERT INTO event_registrations (id, event_id, user_id, status, generation, registration_mode, registered_at, updated_at) "
+                "VALUES (201, 101, 8888, 'started', 1, 'standard', :reg_at, :reg_at)"
+            ), {"reg_at": base_now})
+            await conn.execute(text(
+                "INSERT INTO event_deliveries (id, event_id, user_id, registration_id, step_id, retry_index, message_kind, delivery_key, due_at, next_attempt_at, expires_at, schedule_revision, registration_generation, content_version_snapshot, platform, status, attempt_count, created_at, updated_at) "
+                "VALUES (301, 101, 8888, 201, 401, 0, 'scheduled_step', 'ev:101:reg:201:step:401:r0', :due_at, :next_at, :exp_at, 1, 1, 1, 'telegram', 'pending', 0, :base_now, :base_now)"
+            ), {"due_at": base_now, "next_at": base_now, "exp_at": base_now + timedelta(hours=2), "base_now": base_now})
+
+        sessions = async_sessionmaker(pg_engine, expire_on_commit=False, class_=AsyncSession)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(database, "engine", pg_engine)
+            mp.setattr(database, "async_session_maker", sessions)
+            # 1. Run migration via init_db
+            await database.init_db()
+            # 2. Verify idempotence: run init_db again without error
+            await database.init_db()
+
+        # Verify historical scenario backfilled to 'legacy_auto' while preserving all existing data
+        async with sessions() as session:
+            scen = await session.get(EventScenario, 101)
+            assert scen is not None
+            assert scen.id == 101
+            assert scen.title == "Historical Webinar"
+            assert scen.media_mode == "legacy_auto"
+            assert scen.media_order == "media_top"
+
+            delivery = await session.get(EventDelivery, 301)
+            assert delivery is not None
+            assert delivery.status == "pending"
+
+        # Verify CHECK constraint ck_event_scenarios_media_mode rejects invalid values
+        async with sessions() as session:
+            with pytest.raises(IntegrityError):
+                await session.execute(text(
+                    "INSERT INTO event_scenarios (code, event_type, title, starts_at, duration_minutes, is_active, is_archived, schedule_revision, content_version, media_order, media_mode, link, created_at, updated_at) "
+                    "VALUES ('invalid_scen', 'webinar', 'Invalid Mode', :starts_at, 120, true, false, 1, 1, 'media_top', 'invalid_mode', 'https://example.test/invalid', :base_now, :base_now)"
+                ), {"starts_at": base_now + timedelta(days=2), "base_now": base_now})
+                await session.commit()
+
+        # Verify new event creation with explicit formats works on PostgreSQL
+        from event_admin_service import create_scenario, update_scenario_fields
+        scen_sep = await create_scenario(
+            sessions,
+            code="new_pg_separate_event",
+            event_type="webinar",
+            link="https://example.test/pg-sep",
+            title="New PG Separate Event",
+            starts_at_utc=base_now + timedelta(days=3),
+            media_format="separate_text_top",
+        )
+        assert scen_sep.media_mode == "separate"
+        assert scen_sep.media_order == "text_top"
+        assert scen_sep.media_format == "separate_text_top"
+
+        # Create scenario in separate format, attach exactly 1 photo, and update to caption mode
+        scen_cap = await create_scenario(
+            sessions,
+            code="new_pg_caption_event",
+            event_type="webinar",
+            link="https://example.test/pg-cap",
+            title="New PG Caption Event",
+            starts_at_utc=base_now + timedelta(days=4),
+            media_format="separate_media_top",
+        )
+        async with sessions() as session:
+            media = EventScenarioMedia(
+                event_id=scen_cap.id,
+                file_type="photo",
+                file_id="tg_photo_pg_test",
+                max_token="max_photo_pg_test",
+                sort_order=0,
+            )
+            session.add(media)
+            await session.commit()
+
+        updated_cap = await update_scenario_fields(
+            sessions,
+            scen_cap.id,
+            media_format="caption",
+        )
+        assert updated_cap.media_mode == "caption"
+        assert updated_cap.media_format == "caption"
+
+        async with sessions() as session:
+            scen_cap_db = await session.get(EventScenario, scen_cap.id)
+            assert scen_cap_db.media_mode == "caption"
+            assert scen_cap_db.media_format == "caption"
     finally:
         await pg_engine.dispose()
 

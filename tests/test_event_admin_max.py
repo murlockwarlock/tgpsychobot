@@ -2,6 +2,7 @@ import io
 import os
 import re
 import json
+import asyncio
 import html
 from functools import wraps
 from datetime import datetime, timedelta
@@ -220,9 +221,14 @@ _MAX_EVENT_BUTTON_CONTRACTS = (
     (re.compile(r"admin_ev_edit_duration_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_duration", "max_event_edit_duration"),
     (re.compile(r"admin_ev_edit_link_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_link", "max_event_edit_link"),
     (re.compile(r"admin_ev_edit_place_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_place", "max_event_edit_place"),
+    (re.compile(r"admin_ev_format_menu_\d+$"), "navigation", "events/edit-format", "max.events.edit", "show_format_menu", None),
+    (re.compile(r"admin_ev_set_fmt_\d+_[a-z_]+$"), "mutation", "events/edit-format", "max.events.edit", "set_format_handler", None),
+    (re.compile(r"admin_ev_preview_tg_\d+$"), "navigation", "events/preview-tg", "max.events.edit", "show_telegram_preview", None),
+    (re.compile(r"admin_ev_preview_max_\d+$"), "navigation", "events/preview-max", "max.events.edit", "show_max_preview", None),
     (re.compile(r"admin_ev_edit_description_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_description", "max_event_edit_description"),
     (re.compile(r"admin_ev_edit_media_\d+$"), "navigation", "events/edit-media", "max.description-media", "show_media_editor", "max_event_edit_media"),
     (re.compile(r"admin_ev_description_save_\d+$"), "mutation", "events/edit", "max.description-media", "save_description", None),
+    (re.compile(r"admin_ev_cancel_draft_\d+$"), "destructive", "events/edit", "max.events.edit", "cancel_draft", None),
     (re.compile(r"admin_ev_description_delete_\d+$"), "destructive", "events/edit", "max.description-media", "delete_description", "max_event_edit_description"),
     (re.compile(r"admin_ev_media_add_\d+$"), "navigation", "events/edit-media", "max.description-media", "start_add_media", "max_event_edit_media_add"),
     (re.compile(r"admin_ev_media_save_\d+$"), "mutation", "events/edit-media", "max.description-media", "save_media", None),
@@ -285,7 +291,7 @@ _MAX_REAL_JOURNEY_TESTS = {
     ),
     "max.description-media": (
         "test_max_description_and_media_edit_routes",
-        "test_max_media_back_preserves_draft_and_cancel_state_is_clear",
+        "test_max_media_back_route_preserves_unsaved_draft",
         "test_max_paginated_edit_roundtrip_and_delete_stays_draft",
     ),
     "max.steps.roundtrip": (
@@ -513,6 +519,7 @@ async def test_max_visible_event_buttons_dispatch_through_application_contract(d
         "start_edit_step_offset_custom", "step_move_up", "step_move_down", "ask_delete_step",
         "confirm_delete_step", "show_step", "show_stats", "show_problems", "show_problem_detail",
         "start_resolve", "show_test_send_menu", "do_test_send",
+        "show_format_menu", "set_format_handler", "show_telegram_preview", "show_max_preview",
     }
     routed: list[str] = []
 
@@ -675,6 +682,7 @@ async def test_max_visible_event_buttons_execute_real_application_journeys(db_se
         "start_edit_step_offset_custom", "step_move_up", "step_move_down", "ask_delete_step",
         "confirm_delete_step", "show_step", "show_stats", "show_problems", "show_problem_detail",
         "start_resolve", "show_test_send_menu", "do_test_send",
+        "show_format_menu", "set_format_handler", "show_telegram_preview", "show_max_preview",
     }
 
     def wrap_service(name: str, original):
@@ -1001,6 +1009,257 @@ async def test_max_long_title_navigation_preserves_page_and_archive_context(db_s
 
 
 @pytest.mark.asyncio
+async def test_max_real_handle_update_paginated_format_save_cancel_journey(db_session_maker, monkeypatch):
+    """MAX BotApplication ingress journey against the recorded HTTP JSON boundary."""
+    from event_admin_service import create_scenario
+    from max_messenger_bot import app as max_app_module
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    base_start = datetime.utcnow() + timedelta(days=2)
+    target = await create_scenario(
+        db_session_maker,
+        code="max_real_page_two_target",
+        event_type="webinar",
+        title="MAX page two target",
+        starts_at_utc=base_start,
+        link="https://example.test/max-page-two-target",
+    )
+    for index in range(max_admin_events.PAGE_SIZE):
+        await create_scenario(
+            db_session_maker,
+            code=f"max_real_page_two_fill_{index}",
+            event_type="webinar",
+            title=f"MAX page two filler {index}",
+            starts_at_utc=base_start + timedelta(days=index + 1),
+            link=f"https://example.test/max-page-two/{index}",
+        )
+
+    transport = _RecordedMaxSession()
+    client = MaxApiClient(token="test-token", base_url="https://max.test")
+    client._session = transport
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    update_counter = 0
+
+    def message_body() -> dict:
+        for request in reversed(transport.requests):
+            if request["url"].endswith("/messages"):
+                return request["body"]
+        raise AssertionError("No MAX /messages request was recorded")
+
+    def button_payload(body: dict, prefix: str) -> str:
+        for attachment in body.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    payload = button.get("payload")
+                    if payload and payload.startswith(prefix):
+                        return payload
+        raise AssertionError(f"No visible MAX callback with prefix {prefix!r}")
+
+    async def press(payload: str) -> dict:
+        nonlocal update_counter
+        update_counter += 1
+        transport.requests.clear()
+        await app.handle_update(
+            {
+                "update_type": "message_callback",
+                "update_id": f"max-journey-cb-{update_counter}",
+                "callback": {
+                    "callback_id": f"max-journey-callback-{update_counter}",
+                    "payload": payload,
+                    "user": {"user_id": 456, "first_name": "Admin", "username": "admin"},
+                },
+                "message": {
+                    "mid": f"max-journey-message-{update_counter}",
+                    "recipient": {"chat_id": 123},
+                    "body": {"text": "admin"},
+                },
+            }
+        )
+        body = message_body()
+        json.loads(json.dumps(body, ensure_ascii=False))
+        return body
+
+    async def send_text(text: str) -> dict:
+        nonlocal update_counter
+        update_counter += 1
+        transport.requests.clear()
+        await app.handle_update(
+            {
+                "update_type": "message_created",
+                "update_id": f"max-journey-message-{update_counter}",
+                "message": {
+                    "mid": f"max-journey-incoming-{update_counter}",
+                    "recipient": {"chat_id": 123},
+                    "sender": {"user_id": 456, "first_name": "Admin", "username": "admin"},
+                    "body": {"text": text},
+                },
+            }
+        )
+        body = message_body()
+        json.loads(json.dumps(body, ensure_ascii=False))
+        return body
+
+    try:
+        listing = await press("admin_events")
+        assert "Страница 1 из 2" in listing["text"]
+        listing = await press(button_payload(listing, "admin_ev_page_1_0"))
+        assert "Страница 2 из 2" in listing["text"]
+        target_callback = button_payload(listing, f"admin_ev_open_{target.id}_1_0")
+
+        card = await press(target_callback)
+        assert "MAX page two target" in card["text"]
+        edit_menu = await press(button_payload(card, f"admin_ev_edit_menu_{target.id}_1_0"))
+        format_menu = await press(button_payload(edit_menu, f"admin_ev_format_menu_{target.id}"))
+        assert button_payload(format_menu, f"admin_ev_edit_menu_{target.id}_1_0")
+        edit_menu = await press(button_payload(format_menu, f"admin_ev_edit_menu_{target.id}_1_0"))
+
+        description_screen = await press(button_payload(edit_menu, f"admin_ev_edit_description_{target.id}"))
+        draft_screen = await send_text("Описание для отмены")
+        edit_menu = await press(button_payload(draft_screen, f"admin_ev_edit_menu_{target.id}_1_0"))
+        card = await press(button_payload(edit_menu, f"admin_ev_cancel_draft_{target.id}"))
+        assert "Карточка мероприятия" in card["text"]
+        assert "Описание для отмены" not in card["text"]
+        async with db_session_maker() as session:
+            assert (await session.get(EventScenario, target.id)).description is None
+
+        edit_menu = await press(button_payload(card, f"admin_ev_edit_menu_{target.id}_1_0"))
+        description_screen = await press(button_payload(edit_menu, f"admin_ev_edit_description_{target.id}"))
+        draft_screen = await send_text("Описание для сохранения")
+        card = await press(button_payload(draft_screen, f"admin_ev_description_save_{target.id}"))
+        assert "Описание для сохранения" in card["text"]
+        async with db_session_maker() as session:
+            assert (await session.get(EventScenario, target.id)).description == "Описание для сохранения"
+
+        listing = await press(button_payload(card, "admin_ev_page_1_0"))
+        assert "Страница 2 из 2" in listing["text"]
+        assert "max_real_page_two_target" in listing["text"]
+    finally:
+        await app.states.clear(MAX_ID_OFFSET + 456)
+
+
+@pytest.mark.asyncio
+async def test_max_handle_update_stale_callbacks_preserve_foreign_draft_and_db(db_session_maker, monkeypatch):
+    from event_admin_service import create_scenario
+    from max_messenger_bot import app as max_app_module
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    event_a = await create_scenario(
+        db_session_maker,
+        code="max_stale_event_a",
+        event_type="webinar",
+        title="MAX Event A",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/max-stale-a",
+        description="A original",
+    )
+    event_b = await create_scenario(
+        db_session_maker,
+        code="max_stale_event_b",
+        event_type="webinar",
+        title="MAX Event B",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/max-stale-b",
+        description="B original",
+    )
+    client = MaxApiClient(token="test-token", base_url="https://max.test")
+    transport = _RecordedMaxSession()
+    client._session = transport
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    await app.states.set(
+        MAX_ID_OFFSET + 456,
+        123,
+        "max_event_edit_description",
+        {
+            "event_id": event_a.id,
+            "description_draft": "A draft that must remain isolated",
+            "event_list_back": "admin_ev_page_1_0",
+        },
+    )
+
+    async def press(payload: str, update_number: int):
+        transport.requests.clear()
+        await app.handle_update(
+            {
+                "update_type": "message_callback",
+                "update_id": f"max-stale-{update_number}",
+                "callback": {
+                    "callback_id": f"max-stale-callback-{update_number}",
+                    "payload": payload,
+                    "user": {"user_id": 456, "first_name": "Admin", "username": "admin"},
+                },
+                "message": {
+                    "mid": f"max-stale-message-{update_number}",
+                    "recipient": {"chat_id": 123},
+                    "body": {"text": "admin"},
+                },
+            }
+        )
+
+    try:
+        await press(f"admin_ev_description_save_{event_b.id}", 1)
+        await press(f"admin_ev_cancel_draft_{event_b.id}", 2)
+        await press(f"admin_ev_edit_menu_{event_b.id}_1_0", 3)
+        snapshot = await app.states.get(MAX_ID_OFFSET + 456)
+        assert snapshot is not None
+        assert snapshot.data["event_id"] == event_a.id
+        assert snapshot.data["description_draft"] == "A draft that must remain isolated"
+        assert transport.requests
+        assert any(request["url"].endswith("/answers") for request in transport.requests), transport.requests
+
+        async with db_session_maker() as session:
+            saved_a = await session.get(EventScenario, event_a.id)
+            saved_b = await session.get(EventScenario, event_b.id)
+            assert saved_a.description == "A original"
+            assert saved_b.description == "B original"
+    finally:
+        await app.states.clear(MAX_ID_OFFSET + 456)
+
+
+@pytest.mark.asyncio
+async def test_max_concurrent_save_and_cancel_have_one_atomic_winner(db_session_maker, mock_client, monkeypatch):
+    from event_admin_service import create_scenario
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_concurrent_draft",
+        event_type="webinar",
+        title="Concurrent draft",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/max-concurrent",
+        description="Original",
+    )
+    states = MemoryStateStore()
+    await states.set(
+        456,
+        123,
+        "max_event_edit_description",
+        {"event_id": scen.id, "description_draft": "Saved once", "event_list_back": "admin_events"},
+    )
+
+    await asyncio.gather(
+        max_admin_events.save_description(mock_client, states, 123, 456, event_id=scen.id),
+        max_admin_events.cancel_draft(mock_client, states, 123, 456, scen.id),
+    )
+
+    snapshot = await states.get(456)
+    assert snapshot is None
+    async with db_session_maker() as session:
+        stored = await session.get(EventScenario, scen.id)
+        assert stored.description in {"Original", "Saved once"}
+
+
+@pytest.mark.asyncio
 async def test_max_problem_delivery_page_roundtrip_uses_current_page(monkeypatch):
     selected = DeliveryItem(
         id=605,
@@ -1323,6 +1582,7 @@ async def test_max_description_chunks_append_and_runtime_split_after_save(db_ses
         title="Chunked MAX description",
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://example.test/max-chunks",
+        media_mode="legacy_auto",
     )
     await max_admin_events.start_edit_description(mock_client, states, 123, 456, scen.id)
     await max_admin_events.receive_edit_description(mock_client, states, 123, 456, "A" * 3000)
@@ -1431,7 +1691,7 @@ async def test_max_media_back_preserves_draft_and_cancel_state_is_clear(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_max_media_cancel_route_clears_unsaved_draft(states, mock_client, monkeypatch):
+async def test_max_media_back_route_preserves_unsaved_draft(states, mock_client, monkeypatch):
     app = MaxBotApplication(mock_client)
     app.states = states
     monkeypatch.setattr("max_messenger_bot.app.common.is_admin", AsyncMock(return_value=True))
@@ -1447,7 +1707,10 @@ async def test_max_media_cancel_route_clears_unsaved_draft(states, mock_client, 
         sender=Sender(user_id=456, username="admin", first_name="Admin", last_name=None),
     )
     await app._handle_callback_impl(callback)
-    assert await states.get(456) is None
+    snapshot = await states.get(456)
+    assert snapshot is not None
+    assert snapshot.state == "max_event_edit_media"
+    assert snapshot.data["media_draft"][0]["file_type"] == "photo"
 
 
 @pytest.mark.asyncio
@@ -1463,6 +1726,7 @@ async def test_max_paginated_edit_roundtrip_and_delete_stays_draft(db_session_ma
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://example.test/max-paginated-edit",
         description="x" * 5000,
+        media_mode="legacy_auto",
     )
 
     await max_admin_events.show_scenario(mock_client, 123, scen.id, back="admin_ev_page_2_1")
@@ -1490,8 +1754,14 @@ async def test_max_paginated_edit_roundtrip_and_delete_stays_draft(db_session_ma
     async with db_session_maker() as session:
         saved = await session.get(EventScenario, scen.id)
         assert saved.description is None
+    saved_text = mock_client.send_message.call_args.kwargs["text"]
     saved_buttons = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
-    assert saved_buttons[0][0]["payload"] == f"admin_ev_open_{scen.id}_2_1"
+    assert "Изменения мероприятия сохранены" in saved_text
+    assert any(
+        button.get("payload") == "admin_ev_page_2_1"
+        for row in saved_buttons
+        for button in row
+    )
 
 
 @pytest.mark.asyncio
@@ -1687,6 +1957,7 @@ async def test_max_dispatcher_description_chunks_save_reopen_and_runtime_split(d
         title="MAX dispatcher description",
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://example.test/max-dispatcher-description",
+        media_mode="legacy_auto",
     )
     app = MaxBotApplication(mock_client)
     app.states = states
@@ -2268,3 +2539,1412 @@ async def test_max_long_title_application_list_edit_cancel_save_reopen(db_sessio
         assert "Мероприятия и цепочки" in listing.kwargs["text"]
     finally:
         await app.states.clear(456)
+
+
+@pytest.mark.asyncio
+async def test_max_real_application_limits_error_screen_edit_and_reopen_journey(db_session_maker, monkeypatch):
+    """Real MAX Application journey:
+
+    1. Open event description editor and enter long description exceeding safe caption limit.
+    2. Press the real Save button.
+    3. Receive validated outgoing message explaining limit excess (platform, actual length, limit, excess, recommendation).
+    4. Verify working edit buttons on error screen (edit description, edit title, format menu, save, cancel draft).
+    5. Test unified draft across format change and cancel draft.
+    6. Fix description text to a valid length.
+    7. Press Save and verify success confirmation.
+    8. Reopen event card and verify updated description in DB and card view.
+    """
+    from max_messenger_bot import app as max_app_module
+    from max_messenger_bot.app import MaxBotApplication
+    from max_messenger_bot.api import MaxApiClient
+    from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
+    from event_admin_service import create_scenario, update_scenario_fields
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    now = datetime.utcnow()
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_journey_limits",
+        event_type="webinar",
+        title="MAX Journey Limits Webinar",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/max-journey",
+        media_format="separate_media_top",
+    )
+    async with db_session_maker() as session:
+        session.add(EventScenarioMedia(
+            event_id=scen.id,
+            file_type="photo",
+            file_id="max_photo_1",
+            max_token="max_photo_1",
+            source_platform="max",
+            sort_order=0,
+        ))
+        await session.commit()
+    await update_scenario_fields(db_session_maker, scen.id, media_format="caption")
+
+    client = AsyncMock(spec=MaxApiClient)
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+
+    async def press(payload):
+        client.reset_mock()
+        await app.handle_callback(
+            IncomingCallback(
+                raw={},
+                callback_id=f"journey-{payload}",
+                payload=payload,
+                chat_id=123,
+                message_id=None,
+                sender=sender,
+            )
+        )
+        assert client.send_message.called, f"No message sent for callback {payload}"
+        return client.send_message.await_args_list[-1]
+
+    async def send_msg(text):
+        client.reset_mock()
+        await app.handle_message(
+            IncomingMessage(
+                raw={},
+                message_id="msg-journey",
+                chat_id=123,
+                sender=sender,
+                text=text,
+            )
+        )
+        assert client.send_message.called, f"No message sent for text {text[:20]}"
+        return client.send_message.await_args_list[-1]
+
+    def get_buttons(call):
+        res = []
+        for attachment in call.kwargs.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    res.append((button.get("payload", ""), button.get("text", "")))
+        return res
+
+    try:
+        # Step 1: Open description editor
+        call = await press(f"admin_ev_edit_description_{scen.id}")
+        assert "Описание мероприятия" in call.kwargs["text"]
+
+        # Step 2: Feed long description exceeding caption limit (950 chars > 900)
+        long_desc = "Д" * 950
+        call = await send_msg(long_desc)
+        assert "Черновик обновлён" in call.kwargs["text"]
+
+        # Step 3: Press real Save button
+        call = await press(f"admin_ev_description_save_{scen.id}")
+        error_text = call.kwargs["text"]
+        assert "Невозможно сохранить изменения!" in error_text
+        assert "• Платформа: <b>TELEGRAM</b>" in error_text or "• Платформа: <b>MAX</b>" in error_text
+        assert "Фактическая длина:" in error_text
+        assert "лимит:" in error_text
+        assert "Превышение:" in error_text
+        assert "Рекомендация:" in error_text
+
+        # Step 4: Verify working edit buttons on error screen
+        buttons = get_buttons(call)
+        button_payloads = [b[0] for b in buttons]
+        assert f"admin_ev_edit_description_{scen.id}" in button_payloads
+        assert f"admin_ev_edit_title_{scen.id}" in button_payloads
+        assert f"admin_ev_format_menu_{scen.id}" in button_payloads
+        assert f"admin_ev_description_save_{scen.id}" in button_payloads
+        assert f"admin_ev_cancel_draft_{scen.id}" in button_payloads
+
+        # Test unified draft: edit title while draft exists
+        call = await press(f"admin_ev_edit_title_{scen.id}")
+        assert "новое название" in call.kwargs["text"]
+        call = await send_msg("MAX Новое Название 🎯")
+        assert "Название в черновике обновлено" in call.kwargs["text"]
+
+        # Check DB is still untouched
+        async with db_session_maker() as session:
+            unchanged = await session.get(EventScenario, scen.id)
+            assert unchanged.title == "MAX Journey Limits Webinar"
+            assert unchanged.description is None
+
+        # Test cancel draft: click cancel draft button
+        call = await press(f"admin_ev_cancel_draft_{scen.id}")
+        assert any("Черновик сброшен" in c.kwargs.get("text", "") for c in client.send_message.await_args_list)
+        assert "Карточка мероприятия" in call.kwargs["text"]
+        state_after_cancel = await app.states.get(456)
+        assert state_after_cancel is None or state_after_cancel.state is None
+
+        # Re-open description editor and feed long description again
+        call = await press(f"admin_ev_edit_description_{scen.id}")
+        call = await send_msg(long_desc)
+        call = await press(f"admin_ev_description_save_{scen.id}")
+        assert "Невозможно сохранить" in call.kwargs["text"]
+
+        # Step 5: Click edit description button from error screen
+        call = await press(f"admin_ev_edit_description_{scen.id}")
+        assert "Описание мероприятия" in call.kwargs["text"]
+
+        # Step 6: Fix text to valid length
+        valid_desc = "Корректное описание мероприятия для MAX."
+        call = await send_msg(valid_desc)
+        assert "Черновик обновлён" in call.kwargs["text"]
+
+        # Step 7: Click Save
+        call = await press(f"admin_ev_description_save_{scen.id}")
+        assert "Карточка мероприятия" in call.kwargs["text"]
+        assert "Изменения мероприятия сохранены" in call.kwargs["text"]
+
+        # Step 8: Reopen event card and check result
+        call = await press(f"admin_ev_open_{scen.id}")
+        assert valid_desc in call.kwargs["text"]
+
+        async with db_session_maker() as session:
+            refreshed = await session.get(EventScenario, scen.id)
+            assert refreshed.description == valid_desc
+            assert refreshed.media_mode == "caption"
+    finally:
+        await app.states.clear(456)
+
+
+@pytest.mark.asyncio
+async def test_max_cross_event_draft_stale_callback_rejection_journey(db_session_maker, monkeypatch):
+    """MAX Application negative journey:
+    Admin has active draft for Event A.
+    Stale callback buttons for Event B must NOT save, reset, or transfer draft of Event A.
+    DB records for both events remain completely unchanged.
+    """
+    from max_messenger_bot import app as max_app_module
+    from max_messenger_bot.app import MaxBotApplication
+    from max_messenger_bot.api import MaxApiClient
+    from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
+    from event_admin_service import create_scenario
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    now = datetime.utcnow()
+    event_a = await create_scenario(
+        db_session_maker,
+        code="max_draft_event_a",
+        event_type="webinar",
+        title="MAX Event A",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/max-a",
+        description="Original MAX Event A Description",
+        media_format="separate_media_top",
+    )
+    event_b = await create_scenario(
+        db_session_maker,
+        code="max_draft_event_b",
+        event_type="webinar",
+        title="MAX Event B",
+        starts_at_utc=now + timedelta(days=3),
+        link="https://example.test/max-b",
+        description="Original MAX Event B Description",
+        media_format="separate_media_top",
+    )
+
+    client = AsyncMock(spec=MaxApiClient)
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+
+    async def press(payload):
+        client.reset_mock()
+        await app.handle_callback(
+            IncomingCallback(
+                raw={},
+                callback_id=f"cb-{payload}",
+                payload=payload,
+                chat_id=123,
+                message_id=None,
+                sender=sender,
+            )
+        )
+        return client.send_message.await_args_list[-1] if client.send_message.called else None
+
+    async def send_msg(text):
+        client.reset_mock()
+        await app.handle_message(
+            IncomingMessage(
+                raw={},
+                message_id=f"msg-{len(text)}",
+                chat_id=123,
+                sender=sender,
+                text=text,
+            )
+        )
+        return client.send_message.await_args_list[-1] if client.send_message.called else None
+
+    try:
+        # Step 1: Open description editor for Event A and input draft
+        await press(f"admin_ev_edit_description_{event_a.id}")
+        draft_text = "Новый незафиксированный черновик для MAX Event A"
+        await send_msg(draft_text)
+
+        # Step 2: Stale Save button from Event B
+        call = await press(f"admin_ev_description_save_{event_b.id}")
+        assert call is not None
+        assert "Черновик принадлежит другому мероприятию" in call.kwargs["text"]
+
+        # Check DB records are untouched
+        async with db_session_maker() as session:
+            ea = await session.get(EventScenario, event_a.id)
+            eb = await session.get(EventScenario, event_b.id)
+            assert ea.description == "Original MAX Event A Description"
+            assert eb.description == "Original MAX Event B Description"
+
+        # Step 3: Stale Cancel button from Event B
+        call = await press(f"admin_ev_cancel_draft_{event_b.id}")
+        assert call is not None
+        assert "Черновик принадлежит другому мероприятию" in call.kwargs["text"]
+
+        # Check DB and state still untouched
+        async with db_session_maker() as session:
+            ea = await session.get(EventScenario, event_a.id)
+            eb = await session.get(EventScenario, event_b.id)
+            assert ea.description == "Original MAX Event A Description"
+            assert eb.description == "Original MAX Event B Description"
+        state_obj = await app.states.get(456)
+        assert state_obj.data.get("event_id") == event_a.id
+        assert state_obj.data.get("description_draft") == draft_text
+
+        # Step 4: Stale Format selection from Event B
+        call = await press(f"admin_ev_set_fmt_{event_b.id}_caption")
+        assert call is not None
+        assert "Сначала завершите или отмените" in call.kwargs["text"]
+
+        # Step 5: Stale Edit Title from Event B
+        call = await press(f"admin_ev_edit_title_{event_b.id}")
+        assert call is not None
+        assert "Сначала завершите или отмените" in call.kwargs["text"]
+
+        # Other stale card mutations must be rejected before they can change
+        # Event B or replace the active Event A draft.
+        for stale_payload in (
+            f"admin_ev_toggle_{event_b.id}",
+            f"admin_ev_archive_yes_{event_b.id}",
+            f"admin_ev_steps_{event_b.id}_2_1",
+        ):
+            await press(stale_payload)
+            assert any(
+                "Сначала завершите или отмените" in c.kwargs.get("notification", "")
+                for c in client.answer_callback.await_args_list
+            ) or any(
+                "Сначала завершите или отмените" in c.kwargs.get("text", "")
+                for c in client.send_message.await_args_list
+            )
+            state_obj = await app.states.get(456)
+            assert state_obj.data.get("event_id") == event_a.id
+            assert state_obj.data.get("description_draft") == draft_text
+
+        # Step 6: Valid Save for Event A
+        await press(f"admin_ev_description_save_{event_a.id}")
+        assert any("сохранены" in c.kwargs.get("text", "") for c in client.send_message.await_args_list)
+
+        # Verify Event A in DB is updated, Event B is untouched
+        async with db_session_maker() as session:
+            ea = await session.get(EventScenario, event_a.id)
+            eb = await session.get(EventScenario, event_b.id)
+            assert ea.description == draft_text
+            assert eb.description == "Original MAX Event B Description"
+    finally:
+        await app.states.clear(456)
+
+
+@pytest.mark.asyncio
+async def test_max_html_length_mismatch_application_limits_journey(db_session_maker, monkeypatch):
+    """MAX Application journey for HTML length limit mismatch:
+    Visible text fits within limit, but raw HTML serialization exceeds 3900/4000 limit.
+    Rejection explains MAX limits; DB unchanged; fixing with shorter HTML commits successfully.
+    """
+    from max_messenger_bot import app as max_app_module
+    from max_messenger_bot.app import MaxBotApplication
+    from max_messenger_bot.api import MaxApiClient
+    from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
+    from event_admin_service import create_scenario
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    now = datetime.utcnow()
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_html_mismatch_ev",
+        event_type="webinar",
+        title="HTML Mismatch Webinar",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/html-mismatch",
+        media_format="separate_media_top",
+    )
+
+    client = AsyncMock(spec=MaxApiClient)
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+
+    async def press(payload):
+        client.reset_mock()
+        await app.handle_callback(
+            IncomingCallback(
+                raw={},
+                callback_id=f"cb-{payload}",
+                payload=payload,
+                chat_id=123,
+                message_id=None,
+                sender=sender,
+            )
+        )
+        return client.send_message.await_args_list[-1] if client.send_message.called else None
+
+    async def send_msg(text):
+        client.reset_mock()
+        await app.handle_message(
+            IncomingMessage(
+                raw={},
+                message_id=f"msg-{len(text)}",
+                chat_id=123,
+                sender=sender,
+                text=text,
+            )
+        )
+        return client.send_message.await_args_list[-1] if client.send_message.called else None
+
+    try:
+        # Open description editor
+        await press(f"admin_ev_edit_description_{scen.id}")
+
+        # Construct payload with many HTML tags: visible plain text ~2000 chars,
+        # but raw HTML length > 4000 characters.
+        long_html = "<b>текст</b>" * 450
+        assert len(long_html) > 4000
+        from event_content_validator import render_plain_text_for_max
+        assert len(render_plain_text_for_max(long_html)) < 3000
+
+        await send_msg(long_html)
+
+        # Press Save
+        call = await press(f"admin_ev_description_save_{scen.id}")
+        assert call is not None
+        error_text = call.kwargs["text"]
+        assert "Невозможно сохранить изменения!" in error_text
+        assert "• Платформа: <b>MAX</b>" in error_text
+        assert "Фактическая длина:" in error_text
+        assert "Превышение:" in error_text
+
+        # Verify DB is unchanged
+        async with db_session_maker() as session:
+            unchanged = await session.get(EventScenario, scen.id)
+            assert unchanged.description is None
+
+        # Fix description to valid HTML text
+        valid_html = "<b>Короткое корректное описание вебинара</b>"
+        await press(f"admin_ev_edit_description_{scen.id}")
+        await press(f"admin_ev_description_delete_{scen.id}")
+        await send_msg(valid_html)
+
+        # Press Save again
+        await press(f"admin_ev_description_save_{scen.id}")
+        assert any("сохранены" in c.kwargs.get("text", "") for c in client.send_message.await_args_list)
+
+        # Verify DB is updated
+        async with db_session_maker() as session:
+            refreshed = await session.get(EventScenario, scen.id)
+            assert refreshed.description == valid_html
+    finally:
+        await app.states.clear(456)
+
+
+@pytest.mark.asyncio
+async def test_max_back_preserves_draft_across_format_title_desc_preview_journey(db_session_maker, monkeypatch):
+    """MAX Application journey verifying Back buttons preserve active draft:
+    Return from format menu, edit title, preview TG, preview MAX preserves StateStore draft.
+    Cancel draft explicitly discards it.
+    """
+    from max_messenger_bot import app as max_app_module
+    from max_messenger_bot.app import MaxBotApplication
+    from max_messenger_bot.api import MaxApiClient
+    from max_messenger_bot.models import IncomingCallback, IncomingMessage, Sender
+    from event_admin_service import create_scenario
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    now = datetime.utcnow()
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_draft_preservation_ev",
+        event_type="webinar",
+        title="Original Draft Webinar",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/draft-preservation",
+        description="Original description",
+        media_format="separate_media_top",
+    )
+
+    client = AsyncMock(spec=MaxApiClient)
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+
+    async def press(payload):
+        client.reset_mock()
+        await app.handle_callback(
+            IncomingCallback(
+                raw={},
+                callback_id=f"cb-{payload}",
+                payload=payload,
+                chat_id=123,
+                message_id=None,
+                sender=sender,
+            )
+        )
+        return client.send_message.await_args_list[-1] if client.send_message.called else None
+
+    async def send_msg(text):
+        client.reset_mock()
+        await app.handle_message(
+            IncomingMessage(
+                raw={},
+                message_id=f"msg-{len(text)}",
+                chat_id=123,
+                sender=sender,
+                text=text,
+            )
+        )
+        return client.send_message.await_args_list[-1] if client.send_message.called else None
+
+    def get_buttons(call):
+        res = []
+        for att in call.kwargs.get("attachments") or []:
+            for row in att.get("payload", {}).get("buttons", []):
+                for b in row:
+                    res.append((b.get("payload"), b.get("text")))
+        return res
+
+    try:
+        # Step 1: Open edit description and add draft
+        await press(f"admin_ev_edit_description_{scen.id}")
+        await send_msg("Несохранённый текст описания для проверки Back")
+
+        # Step 2: Open edit title and add draft title
+        await press(f"admin_ev_edit_title_{scen.id}")
+        await send_msg("Новое название в черновике")
+
+        # Step 3: Open format menu and select new format
+        await press(f"admin_ev_format_menu_{scen.id}")
+        call = await press(f"admin_ev_set_fmt_{scen.id}_separate_text_top")
+        assert "Черновик ещё не сохранён" in call.kwargs["text"]
+
+        # Back from format menu -> edit menu
+        call = await press(f"admin_ev_edit_menu_{scen.id}")
+        assert "Есть несохранённый черновик" in call.kwargs["text"]
+        button_payloads = [b[0] for b in get_buttons(call)]
+        assert f"admin_ev_description_save_{scen.id}" in button_payloads
+        assert f"admin_ev_cancel_draft_{scen.id}" in button_payloads
+
+        # Step 4: Open TG preview and click Back
+        call = await press(f"admin_ev_preview_tg_{scen.id}")
+        assert "Предпросмотр доставки (Telegram)" in call.kwargs["text"]
+        call = await press(f"admin_ev_edit_menu_{scen.id}")
+        assert "Есть несохранённый черновик" in call.kwargs["text"]
+
+        # Step 5: Open MAX preview and click Back
+        call = await press(f"admin_ev_preview_max_{scen.id}")
+        assert "Предпросмотр доставки (MAX)" in call.kwargs["text"]
+        call = await press(f"admin_ev_edit_menu_{scen.id}")
+        assert "Есть несохранённый черновик" in call.kwargs["text"]
+
+        # Step 6: Verify StateStore still retains all draft properties
+        state_obj = await app.states.get(456)
+        assert state_obj.data.get("event_id") == scen.id
+        assert state_obj.data.get("description_draft") == "Несохранённый текст описания для проверки Back"
+        assert state_obj.data.get("draft_title") == "Новое название в черновике"
+        assert state_obj.data.get("draft_format") == "separate_text_top"
+
+        # Step 7: Cancel draft -> StateStore cleared
+        await press(f"admin_ev_cancel_draft_{scen.id}")
+        assert any("Черновик сброшен" in c.kwargs.get("text", "") for c in client.send_message.await_args_list)
+
+        # Verify DB is unchanged
+        async with db_session_maker() as session:
+            unchanged = await session.get(EventScenario, scen.id)
+            assert unchanged.title == "Original Draft Webinar"
+            assert unchanged.description == "Original description"
+            assert unchanged.media_format == "separate_media_top"
+    finally:
+        await app.states.clear(456)
+
+
+@pytest.mark.asyncio
+async def test_max_custom_emoji_fallback_render(db_session_maker, monkeypatch):
+    """MAX custom emoji render:
+    Scenario title containing Telegram <tg-emoji> entity falls back to Unicode emoji on MAX.
+    """
+    from max_messenger_bot import app as max_app_module
+    from max_messenger_bot.app import MaxBotApplication
+    from max_messenger_bot.api import MaxApiClient
+    from event_admin_service import create_scenario
+    from event_content_validator import format_event_html_title
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+
+    raw_title = '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Горячий вебинар MAX'
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_emoji_scen",
+        event_type="webinar",
+        title=raw_title,
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/emoji-max",
+    )
+
+    client = AsyncMock(spec=MaxApiClient)
+    app = MaxBotApplication(client)
+
+    # Test format_event_html_title for MAX platform
+    max_title = format_event_html_title(scen.title, platform="max")
+    assert "<tg-emoji" not in max_title
+    assert "emoji-id" not in max_title
+    assert "🔥 Горячий вебинар MAX" in max_title
+
+    # Test show_scenario in MAX
+    await max_admin_events.show_scenario(client, 123, scen.id)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "<tg-emoji" not in sent_text
+    assert "🔥 Горячий вебинар MAX" in sent_text
+
+    # Test show_edit_menu in MAX
+    await max_admin_events.show_edit_menu(client, 123, scen.id)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "<tg-emoji" not in sent_text
+    assert "🔥 Горячий вебинар MAX" in sent_text
+
+    # Test show_steps in MAX
+    await max_admin_events.show_steps(client, 123, scen.id)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "<tg-emoji" not in sent_text
+    assert "🔥 Горячий вебинар MAX" in sent_text
+
+    # Test show_stats in MAX
+    await max_admin_events.show_stats(client, 123, scen.id)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "<tg-emoji" not in sent_text
+    assert "🔥 Горячий вебинар MAX" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_max_holistic_draft_media_save_journey(db_session_maker, monkeypatch):
+    """MAX Application Journey: description -> title -> format -> media -> Cancel -> repeat with Save Media.
+    Verifies that Save Media commits description, title, format, and media items atomically in one transaction,
+    tested through real MaxBotApplication.handle_update() ingress with visible button inspection,
+    MAX transport validation (text <= 4000, attachments <= 12), and delivery plan execution."""
+    from max_messenger_bot import app as max_app_module
+    from max_messenger_bot.app import MaxBotApplication
+    from max_messenger_bot.api import MaxApiClient
+    from event_admin_service import create_scenario, list_scenario_media
+    from event_delivery_worker import _build_delivery_plan, _send_delivery_part
+    from database import EventScenario, User
+    from sqlalchemy.orm import selectinload
+    from sqlalchemy import select
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    admin_raw_id = 456
+    admin_effective_id = MAX_ID_OFFSET + admin_raw_id
+    chat_id = 777
+
+    # Prepare user and scenario in DB
+    async with db_session_maker() as session:
+        user_row = User(
+            id=admin_effective_id,
+            username="admin_user",
+            first_name="Admin Max User",
+        )
+        session.add(user_row)
+        await session.commit()
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_holistic_draft",
+        event_type="webinar",
+        title="Initial Max Title & <Legacy>",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/max-draft",
+        description="Initial Max Description",
+        media_format="separate_media_top",
+    )
+
+    transport = _RecordedMaxSession()
+    client = MaxApiClient(token="test-token", base_url="https://max.test")
+    client._session = transport
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    update_counter = 0
+
+    def message_body() -> dict:
+        for request in reversed(transport.requests):
+            if request["url"].endswith("/messages"):
+                return request["body"]
+        raise AssertionError("No MAX /messages request was recorded")
+
+    def validate_max_message(body: dict) -> dict:
+        text = body.get("text") or ""
+        attachments = body.get("attachments") or []
+        assert len(text) <= 4000, f"MAX text length exceeded: {len(text)} > 4000"
+        assert len(attachments) <= 12, f"MAX attachments limit exceeded: {len(attachments)} > 12"
+        # Validate that body is JSON serializable
+        json.loads(json.dumps(body, ensure_ascii=False))
+        return body
+
+    def button_payload(body: dict, prefix: str) -> str:
+        for attachment in body.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    payload = button.get("payload")
+                    if payload and payload.startswith(prefix):
+                        return payload
+        raise AssertionError(f"No visible MAX callback with prefix {prefix!r} in {body.get('attachments')}")
+
+    def all_button_texts(body: dict) -> list[str]:
+        texts = []
+        for attachment in body.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    if "text" in button:
+                        texts.append(button["text"])
+        return texts
+
+    async def press(payload: str) -> dict:
+        nonlocal update_counter
+        update_counter += 1
+        transport.requests.clear()
+        await app.handle_update(
+            {
+                "update_type": "message_callback",
+                "update_id": f"max-journey-cb-{update_counter}",
+                "callback": {
+                    "callback_id": f"max-journey-callback-{update_counter}",
+                    "payload": payload,
+                    "user": {"user_id": admin_raw_id, "first_name": "Admin", "username": "admin"},
+                },
+                "message": {
+                    "mid": f"max-journey-message-{update_counter}",
+                    "recipient": {"chat_id": chat_id},
+                    "body": {"text": "admin"},
+                },
+            }
+        )
+        return validate_max_message(message_body())
+
+    async def send_text(text: str) -> dict:
+        nonlocal update_counter
+        update_counter += 1
+        transport.requests.clear()
+        await app.handle_update(
+            {
+                "update_type": "message_created",
+                "update_id": f"max-journey-message-{update_counter}",
+                "message": {
+                    "mid": f"max-journey-incoming-{update_counter}",
+                    "recipient": {"chat_id": chat_id},
+                    "sender": {"user_id": admin_raw_id, "first_name": "Admin", "username": "admin"},
+                    "body": {"text": text},
+                },
+            }
+        )
+        return validate_max_message(message_body())
+
+    async def send_media(media_type: str, token: str) -> dict:
+        nonlocal update_counter
+        update_counter += 1
+        transport.requests.clear()
+        await app.handle_update(
+            {
+                "update_type": "message_created",
+                "update_id": f"max-journey-media-{update_counter}",
+                "message": {
+                    "mid": f"max-journey-incoming-media-{update_counter}",
+                    "recipient": {"chat_id": chat_id},
+                    "sender": {"user_id": admin_raw_id, "first_name": "Admin", "username": "admin"},
+                    "body": {
+                        "attachments": [
+                            {
+                                "type": media_type,
+                                "payload": {"token": token},
+                            }
+                        ]
+                    },
+                },
+            }
+        )
+        return validate_max_message(message_body())
+
+    try:
+        # =========================================================================
+        # PHASE 1: Build draft (desc, title, format, media) -> Cancel -> verify DB untouched
+        # =========================================================================
+        card = await press(f"admin_ev_open_{scen.id}_0_1")
+        assert "Initial Max Title" in card["text"]
+        assert "Initial Max Description" in card["text"]
+        assert "Текст отдельно, медиа выше" in card["text"]
+
+        # Open edit menu
+        edit_menu = await press(button_payload(card, f"admin_ev_edit_menu_{scen.id}"))
+        assert any("Описание" in t for t in all_button_texts(edit_menu))
+
+        # 1. Edit description
+        await press(button_payload(edit_menu, f"admin_ev_edit_description_{scen.id}"))
+        desc_screen = await send_text("Pending Max Description")
+        assert "Черновик обновлён" in desc_screen["text"]
+        edit_menu = await press(button_payload(desc_screen, f"admin_ev_edit_menu_{scen.id}"))
+
+        # 2. Edit title
+        await press(button_payload(edit_menu, f"admin_ev_edit_title_{scen.id}"))
+        title_screen = await send_text("Pending Max Title & <Draft>")
+        edit_menu = await press(button_payload(title_screen, f"admin_ev_edit_menu_{scen.id}"))
+
+        # 3. Format menu
+        fmt_menu = await press(button_payload(edit_menu, f"admin_ev_format_menu_{scen.id}"))
+        fmt_menu = await press(button_payload(fmt_menu, f"admin_ev_set_fmt_{scen.id}_separate_text_top"))
+        edit_menu = await press(button_payload(fmt_menu, f"admin_ev_edit_menu_{scen.id}"))
+
+        # 4. Add media
+        media_editor = await press(button_payload(edit_menu, f"admin_ev_edit_media_{scen.id}"))
+        await press(button_payload(media_editor, f"admin_ev_media_add_{scen.id}"))
+        media_editor = await send_media("image", "token_cancel_1")
+        assert "В черновике: 1" in media_editor["text"]
+
+        # 5. Cancel draft
+        edit_menu = await press(button_payload(media_editor, f"admin_ev_edit_menu_{scen.id}"))
+        card = await press(button_payload(edit_menu, f"admin_ev_cancel_draft_{scen.id}"))
+        assert "Черновик сброшен" in card["text"]
+
+        # Verify DB is completely untouched
+        async with db_session_maker() as session:
+            s_after_cancel = await session.get(EventScenario, scen.id)
+            assert "Initial Max Title" in s_after_cancel.title
+            assert s_after_cancel.description == "Initial Max Description"
+            assert s_after_cancel.media_format == "separate_media_top"
+        media_after_cancel = await list_scenario_media(db_session_maker, scen.id)
+        assert len(media_after_cancel) == 0
+        assert await app.states.get(admin_effective_id) is None
+
+        # =========================================================================
+        # PHASE 2: Re-enter draft -> description, title, format, 2 media items -> reorder -> SAVE MEDIA
+        # =========================================================================
+        card = await press(f"admin_ev_open_{scen.id}_0_1")
+        edit_menu = await press(button_payload(card, f"admin_ev_edit_menu_{scen.id}"))
+
+        # 1. Enter description
+        await press(button_payload(edit_menu, f"admin_ev_edit_description_{scen.id}"))
+        desc_screen = await send_text("Final Saved Max Description with <b>Bold</b> & <i>Italic</i>")
+        assert "Черновик обновлён" in desc_screen["text"]
+        edit_menu = await press(button_payload(desc_screen, f"admin_ev_edit_menu_{scen.id}"))
+
+        # 2. Enter title with HTML entities
+        await press(button_payload(edit_menu, f"admin_ev_edit_title_{scen.id}"))
+        title_screen = await send_text("Final Saved Max Title & <Safe>")
+        edit_menu = await press(button_payload(title_screen, f"admin_ev_edit_menu_{scen.id}"))
+
+        # 3. Choose format separate_text_top
+        fmt_menu = await press(button_payload(edit_menu, f"admin_ev_format_menu_{scen.id}"))
+        fmt_menu = await press(button_payload(fmt_menu, f"admin_ev_set_fmt_{scen.id}_separate_text_top"))
+        edit_menu = await press(button_payload(fmt_menu, f"admin_ev_edit_menu_{scen.id}"))
+
+        # 4. Add 2 media items: photo then video
+        media_editor = await press(button_payload(edit_menu, f"admin_ev_edit_media_{scen.id}"))
+        await press(button_payload(media_editor, f"admin_ev_media_add_{scen.id}"))
+        media_editor = await send_media("image", "max_media_photo_1")
+        assert "В черновике: 1" in media_editor["text"]
+
+        await press(button_payload(media_editor, f"admin_ev_media_add_{scen.id}"))
+        media_editor = await send_media("video", "max_media_video_2")
+        assert "В черновике: 2" in media_editor["text"]
+
+        # 5. Reorder media items: move second item (video) UP
+        media_editor = await press(button_payload(media_editor, f"admin_ev_media_up_{scen.id}_1"))
+
+        # 6. Click Save Media
+        save_confirmation = await press(button_payload(media_editor, f"admin_ev_media_save_{scen.id}"))
+        assert "сохранены" in save_confirmation["text"]
+        assert "&amp;amp;" not in save_confirmation["text"]
+
+        # Verify DB is atomically updated
+        async with db_session_maker() as session:
+            s_final = await session.get(EventScenario, scen.id)
+            assert "Final Saved Max Title &" in s_final.title
+            assert s_final.description == "Final Saved Max Description with <b>Bold</b> & <i>Italic</i>"
+            assert s_final.media_format == "separate_text_top"
+
+        media_final = await list_scenario_media(db_session_maker, scen.id)
+        assert len(media_final) == 2
+        # Verify reordering: video is first, photo is second
+        assert media_final[0].file_id == "max_media_video_2"
+        assert media_final[0].file_type == "video"
+        assert media_final[0].source_platform == "max"
+        assert media_final[0].source_file_id == "max_media_video_2"
+
+        assert media_final[1].file_id == "max_media_photo_1"
+        assert media_final[1].file_type == "photo"
+        assert media_final[1].source_platform == "max"
+        assert media_final[1].source_file_id == "max_media_photo_1"
+
+        # Verify state is cleared
+        assert await app.states.get(admin_effective_id) is None
+
+        # Reopen card directly via callback and verify clean presentation without double escaping
+        card = await press(button_payload(save_confirmation, f"admin_ev_open_{scen.id}"))
+        assert "Final Saved Max Title" in card["text"]
+        assert "&amp;amp;" not in card["text"]
+        assert "&amp;lt;" not in card["text"]
+        assert "Final Saved Max Description with &lt;b&gt;Bold&lt;/b&gt; &amp; &lt;i&gt;Italic&lt;/i&gt;" in card["text"]
+        assert "Текст отдельно, медиа ниже" in card["text"]
+        assert "Медиа:</b> 2" in card["text"]
+
+        # =========================================================================
+        # PHASE 3: Delivery plan and execution matching saved state
+        # =========================================================================
+        async with db_session_maker() as session:
+            scen_delivery = (await session.execute(
+                select(EventScenario).where(EventScenario.id == scen.id).options(selectinload(EventScenario.media))
+            )).scalar_one()
+
+        plan = _build_delivery_plan(scen_delivery, scen.id, "Runtime MAX announcement", include_media=True)
+        assert len(plan) >= 2
+        assert plan[0]["kind"] == "text"
+        assert plan[1]["kind"] == "media"
+        assert len(plan[1]["items"]) == 2
+        # Verify item order in plan matches reordered DB state
+        assert plan[1]["items"][0]["max_token"] == "max_media_video_2"
+        assert plan[1]["items"][0]["source_file_id"] == "max_media_video_2"
+        assert plan[1]["items"][1]["max_token"] == "max_media_photo_1"
+        assert plan[1]["items"][1]["source_file_id"] == "max_media_photo_1"
+
+        delivery_transport = _RecordedMaxSession()
+        delivery_client = MaxApiClient(token="test-token", base_url="https://max.test")
+        delivery_client._session = delivery_transport
+
+        # Send text and media delivery parts
+        await _send_delivery_part(
+            plan[0],
+            platform="max",
+            user_id=admin_effective_id,
+            event_id=scen.id,
+            is_last=False,
+            bot=None,
+            max_client=delivery_client,
+        )
+        await _send_delivery_part(
+            plan[1],
+            platform="max",
+            user_id=admin_effective_id,
+            event_id=scen.id,
+            is_last=True,
+            bot=None,
+            max_client=delivery_client,
+        )
+
+        # Validate all delivered messages adhere to MAX transport limits
+        assert len(delivery_transport.requests) == 2
+        for req in delivery_transport.requests:
+            body = req["body"]
+            validate_max_message(body)
+
+    finally:
+        await app.states.clear(admin_effective_id)
+
+
+@pytest.mark.asyncio
+async def test_max_format_menu_draft_reflection_and_back(db_session_maker, monkeypatch):
+    """Verifies show_format_menu in MAX marks active draft_format with radio button and preserves it across Back."""
+    from max_messenger_bot.api import MaxApiClient
+    from event_admin_service import create_scenario
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_fmt_draft",
+        event_type="webinar",
+        title="Format Draft Max Event",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/fmt-max",
+        description="Format Draft Max Description",
+        media_format="separate_media_top",
+    )
+
+    client = AsyncMock(spec=MaxApiClient)
+    states = MemoryStateStore()
+    user_id = 999
+    chat_id = 999
+
+    # Open format menu initially - should reflect separate_media_top
+    await max_admin_events.show_format_menu(client, chat_id, scen.id, states=states, user_id=user_id)
+    sent_att = client.send_message.await_args_list[-1].kwargs["attachments"]
+    button_texts = [b["text"] for att in sent_att if att.get("type") == "inline_keyboard" for row in att["payload"]["buttons"] for b in row]
+    assert any("🔘 🖼️ Текст отдельно, медиа выше" in t for t in button_texts)
+
+    # Start edit description so active draft context exists
+    await max_admin_events.start_edit_description(client, states, chat_id, user_id, scen.id)
+    await max_admin_events.receive_edit_description(client, states, chat_id, user_id, "Description draft")
+
+    # Set draft format to separate_text_top
+    await max_admin_events.set_format_handler(client, states, chat_id, user_id, scen.id, "separate_text_top")
+
+    # Reopen format menu - should now reflect draft_format (separate_text_top)
+    await max_admin_events.show_format_menu(client, chat_id, scen.id, states=states, user_id=user_id)
+    sent_att = client.send_message.await_args_list[-1].kwargs["attachments"]
+    button_texts = [b["text"] for att in sent_att if att.get("type") == "inline_keyboard" for row in att["payload"]["buttons"] for b in row]
+    assert any("🔘 📝 Текст отдельно, медиа ниже" in t for t in button_texts)
+    assert any("⚪️ 🖼️ Текст отдельно, медиа выше" in t for t in button_texts)
+
+    # Navigate Back to edit menu
+    await max_admin_events.show_edit_menu(client, chat_id, scen.id, states=states, user_id=user_id)
+    sent_att = client.send_message.await_args_list[-1].kwargs["attachments"]
+    edit_button_texts = [b["text"] for att in sent_att if att.get("type") == "inline_keyboard" for row in att["payload"]["buttons"] for b in row]
+    assert any("Формат:" in t and "Текст отдельно, медиа ниже" in t for t in edit_button_texts)
+
+
+@pytest.mark.asyncio
+async def test_max_visiting_editor_does_not_block_foreign_events(db_session_maker, monkeypatch):
+    """Merely opening edit menu, description editor or media editor without dirty changes does not block foreign events in MAX."""
+    from max_messenger_bot.api import MaxApiClient
+    from event_admin_service import create_scenario
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+
+    event_a = await create_scenario(
+        db_session_maker,
+        code="max_visit_a",
+        event_type="webinar",
+        title="Max Event A",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/max-a",
+    )
+    event_b = await create_scenario(
+        db_session_maker,
+        code="max_visit_b",
+        event_type="webinar",
+        title="Max Event B",
+        starts_at_utc=datetime.utcnow() + timedelta(days=4),
+        link="https://example.test/max-b",
+    )
+
+    client = AsyncMock(spec=MaxApiClient)
+    states = MemoryStateStore()
+    user_id = 999
+    chat_id = 999
+
+    # 1. Visit Event A edit menu
+    await max_admin_events.show_edit_menu(client, chat_id, event_a.id, states=states, user_id=user_id)
+
+    # 2. Visit Event A description editor (without typing)
+    await max_admin_events.start_edit_description(client, states, chat_id, user_id, event_a.id)
+
+    # 3. Visit Event A media editor (without adding/removing media)
+    await max_admin_events.show_media_editor(client, states, chat_id, user_id, event_a.id)
+
+    # 4. Now open Event B edit menu
+    await max_admin_events.show_edit_menu(client, chat_id, event_b.id, states=states, user_id=user_id)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "Это старое меню другого мероприятия" not in sent_text
+    assert "Max Event B" in sent_text
+
+    # 5. Open Event B description editor
+    await max_admin_events.start_edit_description(client, states, chat_id, user_id, event_b.id)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "Это старое меню другого мероприятия" not in sent_text
+    assert "Max Event B" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_max_title_length_visible_and_storage_validation(db_session_maker, monkeypatch):
+    """Verifies that MAX receive_create_title and receive_edit_title validate visible and storage limits."""
+    from max_messenger_bot.api import MaxApiClient
+    from event_admin_service import create_scenario
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_title_limits",
+        event_type="webinar",
+        title="Initial Valid Max Title",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/max-limits",
+    )
+
+    client = AsyncMock(spec=MaxApiClient)
+    states = MemoryStateStore()
+    user_id = 999
+    chat_id = 999
+
+    # Test receive_create_title with visible text > 1000
+    await max_admin_events.receive_create_title(client, states, chat_id, user_id, "A" * 1005)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "1000 симв." in sent_text
+    assert "1005" in sent_text
+
+    # Test receive_create_title with storage overflow > 1000
+    emojis = '<tg-emoji emoji-id="1234567890123456789">🔥</tg-emoji>' * 25
+    raw_storage_overflow = ("B" * 50) + emojis
+    await max_admin_events.receive_create_title(client, states, chat_id, user_id, raw_storage_overflow)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "лимит хранилища (1000 симв.)" in sent_text
+
+    # Test receive_edit_title with visible text > 1000
+    await max_admin_events.start_edit_title(client, states, chat_id, user_id, scen.id)
+    await max_admin_events.receive_edit_title(client, states, chat_id, user_id, "C" * 1005)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "1000 симв." in sent_text
+    assert "1005" in sent_text
+
+    # Test receive_edit_title with storage overflow > 1000
+    await max_admin_events.receive_edit_title(client, states, chat_id, user_id, raw_storage_overflow)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "лимит хранилища (1000 симв.)" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_max_premium_emoji_paginated_journey_a_to_ya_to_a(db_session_maker, monkeypatch):
+    """
+    MAX A -> Ya -> A journey:
+    Paginated list (page 2) -> real button with title and Premium Emoji -> card ->
+    archive / reschedule / copy / steps / monitoring -> back / cancel -> card ->
+    Back -> original list page 2 with original filter.
+    Every outgoing MAX HTTP payload is strictly validated (text <= 4000, attachments <= 12, valid JSON).
+    """
+    from event_admin_service import create_scenario
+    from database import EventStep
+    from max_messenger_bot import app as max_app_module
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    now = datetime.utcnow()
+    base_start = now + timedelta(days=20)
+    # PAGE_SIZE is 6 in MAX, so 6 filler scenarios land on page 1, target scenario on page 2 (index 1)
+    for idx in range(max_admin_events.PAGE_SIZE):
+        await create_scenario(
+            db_session_maker,
+            code=f"max_prem_filler_{idx}",
+            event_type="webinar",
+            title=f"Filler Event {idx}",
+            starts_at_utc=base_start + timedelta(days=idx + 1),
+            link=f"https://example.test/max-filler/{idx}",
+        )
+
+    target_title = '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Premium Q&amp;A &lt;Special Event&gt; with Long Title for Truncation Testing'
+    target = await create_scenario(
+        db_session_maker,
+        code="max_prem_target",
+        event_type="webinar",
+        title=target_title,
+        starts_at_utc=base_start - timedelta(days=2),
+        link="https://example.test/max-target",
+        description="Описание целевого мероприятия с <b>HTML</b>",
+        media_format="separate_media_top",
+    )
+
+    async with db_session_maker() as session:
+        step = EventStep(
+            event_id=target.id,
+            offset_minutes=60,
+            message_text="Напоминание о вебинаре MAX",
+        )
+        session.add(step)
+        await session.commit()
+
+    transport = _RecordedMaxSession()
+    client = MaxApiClient(token="test-token", base_url="https://max.test")
+    client._session = transport
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    update_counter = 0
+    chat_id = 123
+    admin_raw_id = 456
+
+    def message_body() -> dict:
+        for request in reversed(transport.requests):
+            if request["url"].endswith("/messages"):
+                return request["body"]
+        raise AssertionError("No MAX /messages request was recorded")
+
+    def validate_max_message(body: dict) -> dict:
+        text = body.get("text") or ""
+        attachments = body.get("attachments") or []
+        assert len(text) <= 4000, f"MAX text length exceeded: {len(text)} > 4000"
+        assert len(attachments) <= 12, f"MAX attachments limit exceeded: {len(attachments)} > 12"
+        json.loads(json.dumps(body, ensure_ascii=False))
+        return body
+
+    def button_payload(body: dict, prefix: str) -> str:
+        for attachment in body.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    payload = button.get("payload")
+                    if payload and payload.startswith(prefix):
+                        return payload
+        raise AssertionError(f"No visible MAX callback with prefix {prefix!r} in {body.get('attachments')}")
+
+    def find_button(body: dict, prefix: str) -> dict:
+        for attachment in body.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    payload = button.get("payload")
+                    if payload and payload.startswith(prefix):
+                        return button
+        raise AssertionError(f"No visible MAX button with prefix {prefix!r} in {body.get('attachments')}")
+
+    async def press(payload: str) -> dict:
+        nonlocal update_counter
+        update_counter += 1
+        transport.requests.clear()
+        await app.handle_update(
+            {
+                "update_type": "message_callback",
+                "update_id": f"max-journey-cb-{update_counter}",
+                "callback": {
+                    "callback_id": f"max-journey-callback-{update_counter}",
+                    "payload": payload,
+                    "user": {"user_id": admin_raw_id, "first_name": "Admin", "username": "admin"},
+                },
+                "message": {
+                    "mid": f"max-journey-message-{update_counter}",
+                    "recipient": {"chat_id": chat_id},
+                    "body": {"text": "admin"},
+                },
+            }
+        )
+        return validate_max_message(message_body())
+
+    try:
+        # 1. Open scenarios list
+        listing = await press("admin_events")
+        assert "Страница 1 из 2" in listing["text"]
+
+        # Navigate to page 2 (0-indexed page 1)
+        listing = await press(button_payload(listing, "admin_ev_page_1_0"))
+        assert "Страница 2 из 2" in listing["text"]
+
+        # 2. Inspect target button on page 2: plain text, Unicode fallback emoji, no raw HTML tags
+        target_btn = find_button(listing, f"admin_ev_open_{target.id}_1_0")
+        btn_text = target_btn["text"]
+        assert "<tg-emoji" not in btn_text
+        assert "</tg-emoji>" not in btn_text
+        assert "&amp;" not in btn_text
+        assert "&lt;" not in btn_text
+        assert "🔥" in btn_text
+        assert "Premium Q&A <Special Event>" in btn_text
+        assert btn_text.endswith("… (" + target.starts_at_msk[:10] + ")")
+
+        # 3. Open scenario card
+        card = await press(target_btn["payload"])
+        card_text = card["text"]
+        # MAX card strips custom emoji tags and renders fallback emoji in HTML
+        assert "<tg-emoji" not in card_text
+        assert "&lt;tg-emoji" not in card_text
+        assert "&amp;amp;" not in card_text
+        assert "&amp;lt;" not in card_text
+        assert "🔥" in card_text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in card_text
+
+        # 4. Nested screen: Archive
+        archive_btn = button_payload(card, f"admin_ev_archive_ask_{target.id}")
+        archive_screen = await press(archive_btn)
+        arch_text = archive_screen["text"]
+        assert "<tg-emoji" not in arch_text
+        assert "&lt;tg-emoji" not in arch_text
+        assert "&amp;amp;" not in arch_text
+        assert "🔥" in arch_text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in arch_text
+        # Back to card
+        card_back = button_payload(archive_screen, f"admin_ev_open_{target.id}_1_0")
+        card = await press(card_back)
+
+        # 5. Nested screen: Reschedule
+        resched_btn = button_payload(card, f"admin_ev_reschedule_{target.id}")
+        resched_screen = await press(resched_btn)
+        resched_text = resched_screen["text"]
+        assert "<tg-emoji" not in resched_text
+        assert "&lt;tg-emoji" not in resched_text
+        assert "&amp;amp;" not in resched_text
+        assert "🔥" in resched_text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in resched_text
+        # Back to card
+        card_back = button_payload(resched_screen, f"admin_ev_open_{target.id}_1_0")
+        card = await press(card_back)
+
+        # 6. Nested screen: Copy
+        copy_btn = button_payload(card, f"admin_ev_copy_{target.id}")
+        copy_screen = await press(copy_btn)
+        copy_text = copy_screen["text"]
+        assert "<tg-emoji" not in copy_text
+        assert "&lt;tg-emoji" not in copy_text
+        assert "&amp;amp;" not in copy_text
+        assert "🔥" in copy_text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in copy_text
+        # Back to card
+        card_back = button_payload(copy_screen, f"admin_ev_open_{target.id}_1_0")
+        card = await press(card_back)
+
+        # 7. Nested screen: Steps
+        steps_btn = button_payload(card, f"admin_ev_steps_{target.id}_1_0")
+        steps_screen = await press(steps_btn)
+        steps_text = steps_screen["text"]
+        assert "<tg-emoji" not in steps_text
+        assert "&lt;tg-emoji" not in steps_text
+        assert "&amp;amp;" not in steps_text
+        assert "🔥" in steps_text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in steps_text
+        # Back to card
+        card_back = button_payload(steps_screen, f"admin_ev_open_{target.id}_1_0")
+        card = await press(card_back)
+
+        # 8. Nested screen: Monitoring / Stats
+        stats_btn = button_payload(card, f"admin_ev_stats_{target.id}")
+        stats_screen = await press(stats_btn)
+        stats_text = stats_screen["text"]
+        assert "<tg-emoji" not in stats_text
+        assert "&lt;tg-emoji" not in stats_text
+        assert "&amp;amp;" not in stats_text
+        assert "🔥" in stats_text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in stats_text
+        # Back to card
+        card_back = button_payload(stats_screen, f"admin_ev_open_{target.id}_1_0")
+        card = await press(card_back)
+
+        # 9. Return to list (Page 2) with original filter
+        to_list_btn = button_payload(card, "admin_ev_page_1_0")
+        listing = await press(to_list_btn)
+        assert "Страница 2 из 2" in listing["text"]
+        assert button_payload(listing, f"admin_ev_open_{target.id}_1_0") is not None
+    finally:
+        await app.states.clear(MAX_ID_OFFSET + admin_raw_id)
+
+
+@pytest.mark.asyncio
+async def test_max_scenarios_list_button_preserves_raw_legacy_and_escaped_titles(db_session_maker, monkeypatch):
+    """
+    Verifies that MAX scenario list buttons preserve literal angle brackets like '<Новый сезон>'
+    both for raw legacy titles and HTML-escaped titles, convert custom emojis to Unicode fallback,
+    and strip only allowed markup tags.
+    """
+    from event_admin_service import create_scenario
+    from max_messenger_bot import app as max_app_module
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    now = datetime.utcnow()
+    # 1. Raw legacy scenario with literal angle brackets
+    scen_raw = await create_scenario(
+        db_session_maker,
+        code="max_raw_legacy",
+        event_type="webinar",
+        title="Презентация <Новый сезон>",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/raw",
+    )
+    # 2. Escaped scenario with HTML entities
+    scen_escaped = await create_scenario(
+        db_session_maker,
+        code="max_escaped_title",
+        event_type="webinar",
+        title="Презентация &lt;Новый сезон&gt;",
+        starts_at_utc=now + timedelta(days=3),
+        link="https://example.test/escaped",
+    )
+    # 3. Custom emoji with literal angle brackets
+    scen_emoji = await create_scenario(
+        db_session_maker,
+        code="max_emoji_raw",
+        event_type="webinar",
+        title='<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Презентация &lt;Новый сезон&gt;',
+        starts_at_utc=now + timedelta(days=4),
+        link="https://example.test/emoji",
+    )
+
+    transport = _RecordedMaxSession()
+    client = MaxApiClient(token="test-token", base_url="https://max.test")
+    client._session = transport
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    chat_id = 123
+    admin_raw_id = 456
+
+    def message_body() -> dict:
+        for request in reversed(transport.requests):
+            if request["url"].endswith("/messages"):
+                return request["body"]
+        raise AssertionError("No MAX /messages request was recorded")
+
+    def find_button(body: dict, prefix: str) -> dict:
+        for attachment in body.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    payload = button.get("payload")
+                    if payload and payload.startswith(prefix):
+                        return button
+        raise AssertionError(f"No visible MAX button with prefix {prefix!r} in {body.get('attachments')}")
+
+    try:
+        transport.requests.clear()
+        await app.handle_update(
+            {
+                "update_type": "message_callback",
+                "update_id": "max-legacy-title-cb",
+                "callback": {
+                    "callback_id": "max-legacy-title-callback",
+                    "payload": "admin_events",
+                    "user": {"user_id": admin_raw_id, "first_name": "Admin", "username": "admin"},
+                },
+                "message": {
+                    "mid": "max-legacy-title-msg",
+                    "recipient": {"chat_id": chat_id},
+                    "body": {"text": "admin"},
+                },
+            }
+        )
+        body = message_body()
+
+        # Raw legacy button check
+        btn_raw = find_button(body, f"admin_ev_open_{scen_raw.id}")
+        assert "<Новый сезон>" in btn_raw["text"]
+        assert "Презентация <Новый сезон>" in btn_raw["text"]
+
+        # Escaped button check
+        btn_escaped = find_button(body, f"admin_ev_open_{scen_escaped.id}")
+        assert "<Новый сезон>" in btn_escaped["text"]
+        assert "Презентация <Новый сезон>" in btn_escaped["text"]
+        assert "&lt;" not in btn_escaped["text"]
+        assert "&gt;" not in btn_escaped["text"]
+
+        # Emoji + literal angle brackets button check
+        btn_emoji = find_button(body, f"admin_ev_open_{scen_emoji.id}")
+        assert "🔥" in btn_emoji["text"]
+        assert "<Новый сезон>" in btn_emoji["text"]
+        assert "<tg-emoji" not in btn_emoji["text"]
+    finally:
+        await app.states.clear(MAX_ID_OFFSET + admin_raw_id)
+
+
