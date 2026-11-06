@@ -80,6 +80,7 @@ from event_content_validator import (
     calculate_available_description_chars,
     format_event_html_title,
     get_media_format,
+    normalize_telegram_custom_emoji_tags,
     parse_visible_telegram_text,
     render_plain_text_for_max,
     strip_telegram_custom_emoji,
@@ -268,8 +269,11 @@ def _format_display_name(fmt: str) -> str:
     return "Стандартный (авто)"
 
 
-def _scenario_edit_keyboard(s: ScenarioSummary, *, list_back: str = "admin_events") -> Any:
+def _scenario_edit_keyboard(s: ScenarioSummary, *, list_back: str = "admin_events", has_draft: bool = False) -> Any:
     builder = InlineKeyboardBuilder()
+    if has_draft:
+        builder.button(text="💾 Сохранить изменения черновика", callback_data=f"admin_ev_description_save_{s.id}")
+        builder.button(text="❌ Отмена (сбросить черновик)", callback_data=f"admin_ev_cancel_draft_{s.id}")
     builder.button(text="✏️ Изменить название", callback_data=f"admin_ev_edit_title_{s.id}")
     builder.button(text="⏱ Изменить длительность", callback_data=f"admin_ev_edit_duration_{s.id}")
     if s.event_type == "webinar":
@@ -739,10 +743,18 @@ async def process_create_code(message: Message, state: FSMContext) -> None:
 @router.message(EventAdminStates.create_title)
 async def process_create_title(message: Message, state: FSMContext) -> None:
     raw = message.html_text if isinstance(message.html_text, str) else (message.text or "")
-    title = raw.strip()
+    if "&lt;tg-emoji" in raw:
+        raw = re.sub(
+            r'&lt;tg-emoji\b([^&]*)&gt;(.*?)&lt;/tg-emoji&gt;',
+            r'<tg-emoji\1>\2</tg-emoji>',
+            raw,
+            flags=re.IGNORECASE,
+        )
+    title = normalize_telegram_custom_emoji_tags(raw.strip())
     try:
         if not title:
             raise ValueError(f"Название не должно быть пустым и не может превышать {EVENT_TITLE_MAX_LENGTH} символов.")
+        TelegramHtmlValidator.validate(title, allowed_tags=frozenset({"tg-emoji"}))
         _, visible_len, _ = parse_visible_telegram_text(title)
         if visible_len > EVENT_TITLE_MAX_LENGTH:
             raise ValueError(f"Название не должно превышать {EVENT_TITLE_MAX_LENGTH} символов (сейчас: {visible_len}).")
@@ -903,24 +915,37 @@ async def _finalize_scenario_creation(
 async def show_edit_menu(callback: CallbackQuery, state: FSMContext) -> None:
     state_data = await state.get_data()
     parts = callback.data.split("_")
+    event_id = int(parts[4])
     list_back = (
         f"admin_ev_page_{parts[4]}_{parts[5]}"
         if len(parts) >= 7
         else state_data.get("event_list_back", "admin_events")
     )
-    await state.clear()
-    await state.update_data(event_list_back=list_back)
-    event_id = int(parts[4])
+    has_draft = (
+        state_data.get("edit_event_id") == event_id
+        and any(
+            state_data.get(k) is not None
+            for k in ("description_draft", "draft_title", "draft_format")
+        )
+    )
+    if not has_draft:
+        await state.clear()
+        await state.update_data(event_list_back=list_back, edit_event_id=event_id)
+    else:
+        await state.update_data(event_list_back=list_back, edit_event_id=event_id)
+
     scen = await get_scenario_summary(async_session_maker, event_id)
     if not scen:
         await callback.answer("Мероприятие не найдено.", show_alert=True)
         return
 
+    cur_title = (state_data.get("draft_title") or scen.title) if has_draft else scen.title
+    draft_notice = "\n\n⚠️ <b>Есть несохранённый черновик.</b> Нажмите «Сохранить изменения черновика» для валидации и записи." if has_draft else ""
     await callback.message.edit_text(
-        f"✏️ <b>Редактирование мероприятия: {_format_event_html_title(scen.title)}</b>\n\n"
+        f"✏️ <b>Редактирование мероприятия: {_format_event_html_title(cur_title)}</b>{draft_notice}\n\n"
         f"Выберите поле, которое хотите изменить:",
         parse_mode="HTML",
-        reply_markup=_scenario_edit_keyboard(scen, list_back=list_back),
+        reply_markup=_scenario_edit_keyboard(scen, list_back=list_back, has_draft=has_draft),
     )
 
 
@@ -975,13 +1000,22 @@ async def set_format_handler(callback: CallbackQuery, state: FSMContext) -> None
     new_fmt = "_".join(parts[5:])
     state_data = await state.get_data()
     list_back = state_data.get("event_list_back", "admin_events")
-    draft = state_data.get("description_draft") if state_data.get("edit_event_id") == event_id else None
+    has_draft = (
+        state_data.get("edit_event_id") == event_id
+        and any(
+            state_data.get(k) is not None
+            for k in ("description_draft", "draft_title", "draft_format")
+        )
+    )
 
-    if draft is not None:
+    if has_draft:
         await state.update_data(draft_format=new_fmt)
         await callback.answer(f"Формат в черновике: {_format_display_name(new_fmt)}")
         scen = await get_scenario_summary(async_session_maker, event_id)
-        title_text = format_event_html_title(scen.title) if scen else ""
+        cur_title = state_data.get("draft_title") or (scen.title if scen else "")
+        title_text = format_event_html_title(cur_title)
+        draft = state_data.get("description_draft")
+        desc_info = f"\n📝 Описание в черновике: {len(draft)} симв." if draft is not None else ""
         kb = InlineKeyboardBuilder()
         kb.button(text="💾 Сохранить изменения черновика", callback_data=f"admin_ev_description_save_{event_id}")
         kb.button(text="✏️ Редактировать описание", callback_data=f"admin_ev_edit_description_{event_id}")
@@ -991,8 +1025,7 @@ async def set_format_handler(callback: CallbackQuery, state: FSMContext) -> None
         kb.adjust(1)
         await callback.message.edit_text(
             f"✏️ <b>Черновик мероприятия: {title_text}</b>\n\n"
-            f"⚙️ Выбран формат: <b>{_format_display_name(new_fmt)}</b>\n"
-            f"📝 Описание в черновике: {len(draft)} симв.\n\n"
+            f"⚙️ Выбран формат: <b>{_format_display_name(new_fmt)}</b>{desc_info}\n\n"
             f"<i>Черновик ещё не сохранён в базу данных. Нажмите «Сохранить изменения черновика» для валидации и записи.</i>",
             parse_mode="HTML",
             reply_markup=kb.as_markup(),
@@ -1197,13 +1230,16 @@ async def start_edit_title(callback: CallbackQuery, state: FSMContext) -> None:
     list_back = state_data.get("event_list_back", "admin_events")
     has_draft = (
         state_data.get("edit_event_id") == event_id
-        and (state_data.get("description_draft") is not None or state_data.get("draft_format") is not None)
+        and any(
+            state_data.get(k) is not None
+            for k in ("description_draft", "draft_title", "draft_format")
+        )
     )
     await state.update_data(edit_event_id=event_id, event_list_back=list_back)
     await state.set_state(EventAdminStates.edit_title)
     scen = await get_scenario_summary(async_session_maker, event_id)
     cur_title = state_data.get("draft_title") or (scen.title if scen else "")
-    cancel_cb = _event_open_callback(event_id, list_back)
+    cancel_cb = _event_edit_menu_callback(event_id, list_back) if has_draft else _event_open_callback(event_id, list_back)
     await callback.message.edit_text(
         f"✏️ <b>Редактирование названия</b>\n\n"
         f"Текущее название: <b>{format_event_html_title(cur_title)}</b>\n\n"
@@ -1223,7 +1259,7 @@ async def process_edit_title(message: Message, state: FSMContext) -> None:
             raw,
             flags=re.IGNORECASE,
         )
-    title = raw.strip()
+    title = normalize_telegram_custom_emoji_tags(raw.strip())
     data = await state.get_data()
     event_id = data.get("edit_event_id")
     list_back = data.get("event_list_back", "admin_events")
@@ -1242,7 +1278,7 @@ async def process_edit_title(message: Message, state: FSMContext) -> None:
         return
 
     try:
-        TelegramHtmlValidator.validate(title, allowed_tags={"tg-emoji"})
+        TelegramHtmlValidator.validate(title, allowed_tags=frozenset({"tg-emoji"}))
         _, visible_len, _ = parse_visible_telegram_text(title)
         if visible_len > EVENT_TITLE_MAX_LENGTH:
             await message.answer(
@@ -1254,9 +1290,9 @@ async def process_edit_title(message: Message, state: FSMContext) -> None:
         await message.answer(f"❌ Ошибка разметки в названии: {err.message}{rec}")
         return
 
-    has_active_draft = (
-        data.get("description_draft") is not None
-        or data.get("draft_format") is not None
+    has_active_draft = any(
+        data.get(k) is not None
+        for k in ("description_draft", "draft_title", "draft_format")
     )
 
     if has_active_draft:

@@ -745,10 +745,17 @@ async def set_format_handler(
     new_fmt: str,
 ) -> None:
     snapshot = await states.get(user_id)
-    draft = snapshot.data.get("description_draft") if snapshot and snapshot.data.get("event_id") == event_id else None
+    has_draft = bool(
+        snapshot
+        and snapshot.data.get("event_id") == event_id
+        and any(
+            snapshot.data.get(k) is not None
+            for k in ("description_draft", "draft_title", "draft_format")
+        )
+    )
     list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
 
-    if draft is not None:
+    if has_draft:
         snapshot.data["draft_format"] = new_fmt
         await states.set(user_id, chat_id, snapshot.state, snapshot.data)
         rows = [
@@ -758,11 +765,11 @@ async def set_format_handler(
             [callback_button("⚙️ Выбрать другой формат", f"admin_ev_format_menu_{event_id}")],
             [callback_button("❌ Отмена (сбросить черновик)", f"admin_ev_cancel_draft_{event_id}")],
         ]
+        desc_info = f"\n📝 Описание в черновике: {len(snapshot.data['description_draft'])} симв." if snapshot.data.get("description_draft") is not None else ""
         await client.send_message(
             chat_id=chat_id,
             text=(
-                f"⚙️ Выбран формат: <b>{_format_display_name(new_fmt)}</b>\n"
-                f"📝 Описание в черновике: {len(draft)} симв.\n\n"
+                f"⚙️ Выбран формат: <b>{_format_display_name(new_fmt)}</b>{desc_info}\n\n"
                 f"<i>Черновик ещё не сохранён в базу данных. Нажмите «Сохранить изменения черновика» для валидации и записи.</i>"
             ),
             attachments=inline_keyboard(rows),

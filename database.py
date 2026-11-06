@@ -2965,6 +2965,15 @@ class EventScenario(Base):
     deliveries = relationship("EventDelivery", back_populates="event")
     media = relationship("EventScenarioMedia", back_populates="event", cascade="all, delete-orphan", order_by="EventScenarioMedia.sort_order")
 
+    @property
+    def media_format(self) -> str:
+        """Derive explicit media format from media_mode and media_order."""
+        if self.media_mode == "caption":
+            return "caption"
+        if self.media_mode == "separate":
+            return "separate_text_top" if self.media_order == "text_top" else "separate_media_top"
+        return "legacy_auto"
+
     @validates("code")
     def _validate_code_immutable(self, key, value):
         current = getattr(self, "code", None)

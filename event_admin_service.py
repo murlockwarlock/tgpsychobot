@@ -600,7 +600,7 @@ async def create_scenario(
     link: str | None = None,
     description: str | None = None,
     media_order: str = "media_top",
-    media_mode: str = "legacy_auto",
+    media_mode: str = "separate",
     media_format: str | None = None,
     is_active: bool = False,
     now_utc: datetime | None = None,

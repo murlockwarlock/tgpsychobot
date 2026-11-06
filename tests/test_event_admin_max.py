@@ -227,6 +227,7 @@ _MAX_EVENT_BUTTON_CONTRACTS = (
     (re.compile(r"admin_ev_edit_description_\d+$"), "mutation", "events/edit", "max.events.edit", "start_edit_description", "max_event_edit_description"),
     (re.compile(r"admin_ev_edit_media_\d+$"), "navigation", "events/edit-media", "max.description-media", "show_media_editor", "max_event_edit_media"),
     (re.compile(r"admin_ev_description_save_\d+$"), "mutation", "events/edit", "max.description-media", "save_description", None),
+    (re.compile(r"admin_ev_cancel_draft_\d+$"), "destructive", "events/edit", "max.events.edit", "cancel_draft", None),
     (re.compile(r"admin_ev_description_delete_\d+$"), "destructive", "events/edit", "max.description-media", "delete_description", "max_event_edit_description"),
     (re.compile(r"admin_ev_media_add_\d+$"), "navigation", "events/edit-media", "max.description-media", "start_add_media", "max_event_edit_media_add"),
     (re.compile(r"admin_ev_media_save_\d+$"), "mutation", "events/edit-media", "max.description-media", "save_media", None),
@@ -1329,6 +1330,7 @@ async def test_max_description_chunks_append_and_runtime_split_after_save(db_ses
         title="Chunked MAX description",
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://example.test/max-chunks",
+        media_mode="legacy_auto",
     )
     await max_admin_events.start_edit_description(mock_client, states, 123, 456, scen.id)
     await max_admin_events.receive_edit_description(mock_client, states, 123, 456, "A" * 3000)
@@ -1469,6 +1471,7 @@ async def test_max_paginated_edit_roundtrip_and_delete_stays_draft(db_session_ma
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://example.test/max-paginated-edit",
         description="x" * 5000,
+        media_mode="legacy_auto",
     )
 
     await max_admin_events.show_scenario(mock_client, 123, scen.id, back="admin_ev_page_2_1")
@@ -1693,6 +1696,7 @@ async def test_max_dispatcher_description_chunks_save_reopen_and_runtime_split(d
         title="MAX dispatcher description",
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://example.test/max-dispatcher-description",
+        media_mode="legacy_auto",
     )
     app = MaxBotApplication(mock_client)
     app.states = states

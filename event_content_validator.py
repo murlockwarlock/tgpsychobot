@@ -59,7 +59,7 @@ ALLOWED_EVENT_HTML_TAGS = frozenset({
 })
 
 _CUSTOM_EMOJI_PATTERN = re.compile(
-    r'<tg-emoji\b[^>]*\b(?:emoji-id|id)=["\']?([^"\'>]+)["\']?[^>]*>(.*?)</tg-emoji>',
+    r'<tg-emoji\b[^>]*\b(?:emoji[-_]id|id)=["\']?([^"\'>]+)["\']?[^>]*>(.*?)</tg-emoji>',
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -110,11 +110,21 @@ def strip_telegram_custom_emoji(text: str) -> str:
     return _CUSTOM_EMOJI_PATTERN.sub(r"\2", text)
 
 
+def normalize_telegram_custom_emoji_tags(text: str) -> str:
+    """
+    Normalizes all variants of custom emoji tags (<tg-emoji id="...">, <tg-emoji emoji_id="...">)
+    to official Telegram Bot API format: <tg-emoji emoji-id="...">fallback</tg-emoji>.
+    """
+    if not text or "<tg-emoji" not in text:
+        return text
+    return _CUSTOM_EMOJI_PATTERN.sub(r'<tg-emoji emoji-id="\1">\2</tg-emoji>', text)
+
+
 def format_event_html_title(title: str, platform: str = "telegram") -> str:
     """
     Renders title safely:
-    - For Telegram: preserves valid <tg-emoji> tags while escaping other unsafe HTML characters.
-    - For MAX: replaces <tg-emoji> tags with Unicode fallback and escapes HTML characters.
+    - For Telegram: preserves and normalizes valid <tg-emoji> tags while escaping other unsafe HTML characters.
+    - For MAX: replaces <tg-emoji> tags with Unicode fallback and strips HTML markup tags.
     """
     if not title:
         return ""
@@ -127,7 +137,9 @@ def format_event_html_title(title: str, platform: str = "telegram") -> str:
     emoji_tokens: list[str] = []
 
     def _repl(match: re.Match) -> str:
-        emoji_tokens.append(match.group(0))
+        emoji_id = match.group(1)
+        fallback = match.group(2)
+        emoji_tokens.append(f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>')
         return f"\x00EMOJI_{len(emoji_tokens) - 1}\x00"
 
     tokenized = _CUSTOM_EMOJI_PATTERN.sub(_repl, title)
@@ -200,7 +212,7 @@ class TelegramHtmlValidator(HTMLParser):
             if not has_href:
                 self.errors.append("Тег <a> обязан содержать атрибут href")
         elif tag_lower == "tg-emoji":
-            has_emoji_id = any(name.lower() in ("emoji-id", "id") and value for name, value in attrs)
+            has_emoji_id = any(name.lower() in ("emoji-id", "id", "emoji_id") and value for name, value in attrs)
             if not has_emoji_id:
                 self.errors.append("Тег <tg-emoji> обязан содержать атрибут emoji-id")
         if tag_lower not in self.void_tags:

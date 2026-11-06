@@ -630,11 +630,12 @@ async def _send_delivery_part(
             from event_content_validator import (
                 TELEGRAM_CAPTION_LIMIT_TECHNICAL,
                 TELEGRAM_TEXT_LIMIT_TECHNICAL,
+                normalize_telegram_custom_emoji_tags,
                 parse_visible_telegram_text,
             )
 
             if kind == "text" or kind == "control":
-                text_to_send = payload.get("text") or "Управление мероприятием:"
+                text_to_send = normalize_telegram_custom_emoji_tags(payload.get("text") or "Управление мероприятием:")
                 _, utf16_len, _ = parse_visible_telegram_text(text_to_send)
                 if utf16_len > TELEGRAM_TEXT_LIMIT_TECHNICAL:
                     raise PreTransmissionError(
@@ -651,7 +652,7 @@ async def _send_delivery_part(
             if kind == "media_caption":
                 item = items[0]
                 media_reference = await telegram_media_reference(item, 0)
-                cap = payload.get("caption") or ""
+                cap = normalize_telegram_custom_emoji_tags(payload.get("caption") or "")
                 _, utf16_len, _ = parse_visible_telegram_text(cap)
                 if utf16_len > TELEGRAM_CAPTION_LIMIT_TECHNICAL:
                     raise PreTransmissionError(

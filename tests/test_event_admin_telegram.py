@@ -204,6 +204,7 @@ _TELEGRAM_EVENT_BUTTON_CONTRACTS = (
     (re.compile(r"admin_ev_edit_description_\d+$"), "mutation", "events/edit", "telegram.events.edit", "start_edit_description", "EventAdminStates.edit_description"),
     (re.compile(r"admin_ev_edit_media_\d+$"), "navigation", "events/edit-media", "telegram.description-media", "start_edit_media", "EventAdminStates.edit_media"),
     (re.compile(r"admin_ev_description_save_\d+$"), "mutation", "events/edit", "telegram.description-media", "save_description", None),
+    (re.compile(r"admin_ev_cancel_draft_\d+$"), "destructive", "events/edit", "telegram.events.edit", "cancel_draft_handler", None),
     (re.compile(r"admin_ev_description_delete_\d+$"), "destructive", "events/edit", "telegram.description-media", "delete_description", "EventAdminStates.edit_description"),
     (re.compile(r"admin_ev_media_add_\d+$"), "navigation", "events/edit-media", "telegram.description-media", "start_add_media", "EventAdminStates.edit_media_add"),
     (re.compile(r"admin_ev_media_save_\d+$"), "mutation", "events/edit-media", "telegram.description-media", "save_media", None),
@@ -1261,6 +1262,7 @@ async def test_telegram_dispatcher_description_chunks_save_reopen_and_runtime_sp
         title="Telegram dispatcher description",
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://example.test/dispatcher-description",
+        media_mode="legacy_auto",
     )
     event_admin_router._parent_router = None
     dp = Dispatcher(storage=MemoryStorage())
@@ -1490,6 +1492,7 @@ async def test_telegram_long_description_preview_is_bounded(db_session_maker, mo
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://example.test/long-preview",
         description="x" * 5000,
+        media_mode="legacy_auto",
     )
     storage = MemoryStorage()
     state = FSMContext(storage=storage, key=MagicMock(bot_id=1, chat_id=12345, user_id=12345))
@@ -1512,6 +1515,7 @@ async def test_telegram_description_chunks_append_and_runtime_split_after_save(d
         title="Chunked Telegram description",
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://example.test/chunks",
+        media_mode="legacy_auto",
     )
     storage = MemoryStorage()
     state = FSMContext(storage=storage, key=MagicMock(bot_id=1, chat_id=12345, user_id=12345))
@@ -2543,22 +2547,23 @@ async def test_telegram_real_dispatcher_custom_emoji_title_journey(db_session_ma
         methods = await _feed_callback(dp, bot, f"admin_ev_edit_title_{scen.id}")
         assert any(isinstance(m, EditMessageText) for m in methods)
 
-        # Send title containing custom emoji tag
+        # Send title containing custom emoji tag (input may use id="...", output normalizes to emoji-id="...")
         emoji_title = '<tg-emoji id="5368324170671202286">🔥</tg-emoji> Горячий вебинар'
+        normalized_title = '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Горячий вебинар'
         methods = await _feed_message(dp, bot, emoji_title)
         saved_msg = next(m for m in methods if isinstance(m, SendMessage))
-        # Must preserve <tg-emoji> without escaping into &lt;tg-emoji&gt;
-        assert '<tg-emoji id="5368324170671202286">🔥</tg-emoji>' in saved_msg.text
+        # Must preserve <tg-emoji> with normalized emoji-id without escaping into &lt;tg-emoji&gt;
+        assert normalized_title in saved_msg.text
         assert '&lt;tg-emoji' not in saved_msg.text
 
         # Reopen card
         methods = await _feed_callback(dp, bot, f"admin_ev_open_{scen.id}")
         card = next(m for m in methods if isinstance(m, EditMessageText))
-        assert '<tg-emoji id="5368324170671202286">🔥</tg-emoji>' in card.text
+        assert normalized_title in card.text
 
         async with db_session_maker() as session:
             db_scen = await session.get(EventScenario, scen.id)
-            assert db_scen.title == emoji_title
+            assert db_scen.title == normalized_title
             assert len(db_scen.title) <= 1000
     finally:
         for router in routers:

@@ -1449,10 +1449,11 @@ async def test_max_mandatory_a_to_ya_to_a_journey(session_factory, monkeypatch):
     monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", session_factory)
     monkeypatch.setattr("max_messenger_bot.services.common.async_session_maker", session_factory)
     monkeypatch.setattr("max_messenger_bot.app.async_session_maker", session_factory)
+    monkeypatch.setattr("followups.async_session_maker", session_factory)
     monkeypatch.setattr(max_ai, "async_session_maker", session_factory)
 
-    max_user_id = 777 + MAX_ID_OFFSET
-    chat_id = 777
+    max_user_id = 771 + MAX_ID_OFFSET
+    chat_id = 771
 
     async with session_factory() as s:
         cfg = await s.get(AIConfig, 1)
@@ -1550,7 +1551,7 @@ async def test_max_mandatory_a_to_ya_to_a_journey(session_factory, monkeypatch):
         "message": {
             "mid": "mid_user_1",
             "chat_id": chat_id,
-            "sender": {"user_id": 777, "first_name": "MaxUser", "name": "MaxUser"},
+            "sender": {"user_id": 771, "first_name": "MaxUser", "name": "MaxUser"},
             "recipient": {"chat_id": chat_id},
             "text": test_prompt,
         },
@@ -1559,6 +1560,8 @@ async def test_max_mandatory_a_to_ya_to_a_journey(session_factory, monkeypatch):
     await app.handle_update(user_msg_update)
     if max_user_id in app.user_tasks:
         await app.user_tasks[max_user_id]
+    if hasattr(app, "background_tasks") and app.background_tasks:
+        await asyncio.gather(*list(app.background_tasks), return_exceptions=True)
     assert not single_flight.is_busy("max", max_user_id)
 
     assert len(primary_calls) == 1
@@ -1608,11 +1611,12 @@ async def test_max_mandatory_a_to_ya_to_a_journey(session_factory, monkeypatch):
     retry_update = {
         "update_id": "max_up_2",
         "update_type": "message_callback",
+        "message": {"mid": "mid_failure_msg", "chat_id": chat_id},
         "callback": {
             "callback_id": "cb_max_1",
             "chat_id": chat_id,
             "payload": rendered_btn["payload"],
-            "sender": {"user_id": 777, "first_name": "MaxUser"},
+            "sender": {"user_id": 771, "first_name": "MaxUser"},
             "message": {
                 "mid": "mid_failure_msg",
                 "chat_id": chat_id,
@@ -1623,6 +1627,8 @@ async def test_max_mandatory_a_to_ya_to_a_journey(session_factory, monkeypatch):
     await app.handle_update(retry_update)
     if max_user_id in app.user_tasks:
         await app.user_tasks[max_user_id]
+    if hasattr(app, "background_tasks") and app.background_tasks:
+        await asyncio.gather(*list(app.background_tasks), return_exceptions=True)
     assert not single_flight.is_busy("max", max_user_id)
 
     # Verify primary provider was called on retry with prompt
@@ -1896,6 +1902,7 @@ async def test_max_forged_ordinary_message_callback_rejected(session_factory, mo
     monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", session_factory)
     monkeypatch.setattr("max_messenger_bot.services.common.async_session_maker", session_factory)
     monkeypatch.setattr("max_messenger_bot.app.async_session_maker", session_factory)
+    monkeypatch.setattr("followups.async_session_maker", session_factory)
     monkeypatch.setattr(max_ai, "async_session_maker", session_factory)
 
     max_user_id = 888 + MAX_ID_OFFSET
@@ -1976,8 +1983,8 @@ async def test_max_forged_non_retryable_failed_log_rejected(session_factory, mon
     monkeypatch.setattr("max_messenger_bot.app.async_session_maker", session_factory)
     monkeypatch.setattr(max_ai, "async_session_maker", session_factory)
 
-    max_user_id = 889 + MAX_ID_OFFSET
-    chat_id = 889
+    max_user_id = 888 + MAX_ID_OFFSET
+    chat_id = 888
 
     async with session_factory() as s:
         cfg = AIConfig(id=1, provider="Gemini", gemini_model="gemini-2.5-flash", gemini_api_key="k", allow_fallback=False)
@@ -2285,10 +2292,11 @@ async def test_max_terminal_failure_retry_stale_topic_journey(session_factory, m
     monkeypatch.setattr("max_messenger_bot.storage.async_session_maker", session_factory)
     monkeypatch.setattr("max_messenger_bot.services.common.async_session_maker", session_factory)
     monkeypatch.setattr("max_messenger_bot.app.async_session_maker", session_factory)
+    monkeypatch.setattr("followups.async_session_maker", session_factory)
     monkeypatch.setattr(max_ai, "async_session_maker", session_factory)
 
-    max_user_id = 888 + MAX_ID_OFFSET
-    chat_id = 888
+    max_user_id = 889 + MAX_ID_OFFSET
+    chat_id = 889
 
     async with session_factory() as s:
         cfg = await s.get(AIConfig, 1)
@@ -2380,7 +2388,7 @@ async def test_max_terminal_failure_retry_stale_topic_journey(session_factory, m
         "message": {
             "mid": "mid_u_123",
             "chat_id": chat_id,
-            "sender": {"user_id": 888, "first_name": "MaxAlice", "name": "MaxAlice"},
+            "sender": {"user_id": 889, "first_name": "MaxAlice", "name": "MaxAlice"},
             "recipient": {"chat_id": chat_id},
             "text": test_prompt,
         },
@@ -2388,6 +2396,8 @@ async def test_max_terminal_failure_retry_stale_topic_journey(session_factory, m
     await app.handle_update(msg_update)
     if max_user_id in app.user_tasks:
         await app.user_tasks[max_user_id]
+    if hasattr(app, "background_tasks") and app.background_tasks:
+        await asyncio.gather(*list(app.background_tasks), return_exceptions=True)
 
     assert len(primary_calls) == 1
     assert len(fallback_calls) == 1
@@ -2411,16 +2421,19 @@ async def test_max_terminal_failure_retry_stale_topic_journey(session_factory, m
     cb_update_none = {
         "update_id": "up_cb_none",
         "update_type": "message_callback",
+        "message": {"mid": "mid_fail_msg", "chat_id": chat_id},
         "callback": {
             "callback_id": "cb_id_none",
             "payload": callback_payload,
-            "user": {"user_id": 888, "first_name": "MaxAlice", "name": "MaxAlice"},
+            "user": {"user_id": 889, "first_name": "MaxAlice", "name": "MaxAlice"},
             "message": {"mid": "mid_fail_msg", "chat_id": chat_id},
         },
     }
     await app.handle_update(cb_update_none)
     if max_user_id in app.user_tasks:
         await app.user_tasks[max_user_id]
+    if hasattr(app, "background_tasks") and app.background_tasks:
+        await asyncio.gather(*list(app.background_tasks), return_exceptions=True)
 
     # Assert: zero new provider calls
     assert len(primary_calls) == 1
@@ -2455,16 +2468,19 @@ async def test_max_terminal_failure_retry_stale_topic_journey(session_factory, m
     cb_update_456 = {
         "update_id": "up_cb_456",
         "update_type": "message_callback",
+        "message": {"mid": "mid_fail_msg", "chat_id": chat_id},
         "callback": {
             "callback_id": "cb_id_456",
             "payload": callback_payload,
-            "user": {"user_id": 888, "first_name": "MaxAlice", "name": "MaxAlice"},
+            "user": {"user_id": 889, "first_name": "MaxAlice", "name": "MaxAlice"},
             "message": {"mid": "mid_fail_msg", "chat_id": chat_id},
         },
     }
     await app.handle_update(cb_update_456)
     if max_user_id in app.user_tasks:
         await app.user_tasks[max_user_id]
+    if hasattr(app, "background_tasks") and app.background_tasks:
+        await asyncio.gather(*list(app.background_tasks), return_exceptions=True)
 
     assert len(primary_calls) == 1
     assert len(fallback_calls) == 1
