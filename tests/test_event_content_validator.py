@@ -31,6 +31,7 @@ from event_content_validator import (
     EventContentValidationError,
     TelegramHtmlValidator,
     calculate_available_description_chars,
+    format_event_html_title,
     get_media_format,
     parse_visible_telegram_text,
     render_plain_text_for_max,
@@ -471,4 +472,203 @@ def test_title_validation_visible_length_vs_storage_length():
     with pytest.raises(ValueError) as exc:
         validate_scenario_input(title=title_raw, **common_kwargs)
     assert "предел хранения (1000 символов)" in str(exc.value)
+
+
+def test_format_event_html_title_prevents_double_escaping_and_handles_legacy_plain_text():
+    # 1. Plain unescaped text (e.g. historical DB records or direct text input)
+    plain_title = "Презентация & Встреча <Новый сезон>"
+    formatted_plain = format_event_html_title(plain_title, platform="telegram")
+    assert formatted_plain == "Презентация &amp; Встреча &lt;Новый сезон&gt;"
+
+    # 2. Already escaped HTML text (e.g. from aiogram message.html_text)
+    # Must NOT double-escape into &amp;amp; or &amp;lt;
+    escaped_title = "Презентация &amp; Встреча &lt;Новый сезон&gt;"
+    formatted_escaped = format_event_html_title(escaped_title, platform="telegram")
+    assert formatted_escaped == "Презентация &amp; Встреча &lt;Новый сезон&gt;"
+    assert "&amp;amp;" not in formatted_escaped
+    assert "&amp;lt;" not in formatted_escaped
+
+    # 3. Custom emoji tags mixed with HTML entities
+    mixed_title = 'Старт курса &amp; <tg-emoji emoji-id="123456789">🚀</tg-emoji> &lt;PRO&gt;'
+    formatted_mixed = format_event_html_title(mixed_title, platform="telegram")
+    assert formatted_mixed == 'Старт курса &amp; <tg-emoji emoji-id="123456789">🚀</tg-emoji> &lt;PRO&gt;'
+    assert "&amp;amp;" not in formatted_mixed
+    assert "&amp;lt;" not in formatted_mixed
+
+    # 4. Custom emoji tags with legacy attribute variants
+    legacy_attr_title = 'Старт & <tg-emoji id="777">⭐</tg-emoji> <VIP>'
+    formatted_legacy = format_event_html_title(legacy_attr_title, platform="telegram")
+    assert formatted_legacy == 'Старт &amp; <tg-emoji emoji-id="777">⭐</tg-emoji> &lt;VIP&gt;'
+
+    # 5. MAX platform formatting: strips tg-emoji tags to fallback and escapes without double escaping
+    max_formatted = format_event_html_title(mixed_title, platform="max")
+    assert max_formatted == "Старт курса &amp; 🚀 &lt;PRO&gt;"
+    assert "<tg-emoji" not in max_formatted
+    assert "&amp;amp;" not in max_formatted
+
+    # 6. None or empty title
+    assert format_event_html_title("", platform="telegram") == ""
+    assert format_event_html_title(None, platform="telegram") == ""
+
+
+def test_title_visible_length_calculation_with_html_parser():
+    from event_admin_service import validate_scenario_input
+
+    future = datetime.utcnow() + timedelta(days=2)
+    common_kwargs = {
+        "code": "visible_len_code",
+        "event_type": "webinar",
+        "starts_at_utc": future,
+        "duration_minutes": 60,
+        "place": None,
+        "link": "https://example.test",
+    }
+
+    # "Q&amp;A" has raw length 7, but visible length 3
+    vis, vis_len, errs = parse_visible_telegram_text("Q&amp;A")
+    assert vis == "Q&A"
+    assert vis_len == 3
+    assert not errs
+
+    # Title of 998 visible chars + entities like &amp; whose raw length is > 1000
+    # Visible text is <= 1000, but raw storage exceeds 1000
+    # "A" * 990 + " &amp; " (visible " & ", 3 chars) = 993 visible chars
+    # plus multiple tg-emoji tags that push raw storage over 1000
+    emoji = '<tg-emoji emoji-id="123">🔥</tg-emoji>'
+    title = ("A" * 980) + " &amp; " + (emoji * 3)
+    vis, vis_len, _ = parse_visible_telegram_text(title)
+    assert len(vis) < 1000
+    assert len(title) > 1000
+
+    with pytest.raises(ValueError) as exc:
+        validate_scenario_input(title=title, **common_kwargs)
+    assert "предел хранения (1000 символов)" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_media_provenance_preservation_and_telegram_delivery_of_max_origin_media(test_session_maker):
+    from unittest.mock import AsyncMock, MagicMock
+    from sqlalchemy import select
+    from aiogram import Bot
+    from database import EventScenario, EventScenarioMedia
+    from event_admin_service import (
+        create_scenario,
+        list_scenario_media,
+        replace_scenario_media,
+        update_scenario_fields,
+    )
+    from event_delivery_worker import _build_delivery_plan, _send_delivery_part
+
+    scen = await create_scenario(
+        test_session_maker,
+        code="prov_test_scen",
+        event_type="webinar",
+        title="Provenance Test Webinar",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/prov",
+        media_format="separate_media_top",
+    )
+
+    # 1. Add media originally uploaded from MAX
+    media_items = [
+        {
+            "file_type": "photo",
+            "file_id": "max_token_photo_1",
+            "max_token": "max_token_photo_1",
+            "source_platform": "max",
+            "source_file_id": "max_token_photo_1",
+        },
+        {
+            "file_type": "video",
+            "file_id": "max_token_video_2",
+            "max_token": "max_token_video_2",
+            "source_platform": "max",
+            "source_file_id": "max_token_video_2",
+        },
+    ]
+    await replace_scenario_media(test_session_maker, scen.id, media_items)
+
+    # 2. Verify list_scenario_media preserves source_platform and source_file_id
+    listed = await list_scenario_media(test_session_maker, scen.id)
+    assert len(listed) == 2
+    assert listed[0].source_platform == "max"
+    assert listed[0].source_file_id == "max_token_photo_1"
+    assert listed[1].source_platform == "max"
+    assert listed[1].source_file_id == "max_token_video_2"
+
+    # 3. Simulate admin reordering in draft and saving atomically via update_scenario_fields
+    reordered_draft = [
+        {
+            "file_type": listed[1].file_type,
+            "file_id": listed[1].file_id,
+            "max_token": listed[1].max_token,
+            "source_platform": listed[1].source_platform,
+            "source_file_id": listed[1].source_file_id,
+        },
+        {
+            "file_type": listed[0].file_type,
+            "file_id": listed[0].file_id,
+            "max_token": listed[0].max_token,
+            "source_platform": listed[0].source_platform,
+            "source_file_id": listed[0].source_file_id,
+        },
+    ]
+    await update_scenario_fields(
+        test_session_maker,
+        scen.id,
+        media_items=reordered_draft,
+    )
+
+    # Verify reordered rows retain source_platform and source_file_id
+    listed_reordered = await list_scenario_media(test_session_maker, scen.id)
+    assert listed_reordered[0].file_id == "max_token_video_2"
+    assert listed_reordered[0].source_platform == "max"
+    assert listed_reordered[0].source_file_id == "max_token_video_2"
+    assert listed_reordered[1].file_id == "max_token_photo_1"
+    assert listed_reordered[1].source_platform == "max"
+    assert listed_reordered[1].source_file_id == "max_token_photo_1"
+
+    # 4. Build delivery plan and verify items preserve source_platform and source_file_id
+    from sqlalchemy.orm import selectinload
+    async with test_session_maker() as session:
+        scen_row = (await session.execute(
+            select(EventScenario)
+            .where(EventScenario.id == scen.id)
+            .options(selectinload(EventScenario.media))
+        )).scalar_one()
+
+    plan = _build_delivery_plan(scen_row, scen.id, "Announcement text", include_media=True)
+    assert len(plan) >= 2
+    media_part = plan[0]
+    assert media_part["kind"] == "media"
+    assert len(media_part["items"]) == 2
+    assert media_part["items"][0]["source_platform"] == "max"
+    assert media_part["items"][0]["source_file_id"] == "max_token_video_2"
+    assert media_part["items"][1]["source_platform"] == "max"
+    assert media_part["items"][1]["source_file_id"] == "max_token_photo_1"
+
+    # 5. Deliver to Telegram user: verify telegram_media_reference downloads from MAX and wraps in BufferedInputFile
+    bot = AsyncMock(spec=Bot)
+    bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=101), MagicMock(message_id=102)])
+    max_client = AsyncMock()
+    max_client.download_attachment = AsyncMock(side_effect=[b"fake-video-bytes", b"fake-photo-bytes"])
+
+    sent_id = await _send_delivery_part(
+        media_part,
+        platform="telegram",
+        user_id=55555,
+        event_id=scen.id,
+        is_last=False,
+        bot=bot,
+        max_client=max_client,
+    )
+    assert sent_id == "101,102"
+    assert max_client.download_attachment.await_count == 2
+    # Verify bot.send_media_group received BufferedInputFile
+    call_media = bot.send_media_group.call_args.kwargs["media"]
+    assert len(call_media) == 2
+    from aiogram.types import BufferedInputFile
+    assert isinstance(call_media[0].media, BufferedInputFile)
+    assert isinstance(call_media[1].media, BufferedInputFile)
+
 

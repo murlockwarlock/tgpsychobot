@@ -3030,12 +3030,24 @@ async def test_telegram_cross_event_draft_stale_callback_rejection_journey(db_se
 
 @pytest.mark.asyncio
 async def test_telegram_holistic_draft_media_save_journey(db_session_maker, monkeypatch):
-    """Journey: input description -> edit title -> change format -> add media -> Cancel -> repeat with Save Media.
-    Verifies that Save Media commits description, title, format, and media items atomically in one transaction."""
+    """Holistic A -> Я -> A journey:
+    1. Start from scenario card callback
+    2. Inspect visible keyboard to navigate to edit menu
+    3. Modify description, title with entities/custom-emoji, format, add photo + video, reorder
+    4. Cancel draft -> verify DB untouched, reopen card
+    5. Phase 2: Repeat modifications through Dispatcher, execute Save Media
+    6. Validate all outgoing aiogram method calls via Pydantic model_validate
+    7. Verify DB atomically committed with media provenance (source_platform, source_file_id)
+    8. Reopen card -> verify clean rendering without double escaping
+    9. Execute runtime delivery plan -> verify correct message order and delivery
+    """
     import handlers
-    from aiogram.types import PhotoSize
-    from database import EventScenario
+    from aiogram.types import PhotoSize, Video
+    from aiogram.methods import SendMessage, EditMessageText, AnswerCallbackQuery
+    from database import EventScenario, EventScenarioMedia
     from event_admin_service import create_scenario, list_scenario_media
+    from event_delivery_worker import _build_delivery_plan, _send_delivery_part
+    from sqlalchemy.orm import selectinload
 
     monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
     monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
@@ -3060,26 +3072,80 @@ async def test_telegram_holistic_draft_media_save_journey(db_session_maker, monk
         router._parent_router = None
         dp.include_router(router)
 
+    async def feed_callback(data: str):
+        methods = await _feed_callback(dp, bot, data)
+        for method in methods:
+            if hasattr(method, "model_dump"):
+                method.__class__.model_validate(method.model_dump())
+        return methods
+
+    async def feed_message(text: str, **kwargs):
+        methods = await _feed_message(dp, bot, text, **kwargs)
+        for method in methods:
+            if hasattr(method, "model_dump"):
+                method.__class__.model_validate(method.model_dump())
+        return methods
+
+    def find_button(methods, prefix: str) -> str:
+        for method in methods:
+            if not isinstance(method, (EditMessageText, SendMessage)) or method.reply_markup is None:
+                continue
+            for row in method.reply_markup.inline_keyboard:
+                for button in row:
+                    if button.callback_data and button.callback_data.startswith(prefix):
+                        return button.callback_data
+        raise AssertionError(f"Button with prefix '{prefix}' not found in methods: {methods}")
+
     try:
+        # Step 1: Open card
+        methods = await feed_callback(f"admin_ev_open_{scen.id}_0_1")
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+
         # Phase 1: Modify description, title, format, media, then CANCEL
         # 1. Edit description
-        await _feed_callback(dp, bot, f"admin_ev_edit_description_{scen.id}")
-        await _feed_message(dp, bot, "Pending Draft Description")
+        methods = await feed_callback(edit_menu_cb)
+        desc_btn_cb = find_button(methods, f"admin_ev_edit_description_{scen.id}")
+        methods = await feed_callback(desc_btn_cb)
+        methods = await feed_message("Pending Draft Description")
+        assert any("Pending Draft Description" in (m.text or "") for m in methods if isinstance(m, (SendMessage, EditMessageText)))
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_menu_cb)
 
-        # 2. Edit title
-        await _feed_callback(dp, bot, f"admin_ev_edit_title_{scen.id}")
-        await _feed_message(dp, bot, "Pending Draft Title")
+        # 2. Edit title with custom emoji
+        title_btn_cb = find_button(methods, f"admin_ev_edit_title_{scen.id}")
+        methods = await feed_callback(title_btn_cb)
+        methods = await feed_message('Draft Title & <tg-emoji emoji-id="111">⭐</tg-emoji> <Pending>')
+        # Verify no double escaping in response
+        assert not any("&amp;amp;" in (m.text or "") for m in methods if isinstance(m, (SendMessage, EditMessageText)))
 
         # 3. Change format
-        await _feed_callback(dp, bot, f"admin_ev_set_fmt_{scen.id}_separate_text_top")
+        fmt_btn_cb = find_button(methods, f"admin_ev_format_menu_{scen.id}")
+        methods = await feed_callback(fmt_btn_cb)
+        set_fmt_cb = find_button(methods, f"admin_ev_set_fmt_{scen.id}_separate_text_top")
+        methods = await feed_callback(set_fmt_cb)
+        assert any("Выбран формат" in (m.text or "") for m in methods if isinstance(m, (SendMessage, EditMessageText)))
+
+        # Reopen format menu to verify radio button indicator
+        fmt_btn_cb = find_button(methods, f"admin_ev_format_menu_{scen.id}")
+        methods = await feed_callback(fmt_btn_cb)
+        assert any("🔘" in b.text for m in methods if hasattr(m, "reply_markup") and m.reply_markup for row in m.reply_markup.inline_keyboard for b in row if "медиа ниже" in b.text.lower())
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_menu_cb)
 
         # 4. Add media
-        await _feed_callback(dp, bot, f"admin_ev_media_add_{scen.id}")
+        media_btn_cb = find_button(methods, f"admin_ev_edit_media_{scen.id}")
+        methods = await feed_callback(media_btn_cb)
+        add_media_cb = find_button(methods, f"admin_ev_media_add_{scen.id}")
+        methods = await feed_callback(add_media_cb)
         mock_photo = [PhotoSize(file_id="tg_photo_draft_1", file_unique_id="u1", width=100, height=100)]
-        await _feed_message(dp, bot, "", photo=mock_photo)
+        methods = await feed_message("", photo=mock_photo)
+        assert any("В черновике: <b>1</b>" in (m.text or "") for m in methods if isinstance(m, (SendMessage, EditMessageText)))
 
         # 5. Cancel draft
-        await _feed_callback(dp, bot, f"admin_ev_cancel_draft_{scen.id}")
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_menu_cb)
+        cancel_cb = find_button(methods, f"admin_ev_cancel_draft_{scen.id}")
+        methods = await feed_callback(cancel_cb)
 
         # Verify DB is completely untouched
         async with db_session_maker() as session:
@@ -3091,38 +3157,123 @@ async def test_telegram_holistic_draft_media_save_journey(db_session_maker, monk
         assert len(media_after_cancel) == 0
 
         # Phase 2: Modify description, title, format, media, and SAVE MEDIA
-        # 1. Edit description
-        await _feed_callback(dp, bot, f"admin_ev_edit_description_{scen.id}")
-        await _feed_message(dp, bot, "Final Saved Description")
+        methods = await feed_callback(f"admin_ev_open_{scen.id}_0_1")
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_menu_cb)
 
-        # 2. Edit title
-        await _feed_callback(dp, bot, f"admin_ev_edit_title_{scen.id}")
-        await _feed_message(dp, bot, "Final Saved Title")
+        # 1. Edit description
+        desc_btn_cb = find_button(methods, f"admin_ev_edit_description_{scen.id}")
+        methods = await feed_callback(desc_btn_cb)
+        methods = await feed_message("Final Saved Description")
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_menu_cb)
+
+        # 2. Edit title with custom emoji and HTML entities
+        title_btn_cb = find_button(methods, f"admin_ev_edit_title_{scen.id}")
+        methods = await feed_callback(title_btn_cb)
+        methods = await feed_message('Final Title & <tg-emoji emoji-id="222">🚀</tg-emoji> <Final>')
 
         # 3. Change format to separate_text_top
-        await _feed_callback(dp, bot, f"admin_ev_set_fmt_{scen.id}_separate_text_top")
+        fmt_btn_cb = find_button(methods, f"admin_ev_format_menu_{scen.id}")
+        methods = await feed_callback(fmt_btn_cb)
+        set_fmt_cb = find_button(methods, f"admin_ev_set_fmt_{scen.id}_separate_text_top")
+        methods = await feed_callback(set_fmt_cb)
+        edit_menu_cb = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_menu_cb)
 
-        # 4. Add media
-        await _feed_callback(dp, bot, f"admin_ev_media_add_{scen.id}")
+        # 4. Add media 1 (photo)
+        media_btn_cb = find_button(methods, f"admin_ev_edit_media_{scen.id}")
+        methods = await feed_callback(media_btn_cb)
+        add_media_cb = find_button(methods, f"admin_ev_media_add_{scen.id}")
+        methods = await feed_callback(add_media_cb)
         mock_photo = [PhotoSize(file_id="tg_photo_final_1", file_unique_id="u2", width=200, height=200)]
-        await _feed_message(dp, bot, "", photo=mock_photo)
+        methods = await feed_message("", photo=mock_photo)
 
-        # 5. Click Save Media (admin_ev_media_save_{scen.id})
-        methods = await _feed_callback(dp, bot, f"admin_ev_media_save_{scen.id}")
+        # Add media 2 (video)
+        add_media_cb = find_button(methods, f"admin_ev_media_add_{scen.id}")
+        methods = await feed_callback(add_media_cb)
+        mock_video = Video(file_id="tg_video_final_2", file_unique_id="u3", width=200, height=200, duration=10)
+        methods = await feed_message("", video=mock_video)
+        assert any("В черновике: <b>2</b>" in (m.text or "") for m in methods if isinstance(m, (SendMessage, EditMessageText)))
+
+        # 5. Reorder media: move item 2 up to position 0
+        move_up_cb = find_button(methods, f"admin_ev_media_up_{scen.id}_1")
+        methods = await feed_callback(move_up_cb)
+
+        # 6. Click Save Media (admin_ev_media_save_{scen.id})
+        save_media_cb = find_button(methods, f"admin_ev_media_save_{scen.id}")
+        methods = await feed_callback(save_media_cb)
         assert any(
             isinstance(m, (SendMessage, EditMessageText)) and "сохранены" in (m.text or "")
             for m in methods
         )
 
-        # Verify DB is atomically updated with ALL changes
+        # 7. Verify DB is atomically updated with ALL changes and media provenance
         async with db_session_maker() as session:
             s_final = await session.get(EventScenario, scen.id)
-            assert s_final.title == "Final Saved Title"
+            assert s_final.title == 'Final Title &amp; <tg-emoji emoji-id="222">🚀</tg-emoji> &lt;Final&gt;'
             assert s_final.description == "Final Saved Description"
             assert s_final.media_format == "separate_text_top"
         media_final = await list_scenario_media(db_session_maker, scen.id)
-        assert len(media_final) == 1
-        assert media_final[0].file_id == "tg_photo_final_1"
+        assert len(media_final) == 2
+        # First item was moved up: video
+        assert media_final[0].file_id == "tg_video_final_2"
+        assert media_final[0].file_type == "video"
+        assert media_final[0].source_platform == "telegram"
+        assert media_final[0].source_file_id == "tg_video_final_2"
+        # Second item: photo
+        assert media_final[1].file_id == "tg_photo_final_1"
+        assert media_final[1].file_type == "photo"
+        assert media_final[1].source_platform == "telegram"
+        assert media_final[1].source_file_id == "tg_photo_final_1"
+
+        # 8. Reopen card callback and verify clean rendered card
+        methods = await feed_callback(f"admin_ev_open_{scen.id}_0_1")
+        card_msg = next(m for m in methods if isinstance(m, (SendMessage, EditMessageText)))
+        assert "&amp;amp;" not in card_msg.text
+        assert "&amp;lt;" not in card_msg.text
+        assert "Final Title &amp;" in card_msg.text
+        assert "Медиа:</b> 2" in card_msg.text
+
+        # 9. Test runtime delivery plan execution
+        async with db_session_maker() as session:
+            scen_delivery = (await session.execute(
+                select(EventScenario).where(EventScenario.id == scen.id).options(selectinload(EventScenario.media))
+            )).scalar_one()
+
+        plan = _build_delivery_plan(scen_delivery, scen.id, "Runtime announcement", include_media=True)
+        # Because format is separate_text_top: text first, media second
+        assert len(plan) >= 2
+        assert plan[0]["kind"] == "text"
+        assert plan[1]["kind"] == "media"
+        assert len(plan[1]["items"]) == 2
+
+        # Send text part
+        bot_delivery = AsyncMock(spec=Bot)
+        bot_delivery.send_message = AsyncMock(return_value=MagicMock(message_id=501))
+        bot_delivery.send_media_group = AsyncMock(return_value=[MagicMock(message_id=502), MagicMock(message_id=503)])
+
+        sent_text_id = await _send_delivery_part(
+            plan[0],
+            platform="telegram",
+            user_id=8888,
+            event_id=scen.id,
+            is_last=False,
+            bot=bot_delivery,
+            max_client=None,
+        )
+        assert sent_text_id == "501"
+
+        sent_media_id = await _send_delivery_part(
+            plan[1],
+            platform="telegram",
+            user_id=8888,
+            event_id=scen.id,
+            is_last=True,
+            bot=bot_delivery,
+            max_client=None,
+        )
+        assert sent_media_id == "502,503"
     finally:
         for router in routers:
             router._parent_router = original_parents[router]

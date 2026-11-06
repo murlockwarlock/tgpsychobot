@@ -524,14 +524,15 @@ async def receive_create_title(
     raw_title: str,
 ) -> None:
     title = raw_title.strip()
-    visible_title = strip_telegram_custom_emoji(title)
-    if not title:
+    vis_text, visible_len, _ = parse_visible_telegram_text(title)
+    if not title or not vis_text.strip():
         await client.send_message(chat_id=chat_id, text="❌ Название мероприятия не может быть пустым.")
         return
-    if len(visible_title) > EVENT_TITLE_MAX_LENGTH:
+    eff_visible_len = max(visible_len, len(vis_text))
+    if eff_visible_len > EVENT_TITLE_MAX_LENGTH:
         await client.send_message(
             chat_id=chat_id,
-            text=f"❌ Длина названия ({len(visible_title)} симв.) превышает максимально допустимую ({EVENT_TITLE_MAX_LENGTH} симв.).",
+            text=f"❌ Длина названия ({eff_visible_len} симв.) превышает максимально допустимую ({EVENT_TITLE_MAX_LENGTH} симв.).",
         )
         return
     if len(title) > EVENT_TITLE_MAX_LENGTH:
@@ -903,6 +904,7 @@ async def set_format_handler(
             [callback_button("🖼 Управление медиа", f"admin_ev_edit_media_{event_id}")],
             [callback_button("⚙️ Выбрать другой формат", f"admin_ev_format_menu_{event_id}")],
             [callback_button("❌ Отмена (сбросить черновик)", f"admin_ev_cancel_draft_{event_id}")],
+            _back(_event_edit_menu_callback(event_id, list_back)),
         ]
         desc_info = f"\n📝 Описание в черновике: {len(snapshot.data['description_draft'])} симв." if snapshot.data.get("description_draft") is not None else ""
         await client.send_message(
@@ -1336,7 +1338,16 @@ async def show_media_editor(client: MaxApiClient, states: StateStore, chat_id: i
         draft = list(snapshot.data["media_draft"])
     else:
         media = await list_scenario_media(async_session_maker, event_id)
-        draft = [{"file_type": item.file_type, "file_id": item.file_id, "max_token": item.max_token, "source_platform": item.source_platform} for item in media]
+        draft = [
+            {
+                "file_type": item.file_type,
+                "file_id": item.file_id,
+                "max_token": item.max_token,
+                "source_platform": item.source_platform,
+                "source_file_id": item.source_file_id or item.file_id,
+            }
+            for item in media
+        ]
     new_data = dict(snapshot.data) if snapshot and snapshot.data.get("event_id") == event_id else {}
     new_data.update({"event_id": event_id, "media_draft": draft, "media_draft_dirty": bool(preserve_draft), "event_list_back": list_back})
     await states.set(user_id, chat_id, "max_event_edit_media", new_data)
@@ -1365,7 +1376,13 @@ async def receive_media(client: MaxApiClient, states: StateStore, chat_id: int, 
         await client.send_message(chat_id=chat_id, text="❌ Отправьте фото или видео.")
         return
     draft = list(snapshot.data.get("media_draft", []))
-    draft.append({"file_type": "photo" if media_type == "image" else media_type, "file_id": media_token, "max_token": media_token, "source_platform": "max"})
+    draft.append({
+        "file_type": "photo" if media_type == "image" else media_type,
+        "file_id": media_token,
+        "max_token": media_token,
+        "source_platform": "max",
+        "source_file_id": media_token,
+    })
     new_data = dict(snapshot.data)
     new_data.update({"event_id": snapshot.data["event_id"], "media_draft": draft, "media_draft_dirty": True, "event_list_back": snapshot.data.get("event_list_back", "admin_events")})
     await states.set(user_id, chat_id, "max_event_edit_media", new_data)
@@ -1496,16 +1513,17 @@ async def receive_edit_title(client: MaxApiClient, states: StateStore, chat_id: 
     event_id = state_obj.data["event_id"]
     list_back = state_obj.data.get("event_list_back", "admin_events")
     title = raw_title.strip()
-    visible_title = strip_telegram_custom_emoji(title)
+    vis_text, visible_len, _ = parse_visible_telegram_text(title)
 
-    if not title:
+    if not title or not vis_text.strip():
         await client.send_message(chat_id=chat_id, text="❌ Название мероприятия не может быть пустым.")
         return
 
-    if len(visible_title) > EVENT_TITLE_MAX_LENGTH:
+    eff_visible_len = max(visible_len, len(vis_text))
+    if eff_visible_len > EVENT_TITLE_MAX_LENGTH:
         await client.send_message(
             chat_id=chat_id,
-            text=f"❌ Длина названия ({len(visible_title)} симв.) превышает максимально допустимую ({EVENT_TITLE_MAX_LENGTH} симв.).",
+            text=f"❌ Длина названия ({eff_visible_len} симв.) превышает максимально допустимую ({EVENT_TITLE_MAX_LENGTH} симв.).",
         )
         return
 
@@ -1531,6 +1549,7 @@ async def receive_edit_title(client: MaxApiClient, states: StateStore, chat_id: 
             [callback_button("⚙️ Изменить формат доставки", f"admin_ev_format_menu_{event_id}")],
             [callback_button("🖼 Управление медиа", f"admin_ev_edit_media_{event_id}")],
             [callback_button("❌ Отмена (сбросить черновик)", f"admin_ev_cancel_draft_{event_id}")],
+            _back(_event_edit_menu_callback(event_id, list_back)),
         ]
         await client.send_message(
             chat_id=chat_id,

@@ -789,9 +789,10 @@ async def process_create_title(message: Message, state: FSMContext) -> None:
         if not title:
             raise ValueError(f"Название не должно быть пустым и не может превышать {EVENT_TITLE_MAX_LENGTH} символов.")
         TelegramHtmlValidator.validate(title, allowed_tags=frozenset({"tg-emoji"}))
-        _, visible_len, _ = parse_visible_telegram_text(title)
-        if visible_len > EVENT_TITLE_MAX_LENGTH:
-            raise ValueError(f"Название не должно превышать {EVENT_TITLE_MAX_LENGTH} символов (сейчас: {visible_len}).")
+        vis_text, visible_len, _ = parse_visible_telegram_text(title)
+        eff_visible_len = max(visible_len, len(vis_text))
+        if eff_visible_len > EVENT_TITLE_MAX_LENGTH:
+            raise ValueError(f"Название не должно превышать {EVENT_TITLE_MAX_LENGTH} символов (сейчас: {eff_visible_len}).")
         if len(title) > EVENT_TITLE_MAX_LENGTH:
             raise ValueError(
                 f"Длина названия с учётом разметки ({len(title)} симв.) превышает максимально допустимый предел хранения ({EVENT_TITLE_MAX_LENGTH} символов)."
@@ -1068,7 +1069,9 @@ async def set_format_handler(callback: CallbackQuery, state: FSMContext) -> None
         kb.button(text="💾 Сохранить изменения черновика", callback_data=f"admin_ev_description_save_{event_id}")
         kb.button(text="✏️ Редактировать описание", callback_data=f"admin_ev_edit_description_{event_id}")
         kb.button(text="✏️ Изменить название", callback_data=f"admin_ev_edit_title_{event_id}")
+        kb.button(text="🖼 Управление медиа", callback_data=f"admin_ev_edit_media_{event_id}")
         kb.button(text="⚙️ Выбрать другой формат", callback_data=f"admin_ev_format_menu_{event_id}")
+        kb.button(text="⬅️ В меню редактирования", callback_data=_event_edit_menu_callback(event_id, list_back))
         kb.button(text="❌ Отмена (сбросить черновик)", callback_data=f"admin_ev_cancel_draft_{event_id}")
         kb.adjust(1)
         await callback.message.edit_text(
@@ -1328,10 +1331,11 @@ async def process_edit_title(message: Message, state: FSMContext) -> None:
 
     try:
         TelegramHtmlValidator.validate(title, allowed_tags=frozenset({"tg-emoji"}))
-        _, visible_len, _ = parse_visible_telegram_text(title)
-        if visible_len > EVENT_TITLE_MAX_LENGTH:
+        vis_text, visible_len, _ = parse_visible_telegram_text(title)
+        eff_visible_len = max(visible_len, len(vis_text))
+        if eff_visible_len > EVENT_TITLE_MAX_LENGTH:
             await message.answer(
-                f"❌ Длина названия ({visible_len} симв.) превышает максимально допустимую ({EVENT_TITLE_MAX_LENGTH} символов)."
+                f"❌ Длина названия ({eff_visible_len} симв.) превышает максимально допустимую ({EVENT_TITLE_MAX_LENGTH} символов)."
             )
             return
         if len(title) > EVENT_TITLE_MAX_LENGTH:
@@ -1354,7 +1358,9 @@ async def process_edit_title(message: Message, state: FSMContext) -> None:
         kb = InlineKeyboardBuilder()
         kb.button(text="💾 Сохранить изменения черновика", callback_data=f"admin_ev_description_save_{event_id}")
         kb.button(text="✏️ Редактировать описание", callback_data=f"admin_ev_edit_description_{event_id}")
+        kb.button(text="🖼 Управление медиа", callback_data=f"admin_ev_edit_media_{event_id}")
         kb.button(text="⚙️ Изменить формат доставки", callback_data=f"admin_ev_format_menu_{event_id}")
+        kb.button(text="⬅️ В меню редактирования", callback_data=_event_edit_menu_callback(event_id, list_back))
         kb.button(text="❌ Отмена (сбросить черновик)", callback_data=f"admin_ev_cancel_draft_{event_id}")
         kb.adjust(1)
         await message.answer(
@@ -1722,7 +1728,16 @@ async def start_edit_media(callback: CallbackQuery, state: FSMContext) -> None:
         draft = list(state_data["media_draft"])
     else:
         media = await list_scenario_media(async_session_maker, event_id)
-        draft = [{"file_type": item.file_type, "file_id": item.file_id, "max_token": item.max_token, "source_platform": item.source_platform} for item in media]
+        draft = [
+            {
+                "file_type": item.file_type,
+                "file_id": item.file_id,
+                "max_token": item.max_token,
+                "source_platform": item.source_platform,
+                "source_file_id": item.source_file_id or item.file_id,
+            }
+            for item in media
+        ]
     preserved_data = dict(state_data) if state_data.get("edit_event_id") == event_id else {}
     await state.clear()
     preserved_data.update(edit_event_id=event_id, media_draft=draft, media_draft_dirty=preserve_draft, event_list_back=list_back)
@@ -1759,7 +1774,13 @@ async def receive_media(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     draft = list(data.get("media_draft", []))
-    draft.append({"file_type": file_type, "file_id": file_id, "max_token": None, "source_platform": "telegram"})
+    draft.append({
+        "file_type": file_type,
+        "file_id": file_id,
+        "max_token": None,
+        "source_platform": "telegram",
+        "source_file_id": file_id,
+    })
     await state.update_data(media_draft=draft, media_draft_dirty=True)
     await state.set_state(EventAdminStates.edit_media)
     await _render_media_editor(message, data["edit_event_id"], state, edit=False)

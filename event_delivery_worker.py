@@ -215,6 +215,7 @@ def _build_delivery_plan(
                 "file_id": getattr(item, "file_id", ""),
                 "max_token": getattr(item, "max_token", None),
                 "source_platform": getattr(item, "source_platform", None),
+                "source_file_id": getattr(item, "source_file_id", None),
             })
         media_parts.append({"kind": "media", "items": items})
 
@@ -229,6 +230,7 @@ def _build_delivery_plan(
                 "file_id": getattr(media[0], "file_id", ""),
                 "max_token": getattr(media[0], "max_token", None),
                 "source_platform": getattr(media[0], "source_platform", None),
+                "source_file_id": getattr(media[0], "source_file_id", None),
             }], "caption": rendered_text}]
         else:
             text_parts = [{"kind": "text", "text": rendered_text}]
@@ -241,6 +243,7 @@ def _build_delivery_plan(
                 "file_id": getattr(media[0], "file_id", ""),
                 "max_token": getattr(media[0], "max_token", None),
                 "source_platform": getattr(media[0], "source_platform", None),
+                "source_file_id": getattr(media[0], "source_file_id", None),
             }], "caption": rendered_text}]
         else:
             text_parts = [{"kind": "text", "text": chunk} for chunk in text_chunks]
@@ -605,7 +608,7 @@ async def _send_delivery_part(
         async def telegram_media_reference(item: dict[str, Any], index: int) -> Any:
             if item.get("source_platform") != "max":
                 return item["file_id"]
-            token = item.get("max_token") or item.get("file_id")
+            token = item.get("max_token") or item.get("source_file_id") or item.get("file_id")
             if not token:
                 raise MediaMaterializationRequired("MAX media has no download token for Telegram delivery")
             if max_client is None:

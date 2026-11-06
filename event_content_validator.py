@@ -123,16 +123,19 @@ def normalize_telegram_custom_emoji_tags(text: str) -> str:
 def format_event_html_title(title: str, platform: str = "telegram") -> str:
     """
     Renders title safely:
-    - For Telegram: preserves and normalizes valid <tg-emoji> tags while escaping other unsafe HTML characters.
-    - For MAX: replaces <tg-emoji> tags with Unicode fallback and strips HTML markup tags.
+    - For Telegram: preserves and normalizes valid <tg-emoji> tags while escaping other unsafe HTML characters
+      without double-escaping existing HTML entities (&amp;, &lt;, &gt;, &quot;, &#39;).
+    - For MAX: replaces <tg-emoji> tags with Unicode fallback, unescapes, and safely escapes for HTML.
     """
     if not title:
         return ""
     if platform == "max":
         plain = strip_telegram_custom_emoji(title)
-        return html.escape(plain, quote=False)
+        unescaped = html.unescape(plain)
+        return html.escape(unescaped, quote=False)
     if "<tg-emoji" not in title:
-        return html.escape(title, quote=False)
+        unescaped = html.unescape(title)
+        return html.escape(unescaped, quote=False)
 
     emoji_tokens: list[str] = []
 
@@ -143,7 +146,8 @@ def format_event_html_title(title: str, platform: str = "telegram") -> str:
         return f"\x00EMOJI_{len(emoji_tokens) - 1}\x00"
 
     tokenized = _CUSTOM_EMOJI_PATTERN.sub(_repl, title)
-    escaped = html.escape(tokenized, quote=False)
+    unescaped = html.unescape(tokenized)
+    escaped = html.escape(unescaped, quote=False)
     for idx, token in enumerate(emoji_tokens):
         escaped = escaped.replace(f"\x00EMOJI_{idx}\x00", token)
     return escaped

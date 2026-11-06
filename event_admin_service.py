@@ -200,6 +200,7 @@ class ScenarioMediaItem:
     max_token: str | None
     source_platform: str | None
     sort_order: int
+    source_file_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -426,13 +427,13 @@ def validate_scenario_input(
             f"Название сценария обязательно и должно содержать от 1 до {EVENT_TITLE_MAX_LENGTH} символов."
         )
 
-    from event_content_validator import strip_telegram_custom_emoji
-    visible_title = strip_telegram_custom_emoji(title_clean)
-    if not visible_title:
+    from event_content_validator import parse_visible_telegram_text
+    visible_title, visible_len, _ = parse_visible_telegram_text(title_clean)
+    if not visible_title.strip():
         raise ValueError(
             f"Название сценария обязательно и должно содержать от 1 до {EVENT_TITLE_MAX_LENGTH} символов."
         )
-    if len(visible_title) > EVENT_TITLE_MAX_LENGTH:
+    if visible_len > EVENT_TITLE_MAX_LENGTH or len(visible_title) > EVENT_TITLE_MAX_LENGTH:
         raise ValueError(
             f"Название сценария обязательно и должно содержать от 1 до {EVENT_TITLE_MAX_LENGTH} символов."
         )
@@ -744,6 +745,7 @@ async def list_scenario_media(
                 file_id=row.file_id,
                 max_token=row.max_token,
                 source_platform=row.source_platform,
+                source_file_id=getattr(row, "source_file_id", None) or row.file_id,
                 sort_order=row.sort_order,
             )
             for row in rows
@@ -835,6 +837,8 @@ async def replace_scenario_media(
             row.file_type != item["file_type"]
             or row.file_id != item["file_id"]
             or row.max_token != item["max_token"]
+            or row.source_platform != item["source_platform"]
+            or row.source_file_id != item["source_file_id"]
             or row.sort_order != item["sort_order"]
             for row, item in zip(sorted(current, key=lambda value: (value.sort_order, value.id)), normalized)
         )
@@ -1056,6 +1060,8 @@ async def update_scenario_fields(
                 row.file_type != item["file_type"]
                 or row.file_id != item["file_id"]
                 or row.max_token != item["max_token"]
+                or row.source_platform != item["source_platform"]
+                or row.source_file_id != item["source_file_id"]
                 or row.sort_order != item["sort_order"]
                 for row, item in zip(sorted(current_media, key=lambda v: (v.sort_order, v.id)), normalized_media)
             )

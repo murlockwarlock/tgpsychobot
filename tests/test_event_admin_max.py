@@ -3147,94 +3147,326 @@ async def test_max_custom_emoji_fallback_render(db_session_maker, monkeypatch):
 @pytest.mark.asyncio
 async def test_max_holistic_draft_media_save_journey(db_session_maker, monkeypatch):
     """MAX Application Journey: description -> title -> format -> media -> Cancel -> repeat with Save Media.
-    Verifies that Save Media commits description, title, format, and media items atomically in one transaction."""
+    Verifies that Save Media commits description, title, format, and media items atomically in one transaction,
+    tested through real MaxBotApplication.handle_update() ingress with visible button inspection,
+    MAX transport validation (text <= 4000, attachments <= 12), and delivery plan execution."""
     from max_messenger_bot import app as max_app_module
     from max_messenger_bot.app import MaxBotApplication
     from max_messenger_bot.api import MaxApiClient
     from event_admin_service import create_scenario, list_scenario_media
-    from database import EventScenario
+    from event_delivery_worker import _build_delivery_plan, _send_delivery_part
+    from database import EventScenario, User
+    from sqlalchemy.orm import selectinload
+    from sqlalchemy import select
 
     monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
     monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
     monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    admin_raw_id = 456
+    admin_effective_id = MAX_ID_OFFSET + admin_raw_id
+    chat_id = 777
+
+    # Prepare user and scenario in DB
+    async with db_session_maker() as session:
+        user_row = User(
+            id=admin_effective_id,
+            username="admin_user",
+            first_name="Admin Max User",
+        )
+        session.add(user_row)
+        await session.commit()
 
     scen = await create_scenario(
         db_session_maker,
         code="max_holistic_draft",
         event_type="webinar",
-        title="Initial Max Title",
+        title="Initial Max Title & <Legacy>",
         starts_at_utc=datetime.utcnow() + timedelta(days=3),
         link="https://example.test/max-draft",
         description="Initial Max Description",
         media_format="separate_media_top",
     )
 
-    client = AsyncMock(spec=MaxApiClient)
-    states = MemoryStateStore()
+    transport = _RecordedMaxSession()
+    client = MaxApiClient(token="test-token", base_url="https://max.test")
+    client._session = transport
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    update_counter = 0
 
-    user_id = 999
-    chat_id = 999
+    def message_body() -> dict:
+        for request in reversed(transport.requests):
+            if request["url"].endswith("/messages"):
+                return request["body"]
+        raise AssertionError("No MAX /messages request was recorded")
 
-    # Phase 1: Modify description, title, format, media, then CANCEL
-    # 1. Edit description
-    await max_admin_events.start_edit_description(client, states, chat_id, user_id, scen.id)
-    await max_admin_events.receive_edit_description(client, states, chat_id, user_id, "Pending Max Description")
+    def validate_max_message(body: dict) -> dict:
+        text = body.get("text") or ""
+        attachments = body.get("attachments") or []
+        assert len(text) <= 4000, f"MAX text length exceeded: {len(text)} > 4000"
+        assert len(attachments) <= 12, f"MAX attachments limit exceeded: {len(attachments)} > 12"
+        # Validate that body is JSON serializable
+        json.loads(json.dumps(body, ensure_ascii=False))
+        return body
 
-    # 2. Edit title
-    await max_admin_events.start_edit_title(client, states, chat_id, user_id, scen.id)
-    await max_admin_events.receive_edit_title(client, states, chat_id, user_id, "Pending Max Title")
+    def button_payload(body: dict, prefix: str) -> str:
+        for attachment in body.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    payload = button.get("payload")
+                    if payload and payload.startswith(prefix):
+                        return payload
+        raise AssertionError(f"No visible MAX callback with prefix {prefix!r} in {body.get('attachments')}")
 
-    # 3. Change format
-    await max_admin_events.set_format_handler(client, states, chat_id, user_id, scen.id, "separate_text_top")
+    def all_button_texts(body: dict) -> list[str]:
+        texts = []
+        for attachment in body.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    if "text" in button:
+                        texts.append(button["text"])
+        return texts
 
-    # 4. Add media
-    await max_admin_events.start_add_media(client, states, chat_id, user_id, scen.id)
-    await max_admin_events.receive_media(client, states, chat_id, user_id, media_type="photo", media_token="token_cancel_1")
+    async def press(payload: str) -> dict:
+        nonlocal update_counter
+        update_counter += 1
+        transport.requests.clear()
+        await app.handle_update(
+            {
+                "update_type": "message_callback",
+                "update_id": f"max-journey-cb-{update_counter}",
+                "callback": {
+                    "callback_id": f"max-journey-callback-{update_counter}",
+                    "payload": payload,
+                    "user": {"user_id": admin_raw_id, "first_name": "Admin", "username": "admin"},
+                },
+                "message": {
+                    "mid": f"max-journey-message-{update_counter}",
+                    "recipient": {"chat_id": chat_id},
+                    "body": {"text": "admin"},
+                },
+            }
+        )
+        return validate_max_message(message_body())
 
-    # 5. Cancel draft
-    await max_admin_events.cancel_draft(client, states, chat_id, user_id, scen.id)
+    async def send_text(text: str) -> dict:
+        nonlocal update_counter
+        update_counter += 1
+        transport.requests.clear()
+        await app.handle_update(
+            {
+                "update_type": "message_created",
+                "update_id": f"max-journey-message-{update_counter}",
+                "message": {
+                    "mid": f"max-journey-incoming-{update_counter}",
+                    "recipient": {"chat_id": chat_id},
+                    "sender": {"user_id": admin_raw_id, "first_name": "Admin", "username": "admin"},
+                    "body": {"text": text},
+                },
+            }
+        )
+        return validate_max_message(message_body())
 
-    # Verify DB is completely untouched
-    async with db_session_maker() as session:
-        s_after_cancel = await session.get(EventScenario, scen.id)
-        assert s_after_cancel.title == "Initial Max Title"
-        assert s_after_cancel.description == "Initial Max Description"
-        assert s_after_cancel.media_format == "separate_media_top"
-    media_after_cancel = await list_scenario_media(db_session_maker, scen.id)
-    assert len(media_after_cancel) == 0
+    async def send_media(media_type: str, token: str) -> dict:
+        nonlocal update_counter
+        update_counter += 1
+        transport.requests.clear()
+        await app.handle_update(
+            {
+                "update_type": "message_created",
+                "update_id": f"max-journey-media-{update_counter}",
+                "message": {
+                    "mid": f"max-journey-incoming-media-{update_counter}",
+                    "recipient": {"chat_id": chat_id},
+                    "sender": {"user_id": admin_raw_id, "first_name": "Admin", "username": "admin"},
+                    "body": {
+                        "attachments": [
+                            {
+                                "type": media_type,
+                                "payload": {"token": token},
+                            }
+                        ]
+                    },
+                },
+            }
+        )
+        return validate_max_message(message_body())
 
-    # Phase 2: Modify description, title, format, media, and SAVE MEDIA
-    # 1. Edit description
-    await max_admin_events.start_edit_description(client, states, chat_id, user_id, scen.id)
-    await max_admin_events.receive_edit_description(client, states, chat_id, user_id, "Final Saved Max Description")
+    try:
+        # =========================================================================
+        # PHASE 1: Build draft (desc, title, format, media) -> Cancel -> verify DB untouched
+        # =========================================================================
+        card = await press(f"admin_ev_open_{scen.id}_0_1")
+        assert "Initial Max Title" in card["text"]
+        assert "Initial Max Description" in card["text"]
+        assert "Текст отдельно, медиа выше" in card["text"]
 
-    # 2. Edit title
-    await max_admin_events.start_edit_title(client, states, chat_id, user_id, scen.id)
-    await max_admin_events.receive_edit_title(client, states, chat_id, user_id, "Final Saved Max Title")
+        # Open edit menu
+        edit_menu = await press(button_payload(card, f"admin_ev_edit_menu_{scen.id}"))
+        assert any("Описание" in t for t in all_button_texts(edit_menu))
 
-    # 3. Change format to separate_text_top
-    await max_admin_events.set_format_handler(client, states, chat_id, user_id, scen.id, "separate_text_top")
+        # 1. Edit description
+        await press(button_payload(edit_menu, f"admin_ev_edit_description_{scen.id}"))
+        desc_screen = await send_text("Pending Max Description")
+        assert "Черновик обновлён" in desc_screen["text"]
+        edit_menu = await press(button_payload(desc_screen, f"admin_ev_edit_menu_{scen.id}"))
 
-    # 4. Add media
-    await max_admin_events.start_add_media(client, states, chat_id, user_id, scen.id)
-    await max_admin_events.receive_media(client, states, chat_id, user_id, media_type="photo", media_token="token_final_1")
+        # 2. Edit title
+        await press(button_payload(edit_menu, f"admin_ev_edit_title_{scen.id}"))
+        title_screen = await send_text("Pending Max Title & <Draft>")
+        edit_menu = await press(button_payload(title_screen, f"admin_ev_edit_menu_{scen.id}"))
 
-    # 5. Click Save Media
-    await max_admin_events.save_media(client, states, chat_id, user_id, scen.id)
+        # 3. Format menu
+        fmt_menu = await press(button_payload(edit_menu, f"admin_ev_format_menu_{scen.id}"))
+        fmt_menu = await press(button_payload(fmt_menu, f"admin_ev_set_fmt_{scen.id}_separate_text_top"))
+        edit_menu = await press(button_payload(fmt_menu, f"admin_ev_edit_menu_{scen.id}"))
 
-    # Verify DB is atomically updated with ALL changes
-    async with db_session_maker() as session:
-        s_final = await session.get(EventScenario, scen.id)
-        assert s_final.title == "Final Saved Max Title"
-        assert s_final.description == "Final Saved Max Description"
-        assert s_final.media_format == "separate_text_top"
-    media_final = await list_scenario_media(db_session_maker, scen.id)
-    assert len(media_final) == 1
-    assert media_final[0].file_id == "token_final_1"
+        # 4. Add media
+        media_editor = await press(button_payload(edit_menu, f"admin_ev_edit_media_{scen.id}"))
+        await press(button_payload(media_editor, f"admin_ev_media_add_{scen.id}"))
+        media_editor = await send_media("image", "token_cancel_1")
+        assert "В черновике: 1" in media_editor["text"]
 
-    # Verify state is cleared
-    snapshot = await states.get(user_id)
-    assert snapshot is None
+        # 5. Cancel draft
+        edit_menu = await press(button_payload(media_editor, f"admin_ev_edit_menu_{scen.id}"))
+        card = await press(button_payload(edit_menu, f"admin_ev_cancel_draft_{scen.id}"))
+        assert "Черновик сброшен" in card["text"]
+
+        # Verify DB is completely untouched
+        async with db_session_maker() as session:
+            s_after_cancel = await session.get(EventScenario, scen.id)
+            assert "Initial Max Title" in s_after_cancel.title
+            assert s_after_cancel.description == "Initial Max Description"
+            assert s_after_cancel.media_format == "separate_media_top"
+        media_after_cancel = await list_scenario_media(db_session_maker, scen.id)
+        assert len(media_after_cancel) == 0
+        assert await app.states.get(admin_effective_id) is None
+
+        # =========================================================================
+        # PHASE 2: Re-enter draft -> description, title, format, 2 media items -> reorder -> SAVE MEDIA
+        # =========================================================================
+        card = await press(f"admin_ev_open_{scen.id}_0_1")
+        edit_menu = await press(button_payload(card, f"admin_ev_edit_menu_{scen.id}"))
+
+        # 1. Enter description
+        await press(button_payload(edit_menu, f"admin_ev_edit_description_{scen.id}"))
+        desc_screen = await send_text("Final Saved Max Description with <b>Bold</b> & <i>Italic</i>")
+        assert "Черновик обновлён" in desc_screen["text"]
+        edit_menu = await press(button_payload(desc_screen, f"admin_ev_edit_menu_{scen.id}"))
+
+        # 2. Enter title with HTML entities
+        await press(button_payload(edit_menu, f"admin_ev_edit_title_{scen.id}"))
+        title_screen = await send_text("Final Saved Max Title & <Safe>")
+        edit_menu = await press(button_payload(title_screen, f"admin_ev_edit_menu_{scen.id}"))
+
+        # 3. Choose format separate_text_top
+        fmt_menu = await press(button_payload(edit_menu, f"admin_ev_format_menu_{scen.id}"))
+        fmt_menu = await press(button_payload(fmt_menu, f"admin_ev_set_fmt_{scen.id}_separate_text_top"))
+        edit_menu = await press(button_payload(fmt_menu, f"admin_ev_edit_menu_{scen.id}"))
+
+        # 4. Add 2 media items: photo then video
+        media_editor = await press(button_payload(edit_menu, f"admin_ev_edit_media_{scen.id}"))
+        await press(button_payload(media_editor, f"admin_ev_media_add_{scen.id}"))
+        media_editor = await send_media("image", "max_media_photo_1")
+        assert "В черновике: 1" in media_editor["text"]
+
+        await press(button_payload(media_editor, f"admin_ev_media_add_{scen.id}"))
+        media_editor = await send_media("video", "max_media_video_2")
+        assert "В черновике: 2" in media_editor["text"]
+
+        # 5. Reorder media items: move second item (video) UP
+        media_editor = await press(button_payload(media_editor, f"admin_ev_media_up_{scen.id}_1"))
+
+        # 6. Click Save Media
+        save_confirmation = await press(button_payload(media_editor, f"admin_ev_media_save_{scen.id}"))
+        assert "сохранены" in save_confirmation["text"]
+        assert "&amp;amp;" not in save_confirmation["text"]
+
+        # Verify DB is atomically updated
+        async with db_session_maker() as session:
+            s_final = await session.get(EventScenario, scen.id)
+            assert "Final Saved Max Title &" in s_final.title
+            assert s_final.description == "Final Saved Max Description with <b>Bold</b> & <i>Italic</i>"
+            assert s_final.media_format == "separate_text_top"
+
+        media_final = await list_scenario_media(db_session_maker, scen.id)
+        assert len(media_final) == 2
+        # Verify reordering: video is first, photo is second
+        assert media_final[0].file_id == "max_media_video_2"
+        assert media_final[0].file_type == "video"
+        assert media_final[0].source_platform == "max"
+        assert media_final[0].source_file_id == "max_media_video_2"
+
+        assert media_final[1].file_id == "max_media_photo_1"
+        assert media_final[1].file_type == "photo"
+        assert media_final[1].source_platform == "max"
+        assert media_final[1].source_file_id == "max_media_photo_1"
+
+        # Verify state is cleared
+        assert await app.states.get(admin_effective_id) is None
+
+        # Reopen card directly via callback and verify clean presentation without double escaping
+        card = await press(button_payload(save_confirmation, f"admin_ev_open_{scen.id}"))
+        assert "Final Saved Max Title" in card["text"]
+        assert "&amp;amp;" not in card["text"]
+        assert "&amp;lt;" not in card["text"]
+        assert "Final Saved Max Description with &lt;b&gt;Bold&lt;/b&gt; &amp; &lt;i&gt;Italic&lt;/i&gt;" in card["text"]
+        assert "Текст отдельно, медиа ниже" in card["text"]
+        assert "Медиа:</b> 2" in card["text"]
+
+        # =========================================================================
+        # PHASE 3: Delivery plan and execution matching saved state
+        # =========================================================================
+        async with db_session_maker() as session:
+            scen_delivery = (await session.execute(
+                select(EventScenario).where(EventScenario.id == scen.id).options(selectinload(EventScenario.media))
+            )).scalar_one()
+
+        plan = _build_delivery_plan(scen_delivery, scen.id, "Runtime MAX announcement", include_media=True)
+        assert len(plan) >= 2
+        assert plan[0]["kind"] == "text"
+        assert plan[1]["kind"] == "media"
+        assert len(plan[1]["items"]) == 2
+        # Verify item order in plan matches reordered DB state
+        assert plan[1]["items"][0]["max_token"] == "max_media_video_2"
+        assert plan[1]["items"][0]["source_file_id"] == "max_media_video_2"
+        assert plan[1]["items"][1]["max_token"] == "max_media_photo_1"
+        assert plan[1]["items"][1]["source_file_id"] == "max_media_photo_1"
+
+        delivery_transport = _RecordedMaxSession()
+        delivery_client = MaxApiClient(token="test-token", base_url="https://max.test")
+        delivery_client._session = delivery_transport
+
+        # Send text and media delivery parts
+        await _send_delivery_part(
+            plan[0],
+            platform="max",
+            user_id=admin_effective_id,
+            event_id=scen.id,
+            is_last=False,
+            bot=None,
+            max_client=delivery_client,
+        )
+        await _send_delivery_part(
+            plan[1],
+            platform="max",
+            user_id=admin_effective_id,
+            event_id=scen.id,
+            is_last=True,
+            bot=None,
+            max_client=delivery_client,
+        )
+
+        # Validate all delivered messages adhere to MAX transport limits
+        assert len(delivery_transport.requests) == 2
+        for req in delivery_transport.requests:
+            body = req["body"]
+            validate_max_message(body)
+
+    finally:
+        await app.states.clear(admin_effective_id)
 
 
 @pytest.mark.asyncio
