@@ -730,9 +730,9 @@ async def _send_delivery_part(
                 raise PreTransmissionError(
                     f"Превышено максимальное число вложений в одном сообщении MAX ({len(total_attachments)} > 12)"
                 )
-            if len(clean_text) > 4000:
+            if len(clean_text) > MAX_TRANSPORT_TEXT_LEN:
                 raise PreTransmissionError(
-                    f"Итоговый текст подписи в MAX превышает лимит ({len(clean_text)} > 4000 симв.)"
+                    f"Итоговый текст подписи в MAX превышает лимит ({len(clean_text)} > {MAX_TRANSPORT_TEXT_LEN} симв.)"
                 )
             response = await max_client.send_message(
                 user_id=raw_max_user_id(user_id) if is_max_user_id(user_id) else user_id,
@@ -1490,9 +1490,9 @@ async def process_single_delivery(
 
             from event_content_validator import strip_telegram_custom_emoji
             clean_text = strip_telegram_custom_emoji(rendered_text)
-            if len(clean_text) > 4000:
+            if len(clean_text) > MAX_TRANSPORT_TEXT_LEN:
                 raise PreTransmissionError(
-                    f"Итоговый текст сообщения в MAX превышает лимит ({len(clean_text)} > 4000 симв.)"
+                    f"Итоговый текст сообщения в MAX превышает лимит ({len(clean_text)} > {MAX_TRANSPORT_TEXT_LEN} симв.)"
                 )
 
             attachments = inline_keyboard([
