@@ -3612,3 +3612,89 @@ async def test_telegram_premium_emoji_paginated_journey_a_to_ya_to_a(db_session_
             router._parent_router = original_parents[router]
 
 
+@pytest.mark.asyncio
+async def test_telegram_scenarios_list_button_preserves_raw_legacy_and_escaped_titles(db_session_maker, monkeypatch):
+    """
+    Verifies that Telegram scenario list buttons preserve literal angle brackets like '<Новый сезон>'
+    both for raw legacy titles and HTML-escaped titles, convert custom emojis to Unicode fallback,
+    and strip only allowed markup tags.
+    """
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+    import handlers
+
+    now = datetime.utcnow()
+    # 1. Raw legacy scenario with literal angle brackets
+    scen_raw = await create_scenario(
+        db_session_maker,
+        code="tg_raw_legacy",
+        event_type="webinar",
+        title="Презентация <Новый сезон>",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/raw",
+    )
+    # 2. Escaped scenario with HTML entities
+    scen_escaped = await create_scenario(
+        db_session_maker,
+        code="tg_escaped_title",
+        event_type="webinar",
+        title="Презентация &lt;Новый сезон&gt;",
+        starts_at_utc=now + timedelta(days=3),
+        link="https://example.test/escaped",
+    )
+    # 3. Custom emoji with literal angle brackets
+    scen_emoji = await create_scenario(
+        db_session_maker,
+        code="tg_emoji_raw",
+        event_type="webinar",
+        title='<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Презентация &lt;Новый сезон&gt;',
+        starts_at_utc=now + timedelta(days=4),
+        link="https://example.test/emoji",
+    )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    def find_button(methods, prefix):
+        for m in methods:
+            if isinstance(m, (EditMessageText, SendMessage)) and m.reply_markup is not None:
+                for row in m.reply_markup.inline_keyboard:
+                    for b in row:
+                        if b.callback_data and b.callback_data.startswith(prefix):
+                            return b
+        raise AssertionError(f"Button with prefix {prefix!r} not found in methods")
+
+    try:
+        methods = await _feed_callback(dp, bot, "admin_events")
+        for m in methods:
+            m.__class__.model_validate(m.model_dump())
+
+        # Raw legacy button check
+        btn_raw = find_button(methods, f"admin_ev_open_{scen_raw.id}")
+        assert "<Новый сезон>" in btn_raw.text
+        assert "Презентация <Новый сезон>" in btn_raw.text
+
+        # Escaped button check
+        btn_escaped = find_button(methods, f"admin_ev_open_{scen_escaped.id}")
+        assert "<Новый сезон>" in btn_escaped.text
+        assert "Презентация <Новый сезон>" in btn_escaped.text
+        assert "&lt;" not in btn_escaped.text
+        assert "&gt;" not in btn_escaped.text
+
+        # Emoji + raw angle brackets button check
+        btn_emoji = find_button(methods, f"admin_ev_open_{scen_emoji.id}")
+        assert "🔥" in btn_emoji.text
+        assert "<Новый сезон>" in btn_emoji.text
+        assert "<tg-emoji" not in btn_emoji.text
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+

@@ -703,4 +703,50 @@ def test_compact_event_title_strips_emoji_tags_and_html_entities_cleanly():
     assert compact_event_title("   ") == ""
 
 
+def test_compact_event_title_preserves_raw_legacy_and_escaped_literal_angle_brackets():
+    """
+    Regression test for P2 issue:
+    Verifies that compact_event_title() preserves literal angle bracket constructs like '<Новый сезон>'
+    both for raw legacy titles and HTML-escaped titles, strips only allowed service markup, converts
+    custom emojis to Unicode fallback, and truncates on cleaned visible plain text.
+    """
+    from event_admin_service import compact_event_title, EVENT_BUTTON_TITLE_PREVIEW_CHARS
+    from event_content_validator import render_plain_text_for_max
+
+    # 1. Raw legacy title with literal angle brackets
+    raw_title = "Презентация <Новый сезон>"
+    assert compact_event_title(raw_title) == "Презентация <Новый сезон>"
+
+    # 2. Escaped title with HTML entities
+    escaped_title = "Презентация &lt;Новый сезон&gt;"
+    assert compact_event_title(escaped_title) == "Презентация <Новый сезон>"
+
+    # Both produce identical cleaned visible plain text
+    assert compact_event_title(raw_title) == compact_event_title(escaped_title)
+
+    # 3. Custom emoji with raw legacy literal angle brackets
+    emoji_raw = '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Презентация <Новый сезон> &amp; Q&amp;A'
+    assert compact_event_title(emoji_raw) == "🔥 Презентация <Новый сезон> & Q&A"
+
+    # 4. Allowed service markup stripped while literal angle brackets preserved
+    markup_raw = "<b>Презентация</b> <Новый сезон> &amp; <i>Эксклюзив</i>"
+    assert compact_event_title(markup_raw) == "Презентация <Новый сезон> & Эксклюзив"
+
+    # 5. Complex mix: allowed tags, custom emoji, escaped entities and raw literal angle brackets
+    complex_title = '<tg-emoji emoji-id="123">🌟</tg-emoji> <b>Launch</b> &lt;v1.0&gt; and <Новый сезон> &amp; "Special"'
+    assert compact_event_title(complex_title) == '🌟 Launch <v1.0> and <Новый сезон> & "Special"'
+
+    # 6. Truncation works over cleaned visible text
+    long_raw = "Презентация <Новый сезон> с подробным рассказом обо всех обновлениях программы"
+    res_trunc = compact_event_title(long_raw, limit=EVENT_BUTTON_TITLE_PREVIEW_CHARS)
+    assert len(res_trunc) <= EVENT_BUTTON_TITLE_PREVIEW_CHARS
+    assert res_trunc.endswith("…")
+    assert "<Новый сезон>" in res_trunc
+
+    # 7. render_plain_text_for_max also preserves literal angle brackets
+    assert render_plain_text_for_max("Презентация <Новый сезон>") == "Презентация <Новый сезон>"
+    assert render_plain_text_for_max("<b>Презентация</b> <Новый сезон>") == "Презентация <Новый сезон>"
+
+
+
 

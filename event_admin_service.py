@@ -89,12 +89,12 @@ EVENT_BUTTON_TITLE_PREVIEW_CHARS = 52
 
 
 def compact_event_title(title: str, *, limit: int = EVENT_LIST_TITLE_PREVIEW_CHARS) -> str:
-    """Single-line plain-text caption for list and button views; strips HTML tags/custom emojis to visible text."""
+    """Single-line plain-text caption for list and button views; strips allowed HTML tags/custom emojis to visible text while preserving literal angle bracket constructs."""
     if not title:
         return ""
-    from event_content_validator import strip_telegram_custom_emoji, _ANY_HTML_TAG_PATTERN
+    from event_content_validator import strip_telegram_custom_emoji, _ALLOWED_HTML_TAG_PATTERN
     no_emoji = strip_telegram_custom_emoji(title)
-    no_tags = _ANY_HTML_TAG_PATTERN.sub("", no_emoji)
+    no_tags = _ALLOWED_HTML_TAG_PATTERN.sub("", no_emoji)
     unescaped = html.unescape(no_tags)
     compact = " ".join(unescaped.split())
     if len(compact) <= limit:

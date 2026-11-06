@@ -3840,3 +3840,111 @@ async def test_max_premium_emoji_paginated_journey_a_to_ya_to_a(db_session_maker
         await app.states.clear(MAX_ID_OFFSET + admin_raw_id)
 
 
+@pytest.mark.asyncio
+async def test_max_scenarios_list_button_preserves_raw_legacy_and_escaped_titles(db_session_maker, monkeypatch):
+    """
+    Verifies that MAX scenario list buttons preserve literal angle brackets like '<Новый сезон>'
+    both for raw legacy titles and HTML-escaped titles, convert custom emojis to Unicode fallback,
+    and strip only allowed markup tags.
+    """
+    from event_admin_service import create_scenario
+    from max_messenger_bot import app as max_app_module
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    now = datetime.utcnow()
+    # 1. Raw legacy scenario with literal angle brackets
+    scen_raw = await create_scenario(
+        db_session_maker,
+        code="max_raw_legacy",
+        event_type="webinar",
+        title="Презентация <Новый сезон>",
+        starts_at_utc=now + timedelta(days=2),
+        link="https://example.test/raw",
+    )
+    # 2. Escaped scenario with HTML entities
+    scen_escaped = await create_scenario(
+        db_session_maker,
+        code="max_escaped_title",
+        event_type="webinar",
+        title="Презентация &lt;Новый сезон&gt;",
+        starts_at_utc=now + timedelta(days=3),
+        link="https://example.test/escaped",
+    )
+    # 3. Custom emoji with literal angle brackets
+    scen_emoji = await create_scenario(
+        db_session_maker,
+        code="max_emoji_raw",
+        event_type="webinar",
+        title='<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Презентация &lt;Новый сезон&gt;',
+        starts_at_utc=now + timedelta(days=4),
+        link="https://example.test/emoji",
+    )
+
+    transport = _RecordedMaxSession()
+    client = MaxApiClient(token="test-token", base_url="https://max.test")
+    client._session = transport
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    chat_id = 123
+    admin_raw_id = 456
+
+    def message_body() -> dict:
+        for request in reversed(transport.requests):
+            if request["url"].endswith("/messages"):
+                return request["body"]
+        raise AssertionError("No MAX /messages request was recorded")
+
+    def find_button(body: dict, prefix: str) -> dict:
+        for attachment in body.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    payload = button.get("payload")
+                    if payload and payload.startswith(prefix):
+                        return button
+        raise AssertionError(f"No visible MAX button with prefix {prefix!r} in {body.get('attachments')}")
+
+    try:
+        transport.requests.clear()
+        await app.handle_update(
+            {
+                "update_type": "message_callback",
+                "update_id": "max-legacy-title-cb",
+                "callback": {
+                    "callback_id": "max-legacy-title-callback",
+                    "payload": "admin_events",
+                    "user": {"user_id": admin_raw_id, "first_name": "Admin", "username": "admin"},
+                },
+                "message": {
+                    "mid": "max-legacy-title-msg",
+                    "recipient": {"chat_id": chat_id},
+                    "body": {"text": "admin"},
+                },
+            }
+        )
+        body = message_body()
+
+        # Raw legacy button check
+        btn_raw = find_button(body, f"admin_ev_open_{scen_raw.id}")
+        assert "<Новый сезон>" in btn_raw["text"]
+        assert "Презентация <Новый сезон>" in btn_raw["text"]
+
+        # Escaped button check
+        btn_escaped = find_button(body, f"admin_ev_open_{scen_escaped.id}")
+        assert "<Новый сезон>" in btn_escaped["text"]
+        assert "Презентация <Новый сезон>" in btn_escaped["text"]
+        assert "&lt;" not in btn_escaped["text"]
+        assert "&gt;" not in btn_escaped["text"]
+
+        # Emoji + literal angle brackets button check
+        btn_emoji = find_button(body, f"admin_ev_open_{scen_emoji.id}")
+        assert "🔥" in btn_emoji["text"]
+        assert "<Новый сезон>" in btn_emoji["text"]
+        assert "<tg-emoji" not in btn_emoji["text"]
+    finally:
+        await app.states.clear(MAX_ID_OFFSET + admin_raw_id)
+
+

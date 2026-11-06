@@ -63,7 +63,12 @@ _CUSTOM_EMOJI_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-_ANY_HTML_TAG_PATTERN = re.compile(r'<[^>]+>')
+_ALLOWED_HTML_TAG_NAMES = sorted(ALLOWED_EVENT_HTML_TAGS | {"br", "hr"}, key=len, reverse=True)
+_ALLOWED_HTML_TAG_PATTERN = re.compile(
+    r"</?(?:" + "|".join(_ALLOWED_HTML_TAG_NAMES) + r")\b[^>]*>",
+    re.IGNORECASE,
+)
+_ANY_HTML_TAG_PATTERN = _ALLOWED_HTML_TAG_PATTERN
 
 
 def utf16_code_units_len(text: str) -> int:
