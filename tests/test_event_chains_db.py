@@ -1725,6 +1725,7 @@ async def _get_safe_postgres_engine():
         return None, f"Failed to connect to validated PostgreSQL test database: {exc}"
 
 
+@pytest.mark.postgres_integration
 @pytest.mark.asyncio
 async def test_real_postgresql_init_and_schema_verification():
     """Real PostgreSQL migration widens title without changing existing events."""
@@ -1847,6 +1848,7 @@ async def test_real_postgresql_init_and_schema_verification():
         await pg_engine.dispose()
 
 
+@pytest.mark.postgres_integration
 @pytest.mark.asyncio
 async def test_real_postgresql_migration_backfills_delivery_content_version_snapshot():
     """An existing v3 event keeps scheduled deliveries active when the snapshot column is added."""
@@ -1973,6 +1975,7 @@ async def test_real_postgresql_migration_backfills_delivery_content_version_snap
         await pg_engine.dispose()
 
 
+@pytest.mark.postgres_integration
 @pytest.mark.asyncio
 async def test_real_postgresql_media_mode_migration_and_constraints():
     """Real PostgreSQL migration test: verifies media_mode column addition, backfill, CHECK constraints, and idempotence."""
@@ -2101,6 +2104,7 @@ async def test_real_postgresql_media_mode_migration_and_constraints():
         await pg_engine.dispose()
 
 
+@pytest.mark.postgres_integration
 @pytest.mark.asyncio
 async def test_real_postgresql_structural_invariants_and_retry_model():
     """Real PostgreSQL integration test: verifies CHECK constraints, partial unique index, and retry chaining on PostgreSQL."""
@@ -2256,6 +2260,7 @@ async def test_real_postgresql_structural_invariants_and_retry_model():
         await pg_engine.dispose()
 
 
+@pytest.mark.postgres_integration
 @pytest.mark.asyncio
 async def test_real_postgresql_update_step_vs_reschedule_concurrency():
     """
@@ -2340,6 +2345,7 @@ async def test_real_postgresql_update_step_vs_reschedule_concurrency():
         await pg_engine.dispose()
 
 
+@pytest.mark.postgres_integration
 @pytest.mark.asyncio
 async def test_real_postgresql_claimed_update_step_vs_presend_barrier():
     """

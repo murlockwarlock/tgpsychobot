@@ -982,6 +982,7 @@ async def test_sqlite_concurrency_registration_vs_ai_service_data(sqlite_session
         ), f"Missing AI metadata in {records}"
 
 
+@pytest.mark.postgres_integration
 @pytest.mark.asyncio
 async def test_real_postgresql_rejoin_vs_reschedule_deadlock_free():
     """Item 2 & Requirement 8: Real PostgreSQL concurrency test for rejoin vs reschedule.

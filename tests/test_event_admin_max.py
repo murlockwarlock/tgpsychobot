@@ -356,6 +356,7 @@ def _assert_max_event_callback_contract(payloads: list[str]) -> None:
         _max_event_callback_contract(payload)
 
 
+@pytest.mark.ui_journey
 @pytest.mark.asyncio
 async def test_max_event_visible_button_contract_covers_changed_screens(
     db_session_maker, mock_client, states, monkeypatch
@@ -415,6 +416,7 @@ async def test_max_event_visible_button_contract_covers_changed_screens(
     assert f"admin_ev_problems_{scen.id}_0" in payloads
 
 
+@pytest.mark.ui_journey
 @pytest.mark.asyncio
 async def test_max_visible_event_buttons_dispatch_through_application_contract(db_session_maker, monkeypatch):
     monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
@@ -554,6 +556,7 @@ async def test_max_visible_event_buttons_dispatch_through_application_contract(d
         assert client.send_message.called, payload
 
 
+@pytest.mark.ui_journey
 @pytest.mark.asyncio
 async def test_max_visible_event_buttons_execute_real_application_journeys(db_session_maker, monkeypatch):
     """Every changed visible payload executes its real MAX service route and state transition."""
@@ -1008,6 +1011,7 @@ async def test_max_long_title_navigation_preserves_page_and_archive_context(db_s
         await app.states.clear(456)
 
 
+@pytest.mark.ui_journey
 @pytest.mark.asyncio
 async def test_max_real_handle_update_paginated_format_save_cancel_journey(db_session_maker, monkeypatch):
     """MAX BotApplication ingress journey against the recorded HTTP JSON boundary."""
@@ -3620,6 +3624,7 @@ async def test_max_title_length_visible_and_storage_validation(db_session_maker,
     assert "лимит хранилища (1000 симв.)" in sent_text
 
 
+@pytest.mark.ui_journey
 @pytest.mark.asyncio
 async def test_max_premium_emoji_paginated_journey_a_to_ya_to_a(db_session_maker, monkeypatch):
     """

@@ -760,6 +760,7 @@ async def _get_safe_postgres_engine():
     return await _db_pg_engine()
 
 
+@pytest.mark.postgres_integration
 @pytest.mark.asyncio
 async def test_real_postgresql_pre_send_lock_hierarchy_and_cas():
     """
@@ -1170,6 +1171,7 @@ async def test_cancel_vs_worker_ponr_concurrency_sqlite(sqlite_session_factory):
     await asyncio.gather(_cancel_task_b(), _worker_task_b())
 
 
+@pytest.mark.postgres_integration
 @pytest.mark.asyncio
 async def test_cancel_vs_worker_ponr_concurrency_postgresql():
     """Requirement 2 & 6: Cancel vs Worker Point of No Return barrier concurrency on real PostgreSQL."""

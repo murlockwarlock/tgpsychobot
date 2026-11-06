@@ -11,6 +11,7 @@ Performs:
 
 from __future__ import annotations
 
+import ast
 import importlib
 import os
 import py_compile
@@ -37,17 +38,43 @@ MANDATORY_BOUNDARY_TESTS = [
     "tests/test_event_content_validator.py",
 ]
 
-MANDATORY_UI_JOURNEY_NODES = [
-    # Telegram Dispatcher real A -> Я -> A journeys
-    "tests/test_event_admin_telegram.py::test_telegram_visible_event_buttons_execute_real_dispatcher_journeys",
-    "tests/test_event_admin_telegram.py::test_telegram_real_paginated_format_save_cancel_journey_preserves_page_filter",
-    "tests/test_event_admin_telegram.py::test_telegram_pagination_page_2_edit_menu_back_roundtrip_journey",
-    "tests/test_event_admin_telegram.py::test_telegram_premium_emoji_paginated_journey_a_to_ya_to_a",
-    # MAX Application real A -> Я -> A journeys
-    "tests/test_event_admin_max.py::test_max_visible_event_buttons_execute_real_application_journeys",
-    "tests/test_event_admin_max.py::test_max_real_handle_update_paginated_format_save_cancel_journey",
-    "tests/test_event_admin_max.py::test_max_premium_emoji_paginated_journey_a_to_ya_to_a",
-]
+
+def _has_ui_marker(node: ast.FunctionDef | ast.AsyncFunctionDef, marker: str = "ui_journey") -> bool:
+    for dec in node.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(target, ast.Attribute) and target.attr == marker:
+            return True
+        if isinstance(target, ast.Name) and target.id == marker:
+            return True
+    return False
+
+
+def discover_ui_journey_nodes(tests_dir: Path | str = "tests") -> list[str]:
+    """Dynamically discover all tests decorated with @pytest.mark.ui_journey."""
+    base = Path(tests_dir)
+    if not base.exists():
+        return []
+
+    discovered: list[str] = []
+    for test_file in sorted(base.rglob("test_*.py")):
+        if not test_file.is_file():
+            continue
+        try:
+            content = test_file.read_text(encoding="utf-8")
+            tree = ast.parse(content, filename=str(test_file))
+        except Exception:
+            continue
+
+        for item in tree.body:
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if _has_ui_marker(item, "ui_journey"):
+                    discovered.append(f"{test_file.as_posix()}::{item.name}")
+            elif isinstance(item, ast.ClassDef):
+                for m in item.body:
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and _has_ui_marker(m, "ui_journey"):
+                        discovered.append(f"{test_file.as_posix()}::{item.name}::{m.name}")
+
+    return sorted(discovered)
 
 MODULE_TEST_MAPPINGS: dict[str, list[str]] = {
     "event_admin_telegram.py": [
@@ -226,11 +253,12 @@ def resolve_targeted_tests(changed_files: list[str]) -> list[str]:
         if Path(mb).exists():
             selected_tests.add(mb)
 
-    # Always ensure mandatory UI journeys (Telegram Dispatcher & MAX Application A -> Я -> A).
+    # Always ensure mandatory UI journeys dynamically discovered via @pytest.mark.ui_journey.
     # If a full test file is already included (e.g. tests/test_event_admin_telegram.py),
     # avoid adding individual node IDs so pytest executes the complete suite for that file.
     # Otherwise, add targeted journey node IDs to keep FAST CI within 1-2 minutes.
-    for node in MANDATORY_UI_JOURNEY_NODES:
+    journey_nodes = discover_ui_journey_nodes()
+    for node in journey_nodes:
         file_part = node.split("::", 1)[0]
         if file_part not in selected_tests and Path(file_part).exists():
             selected_tests.add(node)

@@ -77,6 +77,9 @@ jobs:
           cache-dependency-path: requirements-ci.txt
       - name: Install test dependencies
         run: python -m pip install -r requirements-ci.txt
+      - name: Verify test shard coverage and collection
+        if: matrix.shard == 1
+        run: python scripts/ci_test_shards.py --verify
       - name: Run test shard
         run: python scripts/ci_test_shards.py --shard ${{ matrix.shard }} --total-shards 3 --run
 
@@ -119,17 +122,7 @@ jobs:
           PGPASSWORD: postgres
         run: psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE test_event_chains_ci'
       - name: Run PostgreSQL migration and concurrency checks
-        run: >-
-          python -m pytest -q -rs
-          tests/test_event_chains_db.py::test_real_postgresql_init_and_schema_verification
-          tests/test_event_chains_db.py::test_real_postgresql_migration_backfills_delivery_content_version_snapshot
-          tests/test_event_chains_db.py::test_real_postgresql_media_mode_migration_and_constraints
-          tests/test_event_chains_db.py::test_real_postgresql_structural_invariants_and_retry_model
-          tests/test_event_chains_db.py::test_real_postgresql_update_step_vs_reschedule_concurrency
-          tests/test_event_chains_db.py::test_real_postgresql_claimed_update_step_vs_presend_barrier
-          tests/test_event_chains_worker.py::test_real_postgresql_pre_send_lock_hierarchy_and_cas
-          tests/test_event_chains_worker.py::test_cancel_vs_worker_ponr_concurrency_postgresql
-          tests/test_event_chains_service.py::test_real_postgresql_rejoin_vs_reschedule_deadlock_free
+        run: python -m pytest -q -rs -m postgres_integration
       - name: Drop disposable PostgreSQL database
         if: ${{ always() }}
         env:

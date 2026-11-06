@@ -333,6 +333,7 @@ def _assert_event_callback_contract(callbacks: list[str]) -> None:
         _event_callback_contract(callback)
 
 
+@pytest.mark.ui_journey
 def test_telegram_event_visible_button_contract_covers_changed_screens():
     scenario = ScenarioSummary(
         id=10,
@@ -417,6 +418,7 @@ def test_telegram_event_visible_button_contract_covers_changed_screens():
     )
 
 
+@pytest.mark.ui_journey
 @pytest.mark.asyncio
 async def test_telegram_visible_event_buttons_dispatch_through_router_contract(monkeypatch):
     monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
@@ -555,6 +557,7 @@ async def test_telegram_visible_event_buttons_dispatch_through_router_contract(m
             router._parent_router = None
 
 
+@pytest.mark.ui_journey
 @pytest.mark.asyncio
 async def test_telegram_visible_event_buttons_execute_real_dispatcher_journeys(db_session_maker, monkeypatch):
     """Every changed visible callback executes its registered handler unpatched."""
@@ -1484,6 +1487,7 @@ async def test_telegram_paginated_edit_roundtrip_and_delete_stays_draft(db_sessi
     assert "admin_ev_page_2_1" in saved_callbacks
 
 
+@pytest.mark.ui_journey
 @pytest.mark.asyncio
 async def test_telegram_real_paginated_format_save_cancel_journey_preserves_page_filter(db_session_maker, monkeypatch):
     """Real Dispatcher journey: page 2 -> card -> format -> draft -> cancel/save -> page 2."""
@@ -2782,6 +2786,7 @@ async def test_telegram_real_dispatcher_custom_emoji_title_journey(db_session_ma
             router._parent_router = original_parents[router]
 
 
+@pytest.mark.ui_journey
 @pytest.mark.asyncio
 async def test_telegram_pagination_page_2_edit_menu_back_roundtrip_journey(db_session_maker, monkeypatch):
     """Full journey:
@@ -3447,6 +3452,7 @@ async def test_telegram_title_length_visible_and_storage_validation(db_session_m
             router._parent_router = original_parents[router]
 
 
+@pytest.mark.ui_journey
 @pytest.mark.asyncio
 async def test_telegram_premium_emoji_paginated_journey_a_to_ya_to_a(db_session_maker, monkeypatch):
     """Full journey A -> Я -> A:
