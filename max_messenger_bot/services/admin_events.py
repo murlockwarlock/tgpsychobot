@@ -304,7 +304,7 @@ async def show_scenarios(
             status = "📦 В архиве" if s.is_archived else ("🟢 Активно" if s.is_active else "⚪️ Выключено")
             kind = "Вебинар" if s.event_type == "webinar" else "Очная встреча"
             text_lines.append(
-                f"<b>{idx + 1 + page * PAGE_SIZE}. {html.escape(compact_event_title(s.title))}</b>\n"
+                f"<b>{idx + 1 + page * PAGE_SIZE}. {format_event_html_title(compact_event_title(s.title), platform='max')}</b>\n"
                 f"• Код: <code>{s.code}</code> | Тип: {kind}\n"
                 f"• Начало: {s.starts_at_msk}\n"
                 f"• Статус: {status} | Регистраций: <b>{s.registrations_count}</b>\n\n"
@@ -550,7 +550,7 @@ async def receive_create_title(
     await client.send_message(
         chat_id=chat_id,
         text=(
-            f"✅ Название: <b>{html.escape(title)}</b>\n\n"
+            f"✅ Название: <b>{format_event_html_title(title, platform='max')}</b>\n\n"
             f"<b>Шаг 3 из 5:</b> Введите дату и время начала мероприятия по <b>Московскому времени (МСК)</b>.\n\n"
             f"Формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
             f"Пример: <code>25.10.2026 19:00</code>"

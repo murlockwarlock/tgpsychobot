@@ -672,3 +672,35 @@ async def test_media_provenance_preservation_and_telegram_delivery_of_max_origin
     assert isinstance(call_media[1].media, BufferedInputFile)
 
 
+def test_compact_event_title_strips_emoji_tags_and_html_entities_cleanly():
+    """Verifies compact_event_title produces clean plain text with Unicode fallback for buttons without cutting tags."""
+    from event_admin_service import compact_event_title, EVENT_BUTTON_TITLE_PREVIEW_CHARS, EVENT_LIST_TITLE_PREVIEW_CHARS
+
+    # 1. Custom emoji and HTML entities
+    title1 = '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Q&amp;A &lt;Special Event&gt; "VIP"'
+    res1 = compact_event_title(title1)
+    assert res1 == '🔥 Q&A <Special Event> "VIP"'
+    assert "<tg-emoji" not in res1
+    assert "&amp;" not in res1
+    assert "&lt;" not in res1
+
+    # 2. Other HTML tags like <b>
+    title2 = '<tg-emoji emoji-id="123">🚀</tg-emoji> <b>Launch</b> &amp; <i>Learn</i>'
+    res2 = compact_event_title(title2)
+    assert res2 == "🚀 Launch & Learn"
+
+    # 3. Truncation does not leave dangling tags
+    long_title = '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> ' + ('Событие ' * 15)
+    btn_text = compact_event_title(long_title, limit=EVENT_BUTTON_TITLE_PREVIEW_CHARS)
+    assert len(btn_text) <= EVENT_BUTTON_TITLE_PREVIEW_CHARS
+    assert btn_text.endswith("…")
+    assert btn_text.startswith("🔥 Событие")
+    assert "<tg-emoji" not in btn_text
+    assert "</" not in btn_text
+
+    # 4. Empty / whitespace
+    assert compact_event_title("") == ""
+    assert compact_event_title("   ") == ""
+
+
+

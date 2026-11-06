@@ -562,7 +562,7 @@ async def _show_scenarios_page(callback: CallbackQuery, page: int, include_archi
             status = "📦 В архиве" if s.is_archived else ("🟢 Активно" if s.is_active else "⚪️ Выключено")
             kind = "Вебинар" if s.event_type == "webinar" else "Очная встреча"
             text_lines.append(
-                f"<b>{idx + 1 + page * SCENARIOS_PAGE_SIZE}. {html.escape(compact_event_title(s.title))}</b>\n"
+                f"<b>{idx + 1 + page * SCENARIOS_PAGE_SIZE}. {_format_event_html_title(compact_event_title(s.title))}</b>\n"
                 f"• Код: <code>{s.code}</code> | Тип: {kind}\n"
                 f"• Начало: {s.starts_at_msk}\n"
                 f"• Статус: {status} | Регистраций: <b>{s.registrations_count}</b>\n"
@@ -700,7 +700,7 @@ async def ask_archive_handler(callback: CallbackQuery, state: FSMContext | None 
         return
 
     await callback.message.edit_text(
-        f"📦 Вы уверены, что хотите архивировать мероприятие «<b>{html.escape(scen.title)}</b>»?\n\n"
+        f"📦 Вы уверены, что хотите архивировать мероприятие «<b>{_format_event_html_title(scen.title)}</b>»?\n\n"
         f"История регистраций, отправок и отчётов будет полностью сохранена. "
         f"Новые регистрации станут недоступны.",
         parse_mode="HTML",
@@ -1914,19 +1914,21 @@ async def start_reschedule(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Мероприятие не найдено.", show_alert=True)
         return
 
+    state_data = await state.get_data() if state is not None else {}
+    list_back = state_data.get("event_list_back", "admin_events")
     await state.clear()
-    await state.update_data(reschedule_event_id=event_id)
+    await state.update_data(reschedule_event_id=event_id, event_list_back=list_back)
     await state.set_state(EventAdminStates.reschedule_starts_at)
 
     await callback.message.edit_text(
-        f"⏰ <b>Перенос времени мероприятия: {html.escape(scen.title)}</b>\n\n"
+        f"⏰ <b>Перенос времени мероприятия: {_format_event_html_title(scen.title)}</b>\n\n"
         f"• Текущее время начала: <b>{scen.starts_at_msk}</b>\n"
         f"• Активных регистраций: <b>{scen.registrations_count}</b>\n\n"
         f"Введите новое время начала по <b>Московскому времени (МСК)</b>:\n"
         f"Формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
         f"Пример: <code>28.10.2026 20:00</code>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=f"admin_ev_open_{event_id}").as_markup(),
+        reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=_event_open_callback(event_id, list_back)).as_markup(),
     )
 
 
@@ -1972,16 +1974,18 @@ async def start_copy(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Мероприятие не найдено.", show_alert=True)
         return
 
+    state_data = await state.get_data() if state is not None else {}
+    list_back = state_data.get("event_list_back", "admin_events")
     await state.clear()
-    await state.update_data(copy_source_id=source_id)
+    await state.update_data(copy_source_id=source_id, event_list_back=list_back)
     await state.set_state(EventAdminStates.copy_code)
 
     await callback.message.edit_text(
-        f"📋 <b>Копирование сценария: {html.escape(scen.title)}</b>\n\n"
+        f"📋 <b>Копирование сценария: {_format_event_html_title(scen.title)}</b>\n\n"
         f"Будут скопированы все параметры и шаги напоминаний. Старые регистрации и отправки НЕ копируются.\n\n"
         f"<b>Шаг 1 из 2:</b> Введите уникальный код нового сценария (например: <code>{scen.code}_next</code>):",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=f"admin_ev_open_{source_id}").as_markup(),
+        reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=_event_open_callback(source_id, list_back)).as_markup(),
     )
 
 
@@ -2058,7 +2062,7 @@ async def show_steps_list(callback: CallbackQuery, state: FSMContext) -> None:
 
     text_lines = [
         f"📝 <b>Цепочка сообщений-напоминаний</b>\n",
-        f"Мероприятие: <b>{html.escape(scen.title)}</b>\n\n",
+        f"Мероприятие: <b>{_format_event_html_title(scen.title)}</b>\n\n",
     ]
 
     if not steps:
@@ -2538,7 +2542,7 @@ async def show_delivery_stats(callback: CallbackQuery, state: FSMContext | None 
     stats = await get_scenario_delivery_stats(async_session_maker, event_id)
 
     status_lines = [
-        f"📊 <b>Мониторинг отправок: {html.escape(scen.title)}</b>\n",
+        f"📊 <b>Мониторинг отправок: {_format_event_html_title(scen.title)}</b>\n",
         f"• Всего регистраций: <b>{scen.registrations_count}</b>\n",
         f"• Всего запланированных/созданных доставок: <b>{stats.total}</b>\n\n",
         f"<b>Агрегаты по статусам:</b>\n",

@@ -13,6 +13,7 @@ Provides platform-neutral logic for:
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 from dataclasses import dataclass
@@ -88,8 +89,14 @@ EVENT_BUTTON_TITLE_PREVIEW_CHARS = 52
 
 
 def compact_event_title(title: str, *, limit: int = EVENT_LIST_TITLE_PREVIEW_CHARS) -> str:
-    """Single-line caption for list views; the stored title stays unchanged."""
-    compact = " ".join(title.split())
+    """Single-line plain-text caption for list and button views; strips HTML tags/custom emojis to visible text."""
+    if not title:
+        return ""
+    from event_content_validator import strip_telegram_custom_emoji, _ANY_HTML_TAG_PATTERN
+    no_emoji = strip_telegram_custom_emoji(title)
+    no_tags = _ANY_HTML_TAG_PATTERN.sub("", no_emoji)
+    unescaped = html.unescape(no_tags)
+    compact = " ".join(unescaped.split())
     if len(compact) <= limit:
         return compact
     return compact[:limit - 1].rstrip() + "…"

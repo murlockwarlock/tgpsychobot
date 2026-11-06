@@ -3446,3 +3446,169 @@ async def test_telegram_title_length_visible_and_storage_validation(db_session_m
         for router in routers:
             router._parent_router = original_parents[router]
 
+
+@pytest.mark.asyncio
+async def test_telegram_premium_emoji_paginated_journey_a_to_ya_to_a(db_session_maker, monkeypatch):
+    """Full journey A -> Я -> A:
+    Paginated list (page 2) -> real button with clean title & Unicode emoji -> card with custom emoji in HTML ->
+    nested screens (archive, reschedule, copy, steps, monitoring) without &amp;amp; or literal <tg-emoji> ->
+    Back -> original list page 2 with original filter.
+    Every outgoing Telegram method is strictly validated through its Pydantic model.
+    """
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+    from database import EventStep
+    import handlers
+
+    now = datetime.utcnow()
+    # 6 filler scenarios on page 1 so target scenario lands on page 2 (0-indexed page 1)
+    base_start = now + timedelta(days=20)
+    for idx in range(6):
+        await create_scenario(
+            db_session_maker,
+            code=f"tg_prem_filler_{idx}",
+            event_type="webinar",
+            title=f"Filler Event {idx}",
+            starts_at_utc=base_start + timedelta(days=idx + 1),
+            link=f"https://example.test/filler/{idx}",
+        )
+
+    target_title = '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Premium Q&amp;A &lt;Special Event&gt; with Long Title for Truncation Testing'
+    target = await create_scenario(
+        db_session_maker,
+        code="tg_prem_target",
+        event_type="webinar",
+        title=target_title,
+        starts_at_utc=base_start - timedelta(days=2),
+        link="https://example.test/target",
+        description="Описание целевого мероприятия с <b>HTML</b>",
+        media_format="separate_media_top",
+    )
+
+    async with db_session_maker() as session:
+        step = EventStep(
+            event_id=target.id,
+            offset_minutes=60,
+            message_text="Напоминание о вебинаре",
+        )
+        session.add(step)
+        await session.commit()
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    def validate_methods(methods):
+        for m in methods:
+            m.__class__.model_validate(m.model_dump())
+        return methods
+
+    def find_button(methods, prefix):
+        for m in methods:
+            if isinstance(m, (EditMessageText, SendMessage)) and m.reply_markup is not None:
+                for row in m.reply_markup.inline_keyboard:
+                    for b in row:
+                        if b.callback_data and b.callback_data.startswith(prefix):
+                            return b
+        raise AssertionError(f"Button with prefix {prefix!r} not found in methods")
+
+    try:
+        # 1. Open list (Page 1)
+        methods = validate_methods(await _feed_callback(dp, bot, "admin_events"))
+        # Navigate to Page 2 (0-indexed page 1)
+        page2_btn = find_button(methods, "admin_ev_page_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, page2_btn.callback_data))
+        listing_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "страница 2 из 2" in listing_msg.text
+
+        # 2. Inspect target button in list: plain text, Unicode fallback emoji, no raw HTML tags
+        target_btn = find_button(methods, f"admin_ev_open_{target.id}_1_0")
+        assert "<tg-emoji" not in target_btn.text
+        assert "</tg-emoji>" not in target_btn.text
+        assert "&amp;" not in target_btn.text
+        assert "&lt;" not in target_btn.text
+        assert "🔥" in target_btn.text
+        assert "Premium Q&A <Special Event>" in target_btn.text
+        assert target_btn.text.endswith("… (" + target.starts_at_msk[:10] + ")")
+
+        # 3. Open scenario card
+        methods = validate_methods(await _feed_callback(dp, bot, target_btn.callback_data))
+        card_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        # Card preserves custom emoji in HTML, without double-escaping &amp;amp;
+        assert '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>' in card_msg.text
+        assert "&amp;amp;" not in card_msg.text
+        assert "&amp;lt;" not in card_msg.text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in card_msg.text
+
+        # 4. Nested screen: Archive
+        archive_btn = find_button(methods, f"admin_ev_archive_ask_{target.id}")
+        methods = validate_methods(await _feed_callback(dp, bot, archive_btn.callback_data))
+        archive_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>' in archive_msg.text
+        assert "&amp;amp;" not in archive_msg.text
+        assert "&lt;tg-emoji" not in archive_msg.text
+        # Back to card
+        card_back_btn = find_button(methods, f"admin_ev_open_{target.id}_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, card_back_btn.callback_data))
+
+        # 5. Nested screen: Reschedule
+        resched_btn = find_button(methods, f"admin_ev_reschedule_{target.id}")
+        methods = validate_methods(await _feed_callback(dp, bot, resched_btn.callback_data))
+        resched_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>' in resched_msg.text
+        assert "&amp;amp;" not in resched_msg.text
+        assert "&lt;tg-emoji" not in resched_msg.text
+        # Back to card
+        card_back_btn = find_button(methods, f"admin_ev_open_{target.id}_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, card_back_btn.callback_data))
+
+        # 6. Nested screen: Copy
+        copy_btn = find_button(methods, f"admin_ev_copy_{target.id}")
+        methods = validate_methods(await _feed_callback(dp, bot, copy_btn.callback_data))
+        copy_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>' in copy_msg.text
+        assert "&amp;amp;" not in copy_msg.text
+        assert "&lt;tg-emoji" not in copy_msg.text
+        # Back to card
+        card_back_btn = find_button(methods, f"admin_ev_open_{target.id}_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, card_back_btn.callback_data))
+
+        # 7. Nested screen: Steps
+        steps_btn = find_button(methods, f"admin_ev_steps_{target.id}")
+        methods = validate_methods(await _feed_callback(dp, bot, steps_btn.callback_data))
+        steps_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>' in steps_msg.text
+        assert "&amp;amp;" not in steps_msg.text
+        assert "&lt;tg-emoji" not in steps_msg.text
+        # Back to card
+        card_back_btn = find_button(methods, f"admin_ev_open_{target.id}_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, card_back_btn.callback_data))
+
+        # 8. Nested screen: Monitoring / Stats
+        stats_btn = find_button(methods, f"admin_ev_stats_{target.id}")
+        methods = validate_methods(await _feed_callback(dp, bot, stats_btn.callback_data))
+        stats_msg = next(m for m in methods if isinstance(m, EditMessageText))
+        assert '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>' in stats_msg.text
+        assert "&amp;amp;" not in stats_msg.text
+        assert "&lt;tg-emoji" not in stats_msg.text
+        # Back to card
+        card_back_btn = find_button(methods, f"admin_ev_open_{target.id}_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, card_back_btn.callback_data))
+
+        # 9. Return to list (Page 2) with original filter
+        to_list_btn = find_button(methods, "admin_ev_page_1_0")
+        methods = validate_methods(await _feed_callback(dp, bot, to_list_btn.callback_data))
+        final_listing = next(m for m in methods if isinstance(m, EditMessageText))
+        assert "страница 2 из 2" in final_listing.text
+        assert find_button(methods, f"admin_ev_open_{target.id}_1_0") is not None
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+

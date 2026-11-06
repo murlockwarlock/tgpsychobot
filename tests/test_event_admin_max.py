@@ -3619,3 +3619,224 @@ async def test_max_title_length_visible_and_storage_validation(db_session_maker,
     sent_text = client.send_message.await_args_list[-1].kwargs["text"]
     assert "лимит хранилища (1000 симв.)" in sent_text
 
+
+@pytest.mark.asyncio
+async def test_max_premium_emoji_paginated_journey_a_to_ya_to_a(db_session_maker, monkeypatch):
+    """
+    MAX A -> Ya -> A journey:
+    Paginated list (page 2) -> real button with title and Premium Emoji -> card ->
+    archive / reschedule / copy / steps / monitoring -> back / cancel -> card ->
+    Back -> original list page 2 with original filter.
+    Every outgoing MAX HTTP payload is strictly validated (text <= 4000, attachments <= 12, valid JSON).
+    """
+    from event_admin_service import create_scenario
+    from database import EventStep
+    from max_messenger_bot import app as max_app_module
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "is_admin", AsyncMock(return_value=True))
+
+    now = datetime.utcnow()
+    base_start = now + timedelta(days=20)
+    # PAGE_SIZE is 6 in MAX, so 6 filler scenarios land on page 1, target scenario on page 2 (index 1)
+    for idx in range(max_admin_events.PAGE_SIZE):
+        await create_scenario(
+            db_session_maker,
+            code=f"max_prem_filler_{idx}",
+            event_type="webinar",
+            title=f"Filler Event {idx}",
+            starts_at_utc=base_start + timedelta(days=idx + 1),
+            link=f"https://example.test/max-filler/{idx}",
+        )
+
+    target_title = '<tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> Premium Q&amp;A &lt;Special Event&gt; with Long Title for Truncation Testing'
+    target = await create_scenario(
+        db_session_maker,
+        code="max_prem_target",
+        event_type="webinar",
+        title=target_title,
+        starts_at_utc=base_start - timedelta(days=2),
+        link="https://example.test/max-target",
+        description="Описание целевого мероприятия с <b>HTML</b>",
+        media_format="separate_media_top",
+    )
+
+    async with db_session_maker() as session:
+        step = EventStep(
+            event_id=target.id,
+            offset_minutes=60,
+            message_text="Напоминание о вебинаре MAX",
+        )
+        session.add(step)
+        await session.commit()
+
+    transport = _RecordedMaxSession()
+    client = MaxApiClient(token="test-token", base_url="https://max.test")
+    client._session = transport
+    app = MaxBotApplication(client)
+    app.states = MemoryStateStore()
+    update_counter = 0
+    chat_id = 123
+    admin_raw_id = 456
+
+    def message_body() -> dict:
+        for request in reversed(transport.requests):
+            if request["url"].endswith("/messages"):
+                return request["body"]
+        raise AssertionError("No MAX /messages request was recorded")
+
+    def validate_max_message(body: dict) -> dict:
+        text = body.get("text") or ""
+        attachments = body.get("attachments") or []
+        assert len(text) <= 4000, f"MAX text length exceeded: {len(text)} > 4000"
+        assert len(attachments) <= 12, f"MAX attachments limit exceeded: {len(attachments)} > 12"
+        json.loads(json.dumps(body, ensure_ascii=False))
+        return body
+
+    def button_payload(body: dict, prefix: str) -> str:
+        for attachment in body.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    payload = button.get("payload")
+                    if payload and payload.startswith(prefix):
+                        return payload
+        raise AssertionError(f"No visible MAX callback with prefix {prefix!r} in {body.get('attachments')}")
+
+    def find_button(body: dict, prefix: str) -> dict:
+        for attachment in body.get("attachments") or []:
+            for row in attachment.get("payload", {}).get("buttons", []):
+                for button in row:
+                    payload = button.get("payload")
+                    if payload and payload.startswith(prefix):
+                        return button
+        raise AssertionError(f"No visible MAX button with prefix {prefix!r} in {body.get('attachments')}")
+
+    async def press(payload: str) -> dict:
+        nonlocal update_counter
+        update_counter += 1
+        transport.requests.clear()
+        await app.handle_update(
+            {
+                "update_type": "message_callback",
+                "update_id": f"max-journey-cb-{update_counter}",
+                "callback": {
+                    "callback_id": f"max-journey-callback-{update_counter}",
+                    "payload": payload,
+                    "user": {"user_id": admin_raw_id, "first_name": "Admin", "username": "admin"},
+                },
+                "message": {
+                    "mid": f"max-journey-message-{update_counter}",
+                    "recipient": {"chat_id": chat_id},
+                    "body": {"text": "admin"},
+                },
+            }
+        )
+        return validate_max_message(message_body())
+
+    try:
+        # 1. Open scenarios list
+        listing = await press("admin_events")
+        assert "Страница 1 из 2" in listing["text"]
+
+        # Navigate to page 2 (0-indexed page 1)
+        listing = await press(button_payload(listing, "admin_ev_page_1_0"))
+        assert "Страница 2 из 2" in listing["text"]
+
+        # 2. Inspect target button on page 2: plain text, Unicode fallback emoji, no raw HTML tags
+        target_btn = find_button(listing, f"admin_ev_open_{target.id}_1_0")
+        btn_text = target_btn["text"]
+        assert "<tg-emoji" not in btn_text
+        assert "</tg-emoji>" not in btn_text
+        assert "&amp;" not in btn_text
+        assert "&lt;" not in btn_text
+        assert "🔥" in btn_text
+        assert "Premium Q&A <Special Event>" in btn_text
+        assert btn_text.endswith("… (" + target.starts_at_msk[:10] + ")")
+
+        # 3. Open scenario card
+        card = await press(target_btn["payload"])
+        card_text = card["text"]
+        # MAX card strips custom emoji tags and renders fallback emoji in HTML
+        assert "<tg-emoji" not in card_text
+        assert "&lt;tg-emoji" not in card_text
+        assert "&amp;amp;" not in card_text
+        assert "&amp;lt;" not in card_text
+        assert "🔥" in card_text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in card_text
+
+        # 4. Nested screen: Archive
+        archive_btn = button_payload(card, f"admin_ev_archive_ask_{target.id}")
+        archive_screen = await press(archive_btn)
+        arch_text = archive_screen["text"]
+        assert "<tg-emoji" not in arch_text
+        assert "&lt;tg-emoji" not in arch_text
+        assert "&amp;amp;" not in arch_text
+        assert "🔥" in arch_text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in arch_text
+        # Back to card
+        card_back = button_payload(archive_screen, f"admin_ev_open_{target.id}_1_0")
+        card = await press(card_back)
+
+        # 5. Nested screen: Reschedule
+        resched_btn = button_payload(card, f"admin_ev_reschedule_{target.id}")
+        resched_screen = await press(resched_btn)
+        resched_text = resched_screen["text"]
+        assert "<tg-emoji" not in resched_text
+        assert "&lt;tg-emoji" not in resched_text
+        assert "&amp;amp;" not in resched_text
+        assert "🔥" in resched_text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in resched_text
+        # Back to card
+        card_back = button_payload(resched_screen, f"admin_ev_open_{target.id}_1_0")
+        card = await press(card_back)
+
+        # 6. Nested screen: Copy
+        copy_btn = button_payload(card, f"admin_ev_copy_{target.id}")
+        copy_screen = await press(copy_btn)
+        copy_text = copy_screen["text"]
+        assert "<tg-emoji" not in copy_text
+        assert "&lt;tg-emoji" not in copy_text
+        assert "&amp;amp;" not in copy_text
+        assert "🔥" in copy_text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in copy_text
+        # Back to card
+        card_back = button_payload(copy_screen, f"admin_ev_open_{target.id}_1_0")
+        card = await press(card_back)
+
+        # 7. Nested screen: Steps
+        steps_btn = button_payload(card, f"admin_ev_steps_{target.id}_1_0")
+        steps_screen = await press(steps_btn)
+        steps_text = steps_screen["text"]
+        assert "<tg-emoji" not in steps_text
+        assert "&lt;tg-emoji" not in steps_text
+        assert "&amp;amp;" not in steps_text
+        assert "🔥" in steps_text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in steps_text
+        # Back to card
+        card_back = button_payload(steps_screen, f"admin_ev_open_{target.id}_1_0")
+        card = await press(card_back)
+
+        # 8. Nested screen: Monitoring / Stats
+        stats_btn = button_payload(card, f"admin_ev_stats_{target.id}")
+        stats_screen = await press(stats_btn)
+        stats_text = stats_screen["text"]
+        assert "<tg-emoji" not in stats_text
+        assert "&lt;tg-emoji" not in stats_text
+        assert "&amp;amp;" not in stats_text
+        assert "🔥" in stats_text
+        assert "Premium Q&amp;A &lt;Special Event&gt;" in stats_text
+        # Back to card
+        card_back = button_payload(stats_screen, f"admin_ev_open_{target.id}_1_0")
+        card = await press(card_back)
+
+        # 9. Return to list (Page 2) with original filter
+        to_list_btn = button_payload(card, "admin_ev_page_1_0")
+        listing = await press(to_list_btn)
+        assert "Страница 2 из 2" in listing["text"]
+        assert button_payload(listing, f"admin_ev_open_{target.id}_1_0") is not None
+    finally:
+        await app.states.clear(MAX_ID_OFFSET + admin_raw_id)
+
+
