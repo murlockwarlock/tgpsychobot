@@ -37,6 +37,18 @@ MANDATORY_BOUNDARY_TESTS = [
     "tests/test_event_content_validator.py",
 ]
 
+MANDATORY_UI_JOURNEY_NODES = [
+    # Telegram Dispatcher real A -> Я -> A journeys
+    "tests/test_event_admin_telegram.py::test_telegram_visible_event_buttons_execute_real_dispatcher_journeys",
+    "tests/test_event_admin_telegram.py::test_telegram_real_paginated_format_save_cancel_journey_preserves_page_filter",
+    "tests/test_event_admin_telegram.py::test_telegram_pagination_page_2_edit_menu_back_roundtrip_journey",
+    "tests/test_event_admin_telegram.py::test_telegram_premium_emoji_paginated_journey_a_to_ya_to_a",
+    # MAX Application real A -> Я -> A journeys
+    "tests/test_event_admin_max.py::test_max_visible_event_buttons_execute_real_application_journeys",
+    "tests/test_event_admin_max.py::test_max_real_handle_update_paginated_format_save_cancel_journey",
+    "tests/test_event_admin_max.py::test_max_premium_emoji_paginated_journey_a_to_ya_to_a",
+]
+
 MODULE_TEST_MAPPINGS: dict[str, list[str]] = {
     "event_admin_telegram.py": [
         "tests/test_event_admin_telegram.py",
@@ -214,11 +226,14 @@ def resolve_targeted_tests(changed_files: list[str]) -> list[str]:
         if Path(mb).exists():
             selected_tests.add(mb)
 
-    # If no specific tests were selected (e.g. only docs or workflows changed),
-    # include representative Telegram & MAX UI journeys + boundaries.
-    if len(selected_tests) <= len(MANDATORY_BOUNDARY_TESTS):
-        selected_tests.add("tests/test_event_admin_telegram.py")
-        selected_tests.add("tests/test_event_admin_max.py")
+    # Always ensure mandatory UI journeys (Telegram Dispatcher & MAX Application A -> Я -> A).
+    # If a full test file is already included (e.g. tests/test_event_admin_telegram.py),
+    # avoid adding individual node IDs so pytest executes the complete suite for that file.
+    # Otherwise, add targeted journey node IDs to keep FAST CI within 1-2 minutes.
+    for node in MANDATORY_UI_JOURNEY_NODES:
+        file_part = node.split("::", 1)[0]
+        if file_part not in selected_tests and Path(file_part).exists():
+            selected_tests.add(node)
 
     return sorted(selected_tests)
 

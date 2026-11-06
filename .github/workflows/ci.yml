@@ -10,6 +10,7 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+      - labeled
   workflow_dispatch:
     inputs:
       force_full_ci:
@@ -144,33 +145,11 @@ jobs:
       - postgres-event-chains
     runs-on: ubuntu-latest
     steps:
-      - name: Evaluate CI Gate Results
-        run: |
-          FAST_STATUS="${{ needs.fast-ci.result }}"
-          SQLITE_STATUS="${{ needs.sqlite.result }}"
-          PG_STATUS="${{ needs.postgres-event-chains.result }}"
-          
-          echo "Fast CI status: $FAST_STATUS"
-          echo "SQLite status:  $SQLITE_STATUS"
-          echo "Postgres status: $PG_STATUS"
-          
-          if [ "$FAST_STATUS" = "failure" ] || [ "$FAST_STATUS" = "cancelled" ]; then
-            echo "Fast CI failed or was cancelled"
-            exit 1
-          fi
-          
-          if [ "$SQLITE_STATUS" = "failure" ] || [ "$SQLITE_STATUS" = "cancelled" ]; then
-            echo "SQLite shard suite failed or was cancelled"
-            exit 1
-          fi
-          if [ "$PG_STATUS" = "failure" ] || [ "$PG_STATUS" = "cancelled" ]; then
-            echo "PostgreSQL event chains failed or was cancelled"
-            exit 1
-          fi
-          
-          if [ "$FAST_STATUS" != "success" ] && [ "$SQLITE_STATUS" != "success" ]; then
-            echo "Neither Fast CI nor Full CI succeeded"
-            exit 1
-          fi
-          
-          echo "CI Gate: SUCCESS"
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Evaluate CI Gate Results (Fail-Closed)
+        run: python scripts/ci_gate.py "${{ needs.fast-ci.result }}" "${{ needs.sqlite.result }}" "${{ needs.postgres-event-chains.result }}"
