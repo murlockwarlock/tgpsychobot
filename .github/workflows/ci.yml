@@ -3,17 +3,64 @@ name: CI
 on:
   push:
     branches:
-      - "**"
+      - main
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+    inputs:
+      force_full_ci:
+        description: 'Force FULL CI suite run (all tests + postgres)'
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  sqlite:
-    name: pytest (SQLite)
+  fast-ci:
+    name: Fast CI (Draft PR)
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft && !contains(github.event.pull_request.labels.*.name, 'full-ci') && inputs.force_full_ci != true && inputs.force_full_ci != 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
+    env:
+      BOT_TOKEN: ci-test-token
+      DATABASE_URL: "sqlite+aiosqlite:///:memory:"
+      TESTING: "true"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+      - name: Fetch base branch for git diff
+        run: git fetch origin main --depth=50
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-ci.txt
+      - name: Run Fast CI Suite
+        run: python scripts/run_fast_ci.py
+
+  sqlite:
+    name: pytest (SQLite shard ${{ matrix.shard }}/3)
+    if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft && !contains(github.event.pull_request.labels.*.name, 'full-ci') && inputs.force_full_ci != true && inputs.force_full_ci != 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     env:
       BOT_TOKEN: ci-test-token
       DATABASE_URL: "sqlite+aiosqlite:///:memory:"
@@ -29,11 +76,12 @@ jobs:
           cache-dependency-path: requirements-ci.txt
       - name: Install test dependencies
         run: python -m pip install -r requirements-ci.txt
-      - name: Run full test suite
-        run: python -m pytest -q -rs
+      - name: Run test shard
+        run: python scripts/ci_test_shards.py --shard ${{ matrix.shard }} --total-shards 3 --run
 
   postgres-event-chains:
     name: event chains (PostgreSQL)
+    if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft && !contains(github.event.pull_request.labels.*.name, 'full-ci') && inputs.force_full_ci != true && inputs.force_full_ci != 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -86,3 +134,43 @@ jobs:
         env:
           PGPASSWORD: postgres
         run: dropdb -h 127.0.0.1 -U postgres --if-exists test_event_chains_ci
+
+  ci-gate:
+    name: CI Gate
+    if: always()
+    needs:
+      - fast-ci
+      - sqlite
+      - postgres-event-chains
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate CI Gate Results
+        run: |
+          FAST_STATUS="${{ needs.fast-ci.result }}"
+          SQLITE_STATUS="${{ needs.sqlite.result }}"
+          PG_STATUS="${{ needs.postgres-event-chains.result }}"
+          
+          echo "Fast CI status: $FAST_STATUS"
+          echo "SQLite status:  $SQLITE_STATUS"
+          echo "Postgres status: $PG_STATUS"
+          
+          if [ "$FAST_STATUS" = "failure" ] || [ "$FAST_STATUS" = "cancelled" ]; then
+            echo "Fast CI failed or was cancelled"
+            exit 1
+          fi
+          
+          if [ "$SQLITE_STATUS" = "failure" ] || [ "$SQLITE_STATUS" = "cancelled" ]; then
+            echo "SQLite shard suite failed or was cancelled"
+            exit 1
+          fi
+          if [ "$PG_STATUS" = "failure" ] || [ "$PG_STATUS" = "cancelled" ]; then
+            echo "PostgreSQL event chains failed or was cancelled"
+            exit 1
+          fi
+          
+          if [ "$FAST_STATUS" != "success" ] && [ "$SQLITE_STATUS" != "success" ]; then
+            echo "Neither Fast CI nor Full CI succeeded"
+            exit 1
+          fi
+          
+          echo "CI Gate: SUCCESS"
