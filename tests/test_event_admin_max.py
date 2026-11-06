@@ -3142,3 +3142,248 @@ async def test_max_custom_emoji_fallback_render(db_session_maker, monkeypatch):
     sent_text = client.send_message.await_args_list[-1].kwargs["text"]
     assert "<tg-emoji" not in sent_text
     assert "🔥 Горячий вебинар MAX" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_max_holistic_draft_media_save_journey(db_session_maker, monkeypatch):
+    """MAX Application Journey: description -> title -> format -> media -> Cancel -> repeat with Save Media.
+    Verifies that Save Media commits description, title, format, and media items atomically in one transaction."""
+    from max_messenger_bot import app as max_app_module
+    from max_messenger_bot.app import MaxBotApplication
+    from max_messenger_bot.api import MaxApiClient
+    from event_admin_service import create_scenario, list_scenario_media
+    from database import EventScenario
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module.common, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(max_app_module, "async_session_maker", db_session_maker)
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_holistic_draft",
+        event_type="webinar",
+        title="Initial Max Title",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/max-draft",
+        description="Initial Max Description",
+        media_format="separate_media_top",
+    )
+
+    client = AsyncMock(spec=MaxApiClient)
+    states = MemoryStateStore()
+
+    user_id = 999
+    chat_id = 999
+
+    # Phase 1: Modify description, title, format, media, then CANCEL
+    # 1. Edit description
+    await max_admin_events.start_edit_description(client, states, chat_id, user_id, scen.id)
+    await max_admin_events.receive_edit_description(client, states, chat_id, user_id, "Pending Max Description")
+
+    # 2. Edit title
+    await max_admin_events.start_edit_title(client, states, chat_id, user_id, scen.id)
+    await max_admin_events.receive_edit_title(client, states, chat_id, user_id, "Pending Max Title")
+
+    # 3. Change format
+    await max_admin_events.set_format_handler(client, states, chat_id, user_id, scen.id, "separate_text_top")
+
+    # 4. Add media
+    await max_admin_events.start_add_media(client, states, chat_id, user_id, scen.id)
+    await max_admin_events.receive_media(client, states, chat_id, user_id, media_type="photo", media_token="token_cancel_1")
+
+    # 5. Cancel draft
+    await max_admin_events.cancel_draft(client, states, chat_id, user_id, scen.id)
+
+    # Verify DB is completely untouched
+    async with db_session_maker() as session:
+        s_after_cancel = await session.get(EventScenario, scen.id)
+        assert s_after_cancel.title == "Initial Max Title"
+        assert s_after_cancel.description == "Initial Max Description"
+        assert s_after_cancel.media_format == "separate_media_top"
+    media_after_cancel = await list_scenario_media(db_session_maker, scen.id)
+    assert len(media_after_cancel) == 0
+
+    # Phase 2: Modify description, title, format, media, and SAVE MEDIA
+    # 1. Edit description
+    await max_admin_events.start_edit_description(client, states, chat_id, user_id, scen.id)
+    await max_admin_events.receive_edit_description(client, states, chat_id, user_id, "Final Saved Max Description")
+
+    # 2. Edit title
+    await max_admin_events.start_edit_title(client, states, chat_id, user_id, scen.id)
+    await max_admin_events.receive_edit_title(client, states, chat_id, user_id, "Final Saved Max Title")
+
+    # 3. Change format to separate_text_top
+    await max_admin_events.set_format_handler(client, states, chat_id, user_id, scen.id, "separate_text_top")
+
+    # 4. Add media
+    await max_admin_events.start_add_media(client, states, chat_id, user_id, scen.id)
+    await max_admin_events.receive_media(client, states, chat_id, user_id, media_type="photo", media_token="token_final_1")
+
+    # 5. Click Save Media
+    await max_admin_events.save_media(client, states, chat_id, user_id, scen.id)
+
+    # Verify DB is atomically updated with ALL changes
+    async with db_session_maker() as session:
+        s_final = await session.get(EventScenario, scen.id)
+        assert s_final.title == "Final Saved Max Title"
+        assert s_final.description == "Final Saved Max Description"
+        assert s_final.media_format == "separate_text_top"
+    media_final = await list_scenario_media(db_session_maker, scen.id)
+    assert len(media_final) == 1
+    assert media_final[0].file_id == "token_final_1"
+
+    # Verify state is cleared
+    snapshot = await states.get(user_id)
+    assert snapshot is None
+
+
+@pytest.mark.asyncio
+async def test_max_format_menu_draft_reflection_and_back(db_session_maker, monkeypatch):
+    """Verifies show_format_menu in MAX marks active draft_format with radio button and preserves it across Back."""
+    from max_messenger_bot.api import MaxApiClient
+    from event_admin_service import create_scenario
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_fmt_draft",
+        event_type="webinar",
+        title="Format Draft Max Event",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/fmt-max",
+        description="Format Draft Max Description",
+        media_format="separate_media_top",
+    )
+
+    client = AsyncMock(spec=MaxApiClient)
+    states = MemoryStateStore()
+    user_id = 999
+    chat_id = 999
+
+    # Open format menu initially - should reflect separate_media_top
+    await max_admin_events.show_format_menu(client, chat_id, scen.id, states=states, user_id=user_id)
+    sent_att = client.send_message.await_args_list[-1].kwargs["attachments"]
+    button_texts = [b["text"] for att in sent_att if att.get("type") == "inline_keyboard" for row in att["payload"]["buttons"] for b in row]
+    assert any("🔘 🖼️ Текст отдельно, медиа выше" in t for t in button_texts)
+
+    # Start edit description so active draft context exists
+    await max_admin_events.start_edit_description(client, states, chat_id, user_id, scen.id)
+    await max_admin_events.receive_edit_description(client, states, chat_id, user_id, "Description draft")
+
+    # Set draft format to separate_text_top
+    await max_admin_events.set_format_handler(client, states, chat_id, user_id, scen.id, "separate_text_top")
+
+    # Reopen format menu - should now reflect draft_format (separate_text_top)
+    await max_admin_events.show_format_menu(client, chat_id, scen.id, states=states, user_id=user_id)
+    sent_att = client.send_message.await_args_list[-1].kwargs["attachments"]
+    button_texts = [b["text"] for att in sent_att if att.get("type") == "inline_keyboard" for row in att["payload"]["buttons"] for b in row]
+    assert any("🔘 📝 Текст отдельно, медиа ниже" in t for t in button_texts)
+    assert any("⚪️ 🖼️ Текст отдельно, медиа выше" in t for t in button_texts)
+
+    # Navigate Back to edit menu
+    await max_admin_events.show_edit_menu(client, chat_id, scen.id, states=states, user_id=user_id)
+    sent_att = client.send_message.await_args_list[-1].kwargs["attachments"]
+    edit_button_texts = [b["text"] for att in sent_att if att.get("type") == "inline_keyboard" for row in att["payload"]["buttons"] for b in row]
+    assert any("Формат:" in t and "Текст отдельно, медиа ниже" in t for t in edit_button_texts)
+
+
+@pytest.mark.asyncio
+async def test_max_visiting_editor_does_not_block_foreign_events(db_session_maker, monkeypatch):
+    """Merely opening edit menu, description editor or media editor without dirty changes does not block foreign events in MAX."""
+    from max_messenger_bot.api import MaxApiClient
+    from event_admin_service import create_scenario
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+
+    event_a = await create_scenario(
+        db_session_maker,
+        code="max_visit_a",
+        event_type="webinar",
+        title="Max Event A",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/max-a",
+    )
+    event_b = await create_scenario(
+        db_session_maker,
+        code="max_visit_b",
+        event_type="webinar",
+        title="Max Event B",
+        starts_at_utc=datetime.utcnow() + timedelta(days=4),
+        link="https://example.test/max-b",
+    )
+
+    client = AsyncMock(spec=MaxApiClient)
+    states = MemoryStateStore()
+    user_id = 999
+    chat_id = 999
+
+    # 1. Visit Event A edit menu
+    await max_admin_events.show_edit_menu(client, chat_id, event_a.id, states=states, user_id=user_id)
+
+    # 2. Visit Event A description editor (without typing)
+    await max_admin_events.start_edit_description(client, states, chat_id, user_id, event_a.id)
+
+    # 3. Visit Event A media editor (without adding/removing media)
+    await max_admin_events.show_media_editor(client, states, chat_id, user_id, event_a.id)
+
+    # 4. Now open Event B edit menu
+    await max_admin_events.show_edit_menu(client, chat_id, event_b.id, states=states, user_id=user_id)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "Это старое меню другого мероприятия" not in sent_text
+    assert "Max Event B" in sent_text
+
+    # 5. Open Event B description editor
+    await max_admin_events.start_edit_description(client, states, chat_id, user_id, event_b.id)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "Это старое меню другого мероприятия" not in sent_text
+    assert "Max Event B" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_max_title_length_visible_and_storage_validation(db_session_maker, monkeypatch):
+    """Verifies that MAX receive_create_title and receive_edit_title validate visible and storage limits."""
+    from max_messenger_bot.api import MaxApiClient
+    from event_admin_service import create_scenario
+
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="max_title_limits",
+        event_type="webinar",
+        title="Initial Valid Max Title",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/max-limits",
+    )
+
+    client = AsyncMock(spec=MaxApiClient)
+    states = MemoryStateStore()
+    user_id = 999
+    chat_id = 999
+
+    # Test receive_create_title with visible text > 1000
+    await max_admin_events.receive_create_title(client, states, chat_id, user_id, "A" * 1005)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "1000 симв." in sent_text
+    assert "1005" in sent_text
+
+    # Test receive_create_title with storage overflow > 1000
+    emojis = '<tg-emoji emoji-id="1234567890123456789">🔥</tg-emoji>' * 25
+    raw_storage_overflow = ("B" * 50) + emojis
+    await max_admin_events.receive_create_title(client, states, chat_id, user_id, raw_storage_overflow)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "лимит хранилища (1000 симв.)" in sent_text
+
+    # Test receive_edit_title with visible text > 1000
+    await max_admin_events.start_edit_title(client, states, chat_id, user_id, scen.id)
+    await max_admin_events.receive_edit_title(client, states, chat_id, user_id, "C" * 1005)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "1000 симв." in sent_text
+    assert "1005" in sent_text
+
+    # Test receive_edit_title with storage overflow > 1000
+    await max_admin_events.receive_edit_title(client, states, chat_id, user_id, raw_storage_overflow)
+    sent_text = client.send_message.await_args_list[-1].kwargs["text"]
+    assert "лимит хранилища (1000 симв.)" in sent_text
+

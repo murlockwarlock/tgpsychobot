@@ -421,9 +421,24 @@ def validate_scenario_input(
         raise ValueError("Тип сценария должен быть 'webinar' или 'meeting'.")
 
     title_clean = (title or "").strip()
-    if not title_clean or len(title_clean) > EVENT_TITLE_MAX_LENGTH:
+    if not title_clean:
         raise ValueError(
             f"Название сценария обязательно и должно содержать от 1 до {EVENT_TITLE_MAX_LENGTH} символов."
+        )
+
+    from event_content_validator import strip_telegram_custom_emoji
+    visible_title = strip_telegram_custom_emoji(title_clean)
+    if not visible_title:
+        raise ValueError(
+            f"Название сценария обязательно и должно содержать от 1 до {EVENT_TITLE_MAX_LENGTH} символов."
+        )
+    if len(visible_title) > EVENT_TITLE_MAX_LENGTH:
+        raise ValueError(
+            f"Название сценария обязательно и должно содержать от 1 до {EVENT_TITLE_MAX_LENGTH} символов."
+        )
+    if len(title_clean) > EVENT_TITLE_MAX_LENGTH:
+        raise ValueError(
+            f"Разметка названия ({len(title_clean)} симв.) превышает максимально допустимый предел хранения ({EVENT_TITLE_MAX_LENGTH} символов)."
         )
 
     if not (15 <= duration_minutes <= 1440):
@@ -735,13 +750,7 @@ async def list_scenario_media(
         ]
 
 
-async def replace_scenario_media(
-    session_maker: async_sessionmaker[AsyncSession],
-    event_id: int,
-    attachments: list[dict[str, Any]],
-    *,
-    now_utc: datetime | None = None,
-) -> list[ScenarioMediaItem]:
+def _normalize_media_attachments(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if len(attachments) > 100:
         raise ValueError("Можно добавить не более 100 медиафайлов.")
     normalized: list[dict[str, Any]] = []
@@ -760,6 +769,17 @@ async def replace_scenario_media(
             "source_file_id": str(attachment.get("source_file_id") or file_id).strip() or file_id,
             "sort_order": index,
         })
+    return normalized
+
+
+async def replace_scenario_media(
+    session_maker: async_sessionmaker[AsyncSession],
+    event_id: int,
+    attachments: list[dict[str, Any]],
+    *,
+    now_utc: datetime | None = None,
+) -> list[ScenarioMediaItem]:
+    normalized = _normalize_media_attachments(attachments)
 
     eff_now = now_utc or utc_now()
     async with session_maker() as session:
@@ -919,6 +939,7 @@ async def update_scenario_fields(
     media_order: str | object = _UNSET,
     media_mode: str | object = _UNSET,
     media_format: str | object = _UNSET,
+    media_items: list[dict[str, Any]] | object = _UNSET,
     now_utc: datetime | None = None,
 ) -> ScenarioSummary:
     """Updates content fields of a scenario in a short locked transaction, adjusting expiry for unsent immediate deliveries."""
@@ -962,6 +983,18 @@ async def update_scenario_fields(
         if new_media_mode not in {"legacy_auto", "separate", "caption"}:
             raise ValueError("Режим медиа должен быть legacy_auto, separate или caption.")
 
+        normalized_media: list[dict[str, Any]] | None = None
+        if media_items is not _UNSET and media_items is not None:
+            normalized_media = _normalize_media_attachments(list(media_items))
+            if new_media_mode == "caption":
+                if len(normalized_media) == 0:
+                    new_media_mode = "separate"
+                elif len(normalized_media) > 1:
+                    raise ValueError(
+                        f"В режиме «подпись к медиа» поддерживается ровно 1 файл (передано: {len(normalized_media)}). "
+                        "Удалите лишние файлы или выберите раздельный формат доставки."
+                    )
+
         validate_scenario_input(
             code=scen.code,
             event_type=scen.event_type,
@@ -980,8 +1013,12 @@ async def update_scenario_fields(
             .order_by(EventStep.offset_minutes.asc(), EventStep.sort_order.asc(), EventStep.id.asc())
         )).scalars().all()
 
-        media_count = await session.scalar(
-            select(func.count(EventScenarioMedia.id)).where(EventScenarioMedia.event_id == event_id)
+        media_count = (
+            len(normalized_media)
+            if normalized_media is not None
+            else await session.scalar(
+                select(func.count(EventScenarioMedia.id)).where(EventScenarioMedia.event_id == event_id)
+            )
         )
 
         probe_scen = SimpleNamespace(
@@ -1008,6 +1045,29 @@ async def update_scenario_fields(
         if not val_res.is_valid:
             raise EventContentValidationError(val_res.primary_error_message, val_res)
 
+        media_changed = False
+        if normalized_media is not None:
+            current_media = (
+                await session.execute(
+                    select(EventScenarioMedia).where(EventScenarioMedia.event_id == event_id)
+                )
+            ).scalars().all()
+            media_changed = len(current_media) != len(normalized_media) or any(
+                row.file_type != item["file_type"]
+                or row.file_id != item["file_id"]
+                or row.max_token != item["max_token"]
+                or row.sort_order != item["sort_order"]
+                for row, item in zip(sorted(current_media, key=lambda v: (v.sort_order, v.id)), normalized_media)
+            )
+            if media_changed:
+                for row in current_media:
+                    await session.delete(row)
+                await session.flush()
+                session.add_all([
+                    EventScenarioMedia(event_id=event_id, created_at=eff_now, updated_at=eff_now, **item)
+                    for item in normalized_media
+                ])
+
         duration_changed = (new_dur != scen.duration_minutes)
         content_changed = (
             new_title != scen.title
@@ -1017,6 +1077,7 @@ async def update_scenario_fields(
             or new_description != scen.description
             or new_media_order != scen.media_order
             or new_media_mode != getattr(scen, "media_mode", None)
+            or media_changed
         )
 
         scen.title = new_title

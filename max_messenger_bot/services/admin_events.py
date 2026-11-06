@@ -73,6 +73,7 @@ from event_content_validator import (
     format_event_html_title,
     parse_visible_telegram_text,
     render_plain_text_for_max,
+    strip_telegram_custom_emoji,
 )
 from event_delivery_worker import build_test_delivery_plan
 from ..api import MaxApiClient
@@ -121,8 +122,6 @@ _EVENT_DRAFT_KEYS = frozenset({
     "description_draft",
     "draft_title",
     "draft_format",
-    "media_draft",
-    "media_draft_dirty",
 })
 
 _EVENT_MUTATION_LOCKS: dict[int, asyncio.Lock] = {}
@@ -149,9 +148,13 @@ def has_active_event_draft(snapshot: Any | None) -> bool:
     data = snapshot.data
     if data.get("event_id") is None:
         return False
-    if snapshot.state in MAX_EVENT_INPUT_STATES:
+    if data.get("draft_title") is not None or data.get("draft_format") is not None:
         return True
-    return any(data.get(key) is not None for key in _EVENT_DRAFT_KEYS)
+    if data.get("description_draft") is not None and data.get("description_input_started", True):
+        return True
+    if bool(data.get("media_draft_dirty")):
+        return True
+    return False
 
 
 def has_foreign_event_draft(snapshot: Any | None, event_id: int) -> bool:
@@ -521,8 +524,21 @@ async def receive_create_title(
     raw_title: str,
 ) -> None:
     title = raw_title.strip()
-    if not title or len(title) > EVENT_TITLE_MAX_LENGTH:
-        await client.send_message(chat_id=chat_id, text=f"❌ Название не должно быть пустым и не может превышать {EVENT_TITLE_MAX_LENGTH} символов:")
+    visible_title = strip_telegram_custom_emoji(title)
+    if not title:
+        await client.send_message(chat_id=chat_id, text="❌ Название мероприятия не может быть пустым.")
+        return
+    if len(visible_title) > EVENT_TITLE_MAX_LENGTH:
+        await client.send_message(
+            chat_id=chat_id,
+            text=f"❌ Длина названия ({len(visible_title)} симв.) превышает максимально допустимую ({EVENT_TITLE_MAX_LENGTH} симв.).",
+        )
+        return
+    if len(title) > EVENT_TITLE_MAX_LENGTH:
+        await client.send_message(
+            chat_id=chat_id,
+            text=f"❌ Длина названия с учётом разметки и эмодзи ({len(title)} симв.) превышает лимит хранилища ({EVENT_TITLE_MAX_LENGTH} симв.). Сократите текст или форматирование.",
+        )
         return
 
     state_obj = await states.get(user_id)
@@ -746,13 +762,15 @@ async def show_edit_menu(
     has_draft = bool(
         snapshot
         and snapshot.data.get("event_id") == event_id
-        and any(
-            snapshot.data.get(k) is not None
-            for k in ("description_draft", "draft_title", "draft_format")
+        and (
+            snapshot.data.get("draft_title") is not None
+            or snapshot.data.get("draft_format") is not None
+            or (snapshot.data.get("description_draft") is not None and snapshot.data.get("description_input_started", True))
+            or bool(snapshot.data.get("media_draft_dirty"))
         )
     )
-    cur_title = (snapshot.data.get("draft_title") or s.title) if has_draft else s.title
-    cur_fmt = (snapshot.data.get("draft_format") or s.media_format) if has_draft else s.media_format
+    cur_title = (snapshot.data.get("draft_title") or s.title) if (snapshot and snapshot.data.get("event_id") == event_id and snapshot.data.get("draft_title")) else s.title
+    cur_fmt = (snapshot.data.get("draft_format") or s.media_format) if (snapshot and snapshot.data.get("event_id") == event_id and snapshot.data.get("draft_format")) else s.media_format
 
     rows = []
     if has_draft:
@@ -812,12 +830,8 @@ async def show_format_menu(
         return
     if snapshot and snapshot.data.get("event_id") == event_id:
         back = snapshot.data.get("event_list_back", back)
-    has_draft = bool(
-        snapshot
-        and snapshot.data.get("event_id") == event_id
-        and any(snapshot.data.get(k) is not None for k in ("description_draft", "draft_title", "draft_format"))
-    )
-    current_fmt = (snapshot.data.get("draft_format") or s.media_format) if has_draft else s.media_format
+    has_same_event = bool(snapshot and snapshot.data.get("event_id") == event_id)
+    current_fmt = (snapshot.data.get("draft_format") or s.media_format) if has_same_event else s.media_format
     back_target = _event_edit_menu_callback(event_id, back)
     rows = [
         [callback_button(
@@ -834,7 +848,7 @@ async def show_format_menu(
         )],
         _back(back_target),
     ]
-    title_text = format_event_html_title(snapshot.data.get("draft_title") or s.title, platform="max") if has_draft else format_event_html_title(s.title, platform="max")
+    title_text = format_event_html_title(snapshot.data.get("draft_title") or s.title, platform="max") if (has_same_event and snapshot.data.get("draft_title")) else format_event_html_title(s.title, platform="max")
     text = (
         f"⚙️ <b>Формат доставки для: {title_text}</b>\n\n"
         f"Текущий формат: <b>{_format_display_name(current_fmt)}</b>\n\n"
@@ -870,9 +884,11 @@ async def set_format_handler(
     has_draft = bool(
         snapshot
         and snapshot.data.get("event_id") == event_id
-        and any(
-            snapshot.data.get(k) is not None
-            for k in ("description_draft", "draft_title", "draft_format")
+        and (
+            snapshot.data.get("draft_title") is not None
+            or snapshot.data.get("draft_format") is not None
+            or (snapshot.data.get("description_draft") is not None and snapshot.data.get("description_input_started", True))
+            or bool(snapshot.data.get("media_draft_dirty"))
         )
     )
     list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
@@ -884,6 +900,7 @@ async def set_format_handler(
             [callback_button("💾 Сохранить изменения черновика", f"admin_ev_description_save_{event_id}")],
             [callback_button("✏️ Редактировать текст", f"admin_ev_edit_description_{event_id}")],
             [callback_button("✏️ Изменить название", f"admin_ev_edit_title_{event_id}")],
+            [callback_button("🖼 Управление медиа", f"admin_ev_edit_media_{event_id}")],
             [callback_button("⚙️ Выбрать другой формат", f"admin_ev_format_menu_{event_id}")],
             [callback_button("❌ Отмена (сбросить черновик)", f"admin_ev_cancel_draft_{event_id}")],
         ]
@@ -1199,12 +1216,14 @@ async def save_description(
     list_back = snapshot.data.get("event_list_back", "admin_events")
 
     kwargs: dict[str, Any] = {}
-    if draft_desc is not None:
+    if draft_desc is not None and snapshot.data.get("description_input_started", True):
         kwargs["description"] = draft_desc
     if draft_title is not None:
         kwargs["title"] = draft_title
     if draft_fmt is not None:
         kwargs["media_format"] = draft_fmt
+    if snapshot.data.get("media_draft_dirty") and isinstance(snapshot.data.get("media_draft"), list):
+        kwargs["media_items"] = snapshot.data.get("media_draft")
 
     try:
         s = await update_scenario_fields(async_session_maker, event_id, **kwargs)
@@ -1234,6 +1253,7 @@ async def save_description(
             [callback_button("✏️ Редактировать текст", f"admin_ev_edit_description_{event_id}")],
             [callback_button("✏️ Изменить название", f"admin_ev_edit_title_{event_id}")],
             [callback_button("⚙️ Изменить формат доставки", f"admin_ev_format_menu_{event_id}")],
+            [callback_button("🖼 Управление медиа", f"admin_ev_edit_media_{event_id}")],
             [callback_button("💾 Повторить сохранение", f"admin_ev_description_save_{event_id}")],
             [callback_button("❌ Отмена (сбросить черновик)", f"admin_ev_cancel_draft_{event_id}")],
         ]
@@ -1388,10 +1408,49 @@ async def save_media(client: MaxApiClient, states: StateStore, chat_id: int, use
         return
     draft = snapshot.data.get("media_draft", []) if snapshot else []
     list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
+    draft_desc = snapshot.data.get("description_draft")
+    draft_title = snapshot.data.get("draft_title")
+    draft_fmt = snapshot.data.get("draft_format")
+
+    kwargs: dict[str, Any] = {"media_items": draft}
+    if draft_desc is not None and snapshot.data.get("description_input_started", True):
+        kwargs["description"] = draft_desc
+    if draft_title is not None:
+        kwargs["title"] = draft_title
+    if draft_fmt is not None:
+        kwargs["media_format"] = draft_fmt
+
     try:
-        await replace_scenario_media(async_session_maker, event_id, draft)
+        s = await update_scenario_fields(async_session_maker, event_id, **kwargs)
         await states.clear(user_id)
-        await client.send_message(chat_id=chat_id, text="✅ Медиа сохранены.", attachments=inline_keyboard([_back(_event_open_callback(event_id, list_back))]))
+        await client.send_message(
+            chat_id=chat_id,
+            text=f"✅ Медиа и изменения мероприятия <b>{format_event_html_title(s.title, platform='max')}</b> сохранены.",
+            attachments=inline_keyboard([_back(_event_open_callback(event_id, list_back))]),
+        )
+    except EventContentValidationError as err:
+        rec = f"\n\n💡 Рекомендация: {err.recommendation}" if err.recommendation else ""
+        error_msg = (
+            f"❌ <b>Невозможно сохранить изменения медиа!</b>\n\n"
+            f"• Платформа: <b>{err.platform.upper()}</b>\n"
+            f"• Фактическая длина: <b>{err.actual_length}</b> симв. (лимит: {err.limit_length})\n"
+            f"• Превышение: <b>{err.excess}</b> симв.\n"
+            f"• Причина: {html.escape(err.message)}{rec}\n\n"
+            f"<i>Черновик сохранён. Вы можете изменить формат доставки, текст или количество медиа.</i>"
+        )
+        rows = [
+            [callback_button("✏️ Редактировать текст", f"admin_ev_edit_description_{event_id}")],
+            [callback_button("✏️ Изменить название", f"admin_ev_edit_title_{event_id}")],
+            [callback_button("⚙️ Изменить формат доставки", f"admin_ev_format_menu_{event_id}")],
+            [callback_button("🖼 Управление медиа", f"admin_ev_edit_media_{event_id}")],
+            [callback_button("💾 Повторить сохранение медиа", f"admin_ev_media_save_{event_id}")],
+            [callback_button("❌ Отмена (сбросить черновик)", f"admin_ev_cancel_draft_{event_id}")],
+        ]
+        await client.send_message(
+            chat_id=chat_id,
+            text=error_msg,
+            attachments=inline_keyboard(rows),
+        )
     except Exception as exc:
         await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
 
@@ -1414,7 +1473,11 @@ async def start_edit_title(client: MaxApiClient, states: StateStore, chat_id: in
         return
     list_back = snapshot.data.get("event_list_back", "admin_events") if snapshot else "admin_events"
     draft_data = snapshot.data if (snapshot and snapshot.data.get("event_id") == event_id) else {}
-    has_draft = bool(draft_data.get("description_draft") is not None or draft_data.get("draft_format") is not None)
+    has_draft = bool(
+        draft_data.get("description_draft") is not None
+        or draft_data.get("draft_format") is not None
+        or bool(draft_data.get("media_draft_dirty"))
+    )
     new_data = dict(draft_data)
     new_data.update({"event_id": event_id, "event_list_back": list_back})
     await states.set(user_id, chat_id, "max_event_edit_title", new_data)
@@ -1433,21 +1496,30 @@ async def receive_edit_title(client: MaxApiClient, states: StateStore, chat_id: 
     event_id = state_obj.data["event_id"]
     list_back = state_obj.data.get("event_list_back", "admin_events")
     title = raw_title.strip()
+    visible_title = strip_telegram_custom_emoji(title)
 
     if not title:
         await client.send_message(chat_id=chat_id, text="❌ Название мероприятия не может быть пустым.")
         return
 
+    if len(visible_title) > EVENT_TITLE_MAX_LENGTH:
+        await client.send_message(
+            chat_id=chat_id,
+            text=f"❌ Длина названия ({len(visible_title)} симв.) превышает максимально допустимую ({EVENT_TITLE_MAX_LENGTH} симв.).",
+        )
+        return
+
     if len(title) > EVENT_TITLE_MAX_LENGTH:
         await client.send_message(
             chat_id=chat_id,
-            text=f"❌ Длина названия ({len(title)} симв.) превышает максимально допустимую ({EVENT_TITLE_MAX_LENGTH} симв.).",
+            text=f"❌ Длина названия с учётом разметки и эмодзи ({len(title)} симв.) превышает лимит хранилища ({EVENT_TITLE_MAX_LENGTH} симв.). Сократите текст или форматирование.",
         )
         return
 
     has_active_draft = (
         state_obj.data.get("description_draft") is not None
         or state_obj.data.get("draft_format") is not None
+        or bool(state_obj.data.get("media_draft_dirty"))
     )
 
     if has_active_draft:
@@ -1457,6 +1529,7 @@ async def receive_edit_title(client: MaxApiClient, states: StateStore, chat_id: 
             [callback_button("💾 Сохранить изменения черновика", f"admin_ev_description_save_{event_id}")],
             [callback_button("✏️ Редактировать текст", f"admin_ev_edit_description_{event_id}")],
             [callback_button("⚙️ Изменить формат доставки", f"admin_ev_format_menu_{event_id}")],
+            [callback_button("🖼 Управление медиа", f"admin_ev_edit_media_{event_id}")],
             [callback_button("❌ Отмена (сбросить черновик)", f"admin_ev_cancel_draft_{event_id}")],
         ]
         await client.send_message(
@@ -1494,6 +1567,7 @@ async def receive_edit_title(client: MaxApiClient, states: StateStore, chat_id: 
             [callback_button("✏️ Редактировать текст", f"admin_ev_edit_description_{event_id}")],
             [callback_button("✏️ Изменить название", f"admin_ev_edit_title_{event_id}")],
             [callback_button("⚙️ Изменить формат доставки", f"admin_ev_format_menu_{event_id}")],
+            [callback_button("🖼 Управление медиа", f"admin_ev_edit_media_{event_id}")],
             [callback_button("💾 Повторить сохранение", f"admin_ev_description_save_{event_id}")],
             [callback_button("❌ Отмена (сбросить черновик)", f"admin_ev_cancel_draft_{event_id}")],
         ]

@@ -94,18 +94,20 @@ router = Router(name="event_admin")
 _format_event_html_title = format_event_html_title
 _answered_callbacks: set[str] = set()
 
-_EDIT_CONTEXT_KEYS = (
-    "edit_event_id",
+_DIRTY_DRAFT_KEYS = (
     "description_draft",
     "draft_title",
     "draft_format",
-    "media_draft",
-    "media_draft_dirty",
 )
 
 
 def _has_active_edit_context(data: dict[str, Any]) -> bool:
-    return any(data.get(key) is not None for key in _EDIT_CONTEXT_KEYS)
+    """True only when the draft has actual uncommitted modifications."""
+    if any(data.get(key) is not None for key in _DIRTY_DRAFT_KEYS):
+        return True
+    if bool(data.get("media_draft_dirty")):
+        return True
+    return False
 
 
 async def _reject_foreign_edit_context(callback: CallbackQuery, state: FSMContext, event_id: int) -> bool:
@@ -294,7 +296,13 @@ def _format_display_name(fmt: str) -> str:
     return "Стандартный (авто)"
 
 
-def _scenario_edit_keyboard(s: ScenarioSummary, *, list_back: str = "admin_events", has_draft: bool = False) -> Any:
+def _scenario_edit_keyboard(
+    s: ScenarioSummary,
+    *,
+    list_back: str = "admin_events",
+    has_draft: bool = False,
+    media_format: str | None = None,
+) -> Any:
     builder = InlineKeyboardBuilder()
     if has_draft:
         builder.button(text="💾 Сохранить изменения черновика", callback_data=f"admin_ev_description_save_{s.id}")
@@ -310,8 +318,9 @@ def _scenario_edit_keyboard(s: ScenarioSummary, *, list_back: str = "admin_event
 
     builder.button(text="📝 Описание", callback_data=f"admin_ev_edit_description_{s.id}")
     builder.button(text="🖼 Медиа", callback_data=f"admin_ev_edit_media_{s.id}")
+    eff_fmt = media_format or s.media_format
     builder.button(
-        text=f"⚙️ Формат: {_format_display_name(s.media_format)}",
+        text=f"⚙️ Формат: {_format_display_name(eff_fmt)}",
         callback_data=f"admin_ev_format_menu_{s.id}",
     )
     builder.button(
@@ -783,6 +792,10 @@ async def process_create_title(message: Message, state: FSMContext) -> None:
         _, visible_len, _ = parse_visible_telegram_text(title)
         if visible_len > EVENT_TITLE_MAX_LENGTH:
             raise ValueError(f"Название не должно превышать {EVENT_TITLE_MAX_LENGTH} символов (сейчас: {visible_len}).")
+        if len(title) > EVENT_TITLE_MAX_LENGTH:
+            raise ValueError(
+                f"Длина названия с учётом разметки ({len(title)} симв.) превышает максимально допустимый предел хранения ({EVENT_TITLE_MAX_LENGTH} символов)."
+            )
     except Exception as exc:
         await message.answer(f"❌ {exc}\nПопробуйте ещё раз:")
         return
@@ -950,7 +963,10 @@ async def show_edit_menu(callback: CallbackQuery, state: FSMContext) -> None:
     )
     has_draft = (
         state_data.get("edit_event_id") == event_id
-        and any(state_data.get(k) is not None for k in ("description_draft", "draft_title", "draft_format"))
+        and (
+            any(state_data.get(k) is not None for k in ("description_draft", "draft_title", "draft_format"))
+            or bool(state_data.get("media_draft_dirty"))
+        )
     )
     same_edit_context = state_data.get("edit_event_id") == event_id and _has_active_edit_context(state_data)
     if not same_edit_context:
@@ -965,12 +981,13 @@ async def show_edit_menu(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     cur_title = (state_data.get("draft_title") or scen.title) if has_draft else scen.title
+    cur_fmt = (state_data.get("draft_format") or scen.media_format) if has_draft else scen.media_format
     draft_notice = "\n\n⚠️ <b>Есть несохранённый черновик.</b> Нажмите «Сохранить изменения черновика» для валидации и записи." if has_draft else ""
     await callback.message.edit_text(
         f"✏️ <b>Редактирование мероприятия: {_format_event_html_title(cur_title)}</b>{draft_notice}\n\n"
         f"Выберите поле, которое хотите изменить:",
         parse_mode="HTML",
-        reply_markup=_scenario_edit_keyboard(scen, list_back=list_back, has_draft=has_draft),
+        reply_markup=_scenario_edit_keyboard(scen, list_back=list_back, has_draft=has_draft, media_format=cur_fmt),
     )
 
 
@@ -987,7 +1004,8 @@ async def show_format_menu(callback: CallbackQuery, state: FSMContext) -> None:
 
     state_data = await state.get_data()
     list_back = state_data.get("event_list_back", "admin_events")
-    current_fmt = scen.media_format
+    has_same_event = state_data.get("edit_event_id") == event_id
+    current_fmt = (state_data.get("draft_format") or scen.media_format) if has_same_event else scen.media_format
 
     builder = InlineKeyboardBuilder()
     opt1_icon = "🔘 " if current_fmt == MEDIA_FORMAT_SEPARATE_MEDIA_TOP else "⚪️ "
@@ -1308,18 +1326,17 @@ async def process_edit_title(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Название мероприятия не может быть пустым.")
         return
 
-    if len(title) > EVENT_TITLE_MAX_LENGTH:
-        await message.answer(
-            f"❌ Длина названия ({len(title)} симв.) превышает максимально допустимую ({EVENT_TITLE_MAX_LENGTH} символов)."
-        )
-        return
-
     try:
         TelegramHtmlValidator.validate(title, allowed_tags=frozenset({"tg-emoji"}))
         _, visible_len, _ = parse_visible_telegram_text(title)
         if visible_len > EVENT_TITLE_MAX_LENGTH:
             await message.answer(
-                f"❌ Видимый текст названия ({visible_len} симв.) превышает {EVENT_TITLE_MAX_LENGTH} симв."
+                f"❌ Длина названия ({visible_len} симв.) превышает максимально допустимую ({EVENT_TITLE_MAX_LENGTH} символов)."
+            )
+            return
+        if len(title) > EVENT_TITLE_MAX_LENGTH:
+            await message.answer(
+                f"❌ Длина названия с учётом разметки ({len(title)} симв.) превышает максимально допустимый предел хранения ({EVENT_TITLE_MAX_LENGTH} символов)."
             )
             return
     except EventContentValidationError as err:
@@ -1607,6 +1624,8 @@ async def save_description(callback: CallbackQuery, state: FSMContext) -> None:
         update_kwargs["title"] = draft_title
     if draft_fmt is not None:
         update_kwargs["media_format"] = draft_fmt
+    if data.get("media_draft_dirty") and isinstance(data.get("media_draft"), list):
+        update_kwargs["media_items"] = data.get("media_draft")
 
     try:
         scen = await update_scenario_fields(
@@ -1788,11 +1807,53 @@ async def save_media(callback: CallbackQuery, state: FSMContext) -> None:
     if data.get("edit_event_id") != event_id:
         await callback.answer("Черновик устарел или принадлежит другому мероприятию.", show_alert=True)
         return
+    draft_desc = data.get("description_draft")
+    draft_title = data.get("draft_title")
+    draft_fmt = data.get("draft_format")
+    list_back = data.get("event_list_back", "admin_events")
+
+    update_kwargs: dict[str, Any] = {}
+    if data.get("media_draft_dirty") or "media_draft" in data:
+        update_kwargs["media_items"] = data.get("media_draft", [])
+    if draft_desc is not None:
+        update_kwargs["description"] = draft_desc
+    if draft_title is not None:
+        update_kwargs["title"] = draft_title
+    if draft_fmt is not None:
+        update_kwargs["media_format"] = draft_fmt
+
     try:
-        await replace_scenario_media(async_session_maker, event_id, data.get("media_draft", []))
-        scen = await get_scenario_summary(async_session_maker, event_id)
+        scen = await update_scenario_fields(
+            async_session_maker,
+            event_id,
+            **update_kwargs,
+        )
         await state.clear()
-        await callback.message.edit_text("✅ Медиа сохранены.", reply_markup=_scenario_card_keyboard(scen, data.get("event_list_back", "admin_events")))
+        await state.update_data(event_list_back=list_back)
+        await callback.message.edit_text(
+            f"{_format_scenario_card_text(scen)}\n\n"
+            f"✅ Медиа и изменения мероприятия сохранены.",
+            reply_markup=_scenario_card_keyboard(scen, list_back),
+        )
+    except EventContentValidationError as err:
+        rec = f"\n\n💡 <b>Рекомендация:</b> {html.escape(err.recommendation)}" if err.recommendation else ""
+        error_msg = (
+            f"❌ <b>Невозможно сохранить изменения!</b>\n\n"
+            f"• Платформа: <b>{err.platform.upper()}</b>\n"
+            f"• Фактическая длина: <b>{err.actual_length}</b> симв. (лимит: {err.limit_length})\n"
+            f"• Превышение: <b>{err.excess}</b> симв.\n"
+            f"• Причина: {html.escape(err.message)}{rec}\n\n"
+            f"<i>Черновик сохранён. Вы можете отредактировать текст или изменить формат доставки.</i>"
+        )
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✏️ Редактировать описание", callback_data=f"admin_ev_edit_description_{event_id}")
+        kb.button(text="✏️ Изменить название", callback_data=f"admin_ev_edit_title_{event_id}")
+        kb.button(text="⚙️ Изменить формат доставки", callback_data=f"admin_ev_format_menu_{event_id}")
+        kb.button(text="🖼 Редактировать медиа", callback_data=f"admin_ev_edit_media_{event_id}")
+        kb.button(text="💾 Повторить сохранение", callback_data=f"admin_ev_description_save_{event_id}")
+        kb.button(text="❌ Отмена (сбросить черновик)", callback_data=f"admin_ev_cancel_draft_{event_id}")
+        kb.adjust(1)
+        await callback.message.edit_text(error_msg, parse_mode="HTML", reply_markup=kb.as_markup())
     except Exception as exc:
         await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
 

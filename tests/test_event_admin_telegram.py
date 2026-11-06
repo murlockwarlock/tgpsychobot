@@ -2,6 +2,7 @@ import os
 import re
 import json
 import html
+from typing import Any
 from functools import wraps
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -2061,10 +2062,26 @@ async def _feed_callback(dp: Dispatcher, bot: Bot, data: str, user_id: int = 123
     return [call.args[0] for call in bot.call_args_list if call.args and hasattr(call.args[0], "__class__")]
 
 
-async def _feed_message(dp: Dispatcher, bot: Bot, text: str, user_id: int = 12345, message_id: int = 101):
+async def _feed_message(
+    dp: Dispatcher,
+    bot: Bot,
+    text: str = "",
+    user_id: int = 12345,
+    message_id: int = 101,
+    photo: Any | None = None,
+    video: Any | None = None,
+):
     user = TgUser(id=user_id, is_bot=False, first_name="Admin", username="admin_user")
     chat = Chat(id=user_id, type="private")
-    msg = Message(message_id=message_id, date=datetime.now(), chat=chat, text=text, from_user=user)
+    msg = Message(
+        message_id=message_id,
+        date=datetime.now(),
+        chat=chat,
+        text=text,
+        from_user=user,
+        photo=photo,
+        video=video,
+    )
     update = Update(update_id=2, message=msg)
     bot.reset_mock()
     await dp.feed_update(bot, update)
@@ -3009,3 +3026,272 @@ async def test_telegram_cross_event_draft_stale_callback_rejection_journey(db_se
     finally:
         for router in routers:
             router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_holistic_draft_media_save_journey(db_session_maker, monkeypatch):
+    """Journey: input description -> edit title -> change format -> add media -> Cancel -> repeat with Save Media.
+    Verifies that Save Media commits description, title, format, and media items atomically in one transaction."""
+    import handlers
+    from aiogram.types import PhotoSize
+    from database import EventScenario
+    from event_admin_service import create_scenario, list_scenario_media
+
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="tg_holistic_draft",
+        event_type="webinar",
+        title="Initial TG Title",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/tg-draft",
+        description="Initial TG Description",
+        media_format="separate_media_top",
+    )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    try:
+        # Phase 1: Modify description, title, format, media, then CANCEL
+        # 1. Edit description
+        await _feed_callback(dp, bot, f"admin_ev_edit_description_{scen.id}")
+        await _feed_message(dp, bot, "Pending Draft Description")
+
+        # 2. Edit title
+        await _feed_callback(dp, bot, f"admin_ev_edit_title_{scen.id}")
+        await _feed_message(dp, bot, "Pending Draft Title")
+
+        # 3. Change format
+        await _feed_callback(dp, bot, f"admin_ev_set_fmt_{scen.id}_separate_text_top")
+
+        # 4. Add media
+        await _feed_callback(dp, bot, f"admin_ev_media_add_{scen.id}")
+        mock_photo = [PhotoSize(file_id="tg_photo_draft_1", file_unique_id="u1", width=100, height=100)]
+        await _feed_message(dp, bot, "", photo=mock_photo)
+
+        # 5. Cancel draft
+        await _feed_callback(dp, bot, f"admin_ev_cancel_draft_{scen.id}")
+
+        # Verify DB is completely untouched
+        async with db_session_maker() as session:
+            s_after_cancel = await session.get(EventScenario, scen.id)
+            assert s_after_cancel.title == "Initial TG Title"
+            assert s_after_cancel.description == "Initial TG Description"
+            assert s_after_cancel.media_format == "separate_media_top"
+        media_after_cancel = await list_scenario_media(db_session_maker, scen.id)
+        assert len(media_after_cancel) == 0
+
+        # Phase 2: Modify description, title, format, media, and SAVE MEDIA
+        # 1. Edit description
+        await _feed_callback(dp, bot, f"admin_ev_edit_description_{scen.id}")
+        await _feed_message(dp, bot, "Final Saved Description")
+
+        # 2. Edit title
+        await _feed_callback(dp, bot, f"admin_ev_edit_title_{scen.id}")
+        await _feed_message(dp, bot, "Final Saved Title")
+
+        # 3. Change format to separate_text_top
+        await _feed_callback(dp, bot, f"admin_ev_set_fmt_{scen.id}_separate_text_top")
+
+        # 4. Add media
+        await _feed_callback(dp, bot, f"admin_ev_media_add_{scen.id}")
+        mock_photo = [PhotoSize(file_id="tg_photo_final_1", file_unique_id="u2", width=200, height=200)]
+        await _feed_message(dp, bot, "", photo=mock_photo)
+
+        # 5. Click Save Media (admin_ev_media_save_{scen.id})
+        methods = await _feed_callback(dp, bot, f"admin_ev_media_save_{scen.id}")
+        assert any(
+            isinstance(m, (SendMessage, EditMessageText)) and "сохранены" in (m.text or "")
+            for m in methods
+        )
+
+        # Verify DB is atomically updated with ALL changes
+        async with db_session_maker() as session:
+            s_final = await session.get(EventScenario, scen.id)
+            assert s_final.title == "Final Saved Title"
+            assert s_final.description == "Final Saved Description"
+            assert s_final.media_format == "separate_text_top"
+        media_final = await list_scenario_media(db_session_maker, scen.id)
+        assert len(media_final) == 1
+        assert media_final[0].file_id == "tg_photo_final_1"
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_format_menu_draft_reflection_and_back(db_session_maker, monkeypatch):
+    """Verifies show_format_menu marks active draft_format with radio button and preserves it across Back."""
+    import handlers
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="tg_fmt_draft",
+        event_type="webinar",
+        title="Format Draft Event",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/fmt-draft",
+        description="Format Draft Description",
+        media_format="separate_media_top",
+    )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    try:
+        # Open format menu initially - should reflect separate_media_top
+        methods = await _feed_callback(dp, bot, f"admin_ev_format_menu_{scen.id}")
+        msg = next(m for m in methods if isinstance(m, (EditMessageText, SendMessage)))
+        button_texts = [b.text for row in msg.reply_markup.inline_keyboard for b in row]
+        assert any("🔘 🖼️ Текст отдельно, медиа выше" in t for t in button_texts)
+
+        # Set draft format to separate_text_top
+        await _feed_callback(dp, bot, f"admin_ev_set_fmt_{scen.id}_separate_text_top")
+
+        # Reopen format menu - should now reflect draft_format (separate_text_top)
+        methods = await _feed_callback(dp, bot, f"admin_ev_format_menu_{scen.id}")
+        msg = next(m for m in methods if isinstance(m, (EditMessageText, SendMessage)))
+        button_texts = [b.text for row in msg.reply_markup.inline_keyboard for b in row]
+        assert any("🔘 📝 Текст отдельно, медиа ниже" in t for t in button_texts)
+        assert any("⚪️ 🖼️ Текст отдельно, медиа выше" in t for t in button_texts)
+
+        # Navigate Back to edit menu
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_menu_{scen.id}")
+        edit_msg = next(m for m in methods if isinstance(m, (EditMessageText, SendMessage)))
+        edit_button_texts = [b.text for row in edit_msg.reply_markup.inline_keyboard for b in row]
+        assert any("Формат:" in t and "Текст отдельно, медиа ниже" in t for t in edit_button_texts)
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_visiting_editor_does_not_block_foreign_events(db_session_maker, monkeypatch):
+    """Merely opening edit menu, description editor or media editor without dirty changes does not block foreign events."""
+    import handlers
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    event_a = await create_scenario(
+        db_session_maker,
+        code="tg_visit_a",
+        event_type="webinar",
+        title="Event A",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/a",
+    )
+    event_b = await create_scenario(
+        db_session_maker,
+        code="tg_visit_b",
+        event_type="webinar",
+        title="Event B",
+        starts_at_utc=datetime.utcnow() + timedelta(days=4),
+        link="https://example.test/b",
+    )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    try:
+        # 1. Visit Event A edit menu
+        await _feed_callback(dp, bot, f"admin_ev_edit_menu_{event_a.id}")
+
+        # 2. Visit Event A description editor (do NOT enter any text)
+        await _feed_callback(dp, bot, f"admin_ev_edit_description_{event_a.id}")
+
+        # 3. Visit Event A media editor (do NOT add or remove media)
+        await _feed_callback(dp, bot, f"admin_ev_edit_media_{event_a.id}")
+
+        # 4. Now open Event B card
+        methods = await _feed_callback(dp, bot, f"admin_ev_open_{event_b.id}")
+        assert not any(isinstance(m, AnswerCallbackQuery) and m.show_alert for m in methods)
+        card_msg = next(m for m in methods if isinstance(m, (EditMessageText, SendMessage)))
+        assert "Event B" in card_msg.text
+
+        # 5. Open Event B edit menu
+        methods = await _feed_callback(dp, bot, f"admin_ev_edit_menu_{event_b.id}")
+        assert not any(isinstance(m, AnswerCallbackQuery) and m.show_alert for m in methods)
+        menu_msg = next(m for m in methods if isinstance(m, (EditMessageText, SendMessage)))
+        assert "Event B" in menu_msg.text
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_title_length_visible_and_storage_validation(db_session_maker, monkeypatch):
+    """Verifies that visible text limit (1000) and raw storage limit (1000) are both validated with informative errors."""
+    import handlers
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import create_scenario
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="tg_title_limits",
+        event_type="webinar",
+        title="Initial Valid Title",
+        starts_at_utc=datetime.utcnow() + timedelta(days=3),
+        link="https://example.test/limits",
+    )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    try:
+        # Start editing title
+        await _feed_callback(dp, bot, f"admin_ev_edit_title_{scen.id}")
+
+        # 1. Send title with visible text > 1000 chars
+        invalid_visible = "X" * 1005
+        methods = await _feed_message(dp, bot, invalid_visible)
+        msg = next(m for m in methods if isinstance(m, SendMessage))
+        assert "1000 символов" in msg.text
+        assert "1005" in msg.text
+
+        # 2. Send title with visible text <= 1000 chars, but raw HTML with tg-emoji tags > 1000 chars
+        emojis = '<tg-emoji emoji-id="1234567890123456789">🔥</tg-emoji>' * 25
+        raw_storage_overflow = ("Y" * 50) + emojis
+        methods = await _feed_message(dp, bot, raw_storage_overflow)
+        msg = next(m for m in methods if isinstance(m, SendMessage))
+        assert "предел хранения (1000 символов)" in msg.text
+
+        # 3. Send valid title with custom emoji
+        valid_with_emoji = '<tg-emoji emoji-id="1234567890123456789">🔥</tg-emoji> Valid Emoji Title'
+        methods = await _feed_message(dp, bot, valid_with_emoji)
+        assert any(isinstance(m, (SendMessage, EditMessageText)) and "обновлено" in (m.text or "") for m in methods)
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+

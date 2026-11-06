@@ -435,3 +435,40 @@ def test_custom_emoji_html_roundtrip_preservation():
     # Plain text for MAX
     max_text = render_plain_text_for_max(raw)
     assert max_text == 'Мероприятие: 💎 <Код> курса'
+
+
+def test_title_validation_visible_length_vs_storage_length():
+    from event_admin_service import validate_scenario_input
+
+    future = datetime.utcnow() + timedelta(days=2)
+    common_kwargs = {
+        "code": "valid_code",
+        "event_type": "webinar",
+        "starts_at_utc": future,
+        "duration_minutes": 60,
+        "place": None,
+        "link": "https://example.test",
+    }
+
+    # 1. Valid title under 1000 chars
+    valid_title = "Тестовое мероприятие " + ("A" * 500)
+    validate_scenario_input(title=valid_title, **common_kwargs)
+
+    # 2. Visible length > 1000 chars
+    long_visible = "A" * 1001
+    with pytest.raises(ValueError) as exc:
+        validate_scenario_input(title=long_visible, **common_kwargs)
+    assert "должно содержать от 1 до 1000 символов" in str(exc.value)
+
+    # 3. Visible length <= 1000 chars, but raw HTML with tg-emoji tags > 1000 chars (storage limit)
+    # Each tg-emoji wrapper adds ~40 chars for 2 chars of visible emoji
+    emojis = '<tg-emoji emoji-id="1234567890123456789">🔥</tg-emoji>' * 25
+    title_raw = ("A" * 50) + emojis
+    vis, utf16_len, _ = parse_visible_telegram_text(title_raw)
+    assert len(vis) < 1000  # Visible length is only ~75 characters
+    assert len(title_raw) > 1000  # Raw storage length is over 1300 characters
+
+    with pytest.raises(ValueError) as exc:
+        validate_scenario_input(title=title_raw, **common_kwargs)
+    assert "предел хранения (1000 символов)" in str(exc.value)
+
