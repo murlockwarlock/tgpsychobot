@@ -3142,5 +3142,3 @@ async def test_max_custom_emoji_fallback_render(db_session_maker, monkeypatch):
     sent_text = client.send_message.await_args_list[-1].kwargs["text"]
     assert "<tg-emoji" not in sent_text
     assert "🔥 Горячий вебинар MAX" in sent_text
-
-
