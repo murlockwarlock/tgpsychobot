@@ -100,28 +100,28 @@ def synchronize_template_caption(clean: str, actual_issue_date: str | None) -> s
         return clean or ''
     text = clean
 
-    # 1. Update lines with date labels (e.g., "- Дата выдачи: 11.06.2025", "• Дата выдачи: ...", "Дата: ...")
-    date_line_pattern = re.compile(
-        r'(?m)^(\s*[-•*]?\s*(?:Дата(?:\s+выдачи)?|Date(?:\s+of\s+issue)?)\s*:\s*)(.+)$',
+    # 1. Update lines with date labels (e.g.,
+    #    "• Дата выдачи: 11.06.2025",
+    #    "• **Дата выдачи:** 11.06.2025",
+    #    "- **Дата выдачи**: при формировании")
+    # Must NOT touch other dates such as "Дата рождения: 15.03.2018".
+    issue_date_line_pattern = re.compile(
+        r'(?m)^(\s*[-•*]?\s*(?:\*{1,2})?(?:Дата\s+выдачи|Date(?:\s+of\s+issue)?|Issue\s+date|(?:Дата|Date)(?!\s+(?:рождения|birth|начала|события)))(?:\*{1,2})?(?:\s*:\s*|\s+[-—]\s*)(?:\*{1,2})?\s*)(.+)$',
         re.IGNORECASE,
     )
-    if date_line_pattern.search(text):
-        text = date_line_pattern.sub(r'\g<1>' + actual_issue_date, text)
-
-    # 2. Replace stub phrases (e.g. "проставляется автоматически сервером", "при формировании")
-    stub_pattern = re.compile(
-        r'(?i)\b(?:проставляется\s+автоматически(?:\s+(?:сервером|при\s+формировании))?|при\s+формировании)\b'
+    stub_line_pattern = re.compile(
+        r'(?m)^(\s*[-•*]?\s*(?:\*{1,2})?(?:Дата\s+выдачи|Date(?:\s+of\s+issue)?|Issue\s+date)(?:\*{1,2})?\s+)(?:проставляется\s+автоматически[^\n\r]*|при\s+формировании[^\n\r]*)$',
+        re.IGNORECASE,
     )
-    if stub_pattern.search(text):
-        text = stub_pattern.sub(actual_issue_date, text)
-
-    # 3. If there is a list with Recipient / Получатель, but no date line was present:
-    # Append the date line to ensure image and accompanying message show the same date.
-    has_date_line = re.search(r'(?i)\b(?:дата(?:\s+выдачи)?|date)\s*:', text)
-    recipient_match = re.search(r'(?m)^(\s*[-•*]\s*)Получатель\s*:', text, re.IGNORECASE)
-    if not has_date_line and recipient_match:
-        bullet = recipient_match.group(1)
-        text = text.rstrip() + f'\n{bullet}Дата выдачи: {actual_issue_date}'
+    if issue_date_line_pattern.search(text):
+        text = issue_date_line_pattern.sub(r'\g<1>' + actual_issue_date, text)
+    elif stub_line_pattern.search(text):
+        text = stub_line_pattern.sub(r'\g<1>' + actual_issue_date, text)
+    else:
+        recipient_match = re.search(r'(?m)^(\s*[-•*]\s*)(?:\*{1,2})?Получатель(?:\*{1,2})?\s*:\s*', text, re.IGNORECASE)
+        if recipient_match:
+            bullet = recipient_match.group(1)
+            text = text.rstrip() + f'\n{bullet}Дата выдачи: {actual_issue_date}'
 
     return text
 
@@ -152,9 +152,8 @@ async def render_media_template(directive, *, session_factory, user_id, dialogue
     values = dict(directive.values)
     actual_issue_date = None
     if 'issue_date' in config.get('fields', {}):
-        if 'issue_date' in values or not config['fields']['issue_date'].get('required', True):
-            actual_issue_date = current_issue_date(now=now)
-            values['issue_date'] = actual_issue_date
+        actual_issue_date = current_issue_date(now=now)
+        values['issue_date'] = actual_issue_date
     result = await asyncio.to_thread(render_template, content, config, values)
     rendered = RenderedMediaTemplate(media_id, result.image_bytes, source_identity, config_identity, actual_issue_date=actual_issue_date, values=values)
     if not await media_edit_context_is_current(session_factory, user_id, dialogue_id, topic_id):

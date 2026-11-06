@@ -209,7 +209,7 @@ async def test_real_runtime(session_factory, media_setup, monkeypatch, surface, 
     if case == 'wrong_scope': reference = 'foreign'
     if case == 'missing': reference = 'absent'
     if case == 'unknown': values['unknown'] = 'x'
-    if case == 'required': values.pop('issue_date')
+    if case == 'required': values.pop('recipient')
     if case == 'long': values['recipient'] = 'x' * 257
     if case == 'control': values['recipient'] = 'x\x01'
     response = 'Готово, вот сертификат:\n[RENDER_IMG_MEDIA: ' + reference + ' | ' + json.dumps(values, ensure_ascii=False) + ']'
@@ -599,6 +599,21 @@ def test_certificate_issue_date_clock_and_timezone_guarantee(utc_time, expected_
         "**Сертификат готов**\n\n- Получатель: Денис Солдатов\n- Дата выдачи: 06.11.2026",
     ),
     (
+        "• **Дата выдачи:** 11.06.2025",
+        "06.11.2026",
+        "• **Дата выдачи:** 06.11.2026",
+    ),
+    (
+        "- **Дата выдачи**: при формировании",
+        "06.11.2026",
+        "- **Дата выдачи**: 06.11.2026",
+    ),
+    (
+        "**Сертификат готов**\n\n- **Получатель**: Денис Солдатов\n- **Дата выдачи**: при формировании",
+        "06.11.2026",
+        "**Сертификат готов**\n\n- **Получатель**: Денис Солдатов\n- **Дата выдачи**: 06.11.2026",
+    ),
+    (
         "Сертификат готов\n• Получатель: Иван Солдатов\n• Дата выдачи: проставляется автоматически сервером",
         "06.11.2026",
         "Сертификат готов\n• Получатель: Иван Солдатов\n• Дата выдачи: 06.11.2026",
@@ -607,6 +622,16 @@ def test_certificate_issue_date_clock_and_timezone_guarantee(utc_time, expected_
         "Сертификат готов\n• Получатель: Иван Солдатов\n• Дата выдачи: проставляется автоматически при формировании",
         "06.11.2026",
         "Сертификат готов\n• Получатель: Иван Солдатов\n• Дата выдачи: 06.11.2026",
+    ),
+    (
+        "**Сертификат готов**\n• Получатель: Денис Солдатов\n• **Дата рождения:** 15.03.2018\n• **Дата выдачи:** 11.06.2025",
+        "06.11.2026",
+        "**Сертификат готов**\n• Получатель: Денис Солдатов\n• **Дата рождения:** 15.03.2018\n• **Дата выдачи:** 06.11.2026",
+    ),
+    (
+        "**Сертификат готов**\n• Получатель: Денис Солдатов\n• **Дата рождения:** 15.03.2018",
+        "06.11.2026",
+        "**Сертификат готов**\n• Получатель: Денис Солдатов\n• **Дата рождения:** 15.03.2018\n• Дата выдачи: 06.11.2026",
     ),
     (
         "Сертификат готов\n• Получатель: Денис Солдатов",
@@ -778,11 +803,20 @@ async def test_max_certificate_delivery_journey_date_and_formatting(session_fact
     fixed_time = datetime(2026, 11, 6, 15, 0, 0, tzinfo=timezone.utc)  # 06.11.2026 in MSK
     monkeypatch.setattr(media_templates, '_TEST_CLOCK', lambda: fixed_time)
 
+    from max_messenger_bot.services import common
+    orig_render = common.render_media_template
+    captured_rendered = []
+    async def spy_render(*args, **kwargs):
+        res = await orig_render(*args, **kwargs)
+        captured_rendered.append(res)
+        return res
+    monkeypatch.setattr(common, 'render_media_template', spy_render)
+
     raw_response = (
         "**Сертификат готов**\n\n"
-        "- Получатель: Денис Солдатов\n"
-        "- Дата выдачи: проставляется автоматически сервером\n"
-        "[RENDER_IMG_MEDIA: panda_certificate | {\"recipient\": \"Денис Солдатов\", \"issue_date\": \"проставляется автоматически сервером\"}]"
+        "- **Получатель**: Денис Солдатов\n"
+        "- **Дата выдачи**: при формировании\n"
+        '[RENDER_IMG_MEDIA: panda_certificate | {"recipient": "Денис Солдатов"}]'
     )
     model = AsyncMock(return_value=raw_response)
     monkeypatch.setattr(max_ai, '_dispatch_provider', model)
@@ -813,6 +847,10 @@ async def test_max_certificate_delivery_journey_date_and_formatting(session_fact
         if application.background_tasks:
             await asyncio.gather(*list(application.background_tasks))
 
+        assert len(captured_rendered) == 1
+        assert captured_rendered[0].values['issue_date'] == '06.11.2026'
+        assert captured_rendered[0].values['recipient'] == 'Денис Солдатов'
+
         # Check uploaded file is certificate.png with modified pixels
         assert len(client.uploads) == 1
         assert client.uploads[0][0] == 'file'
@@ -829,8 +867,85 @@ async def test_max_certificate_delivery_journey_date_and_formatting(session_fact
         # HTML formatting without raw markdown
         assert "**" not in text
         assert "<b>Сертификат готов</b>" in text
-        assert "• Дата выдачи: 06.11.2026" in text
-        assert "проставляется автоматически" not in text
+        assert "• <b>Дата выдачи</b>: 06.11.2026" in text
+        assert "при формировании" not in text
         assert "11.06.2025" not in text
+        assert text.count("06.11.2026") == 1
     finally:
         pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.ui_journey
+async def test_telegram_certificate_delivery_when_model_omits_issue_date(session_factory, media_setup, monkeypatch):
+    """User dialogue: model only provides recipient in RENDER_IMG_MEDIA, server fills issue_date."""
+    source, config = await seed_template(session_factory)
+    fixed_time = datetime(2026, 11, 6, 12, 0, 0, tzinfo=timezone.utc)  # 06.11.2026 in MSK
+    monkeypatch.setattr(media_templates, '_TEST_CLOCK', lambda: fixed_time)
+
+    orig_render = handlers.render_media_template
+    captured_rendered = []
+    async def spy_render(*args, **kwargs):
+        res = await orig_render(*args, **kwargs)
+        captured_rendered.append(res)
+        return res
+    monkeypatch.setattr(handlers, 'render_media_template', spy_render)
+
+    ai_response = (
+        "**Сертификат готов**\n\n"
+        "- **Получатель**: Иван Солдатов\n"
+        "- **Дата выдачи**: при формировании\n"
+        '[RENDER_IMG_MEDIA: panda_certificate | {"recipient": "Иван Солдатов"}]'
+    )
+
+    model = AsyncMock(return_value=ai_response)
+    monkeypatch.setattr(ai_integration, '_call_gemini_api', model)
+    transport = TelegramTransport()
+    async def stream(*args, **kwargs): yield source
+    monkeypatch.setattr(transport, 'stream_content', stream)
+
+    bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+    handlers.router._parent_router = None
+    dispatcher = Dispatcher()
+    dispatcher.include_router(handlers.router)
+
+    try:
+        await dispatcher.feed_update(
+            bot,
+            Update(
+                update_id=9002,
+                message=Message(
+                    message_id=9002,
+                    date=datetime.now(timezone.utc),
+                    chat=Chat(id=media_setup, type='private'),
+                    from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Ivan'),
+                    text='Иван Солдатов',
+                ),
+            ),
+        )
+        if media_setup in handlers.user_processing_tasks:
+            await handlers.user_processing_tasks[media_setup]
+
+        assert len(captured_rendered) == 1
+        assert captured_rendered[0].values['issue_date'] == '06.11.2026'
+        assert captured_rendered[0].values['recipient'] == 'Иван Солдатов'
+
+        documents = [c for c in transport.calls if isinstance(c, SendDocument)]
+        assert len(documents) == 1, f"Expected 1 document, got {len(documents)}"
+        doc = SendDocument.model_validate(documents[0].model_dump())
+
+        assert doc.document.filename == 'certificate.png'
+        assert doc.document.data != source
+        assert_pixels(source, doc.document.data, config)
+
+        assert doc.parse_mode == "HTML"
+        assert "**" not in doc.caption
+        assert "<b>Сертификат готов</b>" in doc.caption
+        assert "Иван Солдатов" in doc.caption
+        assert "• <b>Дата выдачи</b>: 06.11.2026" in doc.caption
+        assert "при формировании" not in doc.caption
+        assert doc.caption.count("06.11.2026") == 1
+    finally:
+        dispatcher.sub_routers.clear()
+        handlers.router._parent_router = None
+        await bot.session.close()
