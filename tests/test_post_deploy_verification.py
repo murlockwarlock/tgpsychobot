@@ -17,9 +17,10 @@ from scripts.verify_post_deploy import verify_post_deploy
 @pytest.mark.asyncio
 async def test_post_deploy_verification_dry_run():
     """Verify that verify_post_deploy in dry-run mode completes with 100% pass."""
-    res = await verify_post_deploy(live_send=False)
+    res = await verify_post_deploy(live_send=False, production=False)
     assert res["status"] == "PASSED"
     assert res["live_send"] is False
+    assert res["production_mode"] is False
     assert res["instances_checked"] >= 18
     assert res["isolation_checks"] >= 54
     assert len(res["deliveries"]) == 3
@@ -109,6 +110,66 @@ def test_negative_isolation_max_bots_never_route_to_autobus():
             assert route.target_platform_id == companion["platform_id"], (
                 f"Target ID must be {companion['platform_id']}, got {route.target_platform_id}"
             )
+
+
+@pytest.mark.asyncio
+async def test_negative_missing_bot_instance_id_fails_closed(monkeypatch):
+    """Verify that absence of mandatory BOT_INSTANCE_ID strictly fails closed."""
+    monkeypatch.delenv("BOT_INSTANCE_ID", raising=False)
+    assert notification_routing.detect_current_instance() is None
+
+    # Routing without BOT_INSTANCE_ID fails closed (returns None)
+    route = notification_routing.resolve_notification_route(notification_routing.EventCategory.USER_EVENT)
+    assert route is None
+
+    # Dispatching alert fails closed (returns False without crashing)
+    ok = await notification_routing.send_admin_notification("Negative test message")
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_negative_unregistered_bot_instance_id_fails_closed(monkeypatch):
+    """Verify that an unknown or bogus BOT_INSTANCE_ID strictly fails closed."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "bogus_unregistered_bot_pm2_name")
+    assert notification_routing.detect_current_instance() is None
+
+    route = notification_routing.resolve_notification_route(notification_routing.EventCategory.USER_EVENT)
+    assert route is None
+
+    ok = await notification_routing.send_admin_notification("Negative test message")
+    assert ok is False
+
+
+def test_negative_swapped_max_companion_tokens_fails_closed(monkeypatch):
+    """
+    Verify that if a MAX bot process is configured with a swapped or mismatched
+    companion token, routing strictly detects the ID mismatch and fails closed.
+    """
+    # 1. Yourself Way (8481853696) accidentally given VeraVeda token (8224473896)
+    monkeypatch.setenv("BOT_INSTANCE_ID", "max_id519010411655_bot_new")
+    monkeypatch.setenv("COMPANION_TELEGRAM_BOT_TOKEN", "8224473896:AASwappedVeraVedaToken12345")
+    route_yw = notification_routing.resolve_notification_route(notification_routing.EventCategory.USER_EVENT)
+    assert route_yw is None, "Mismatched companion token must be rejected!"
+
+    # 2. VeraVeda (8224473896) accidentally given Yourself Way token (8481853696)
+    monkeypatch.setenv("BOT_INSTANCE_ID", "max_se13639182_bot_legacy")
+    monkeypatch.setenv("COMPANION_TELEGRAM_BOT_TOKEN", "8481853696:AASwappedYourselfWayToken12345")
+    route_vv = notification_routing.resolve_notification_route(notification_routing.EventCategory.USER_EVENT)
+    assert route_vv is None, "Mismatched companion token must be rejected!"
+
+    # 3. MAX bot given Autobus token (8346799080)
+    monkeypatch.setenv("BOT_INSTANCE_ID", "max_id519010411655_bot_new")
+    monkeypatch.setenv("COMPANION_TELEGRAM_BOT_TOKEN", "8346799080:AAAutobusToken12345")
+    route_ab = notification_routing.resolve_notification_route(notification_routing.EventCategory.USER_EVENT)
+    assert route_ab is None, "Autobus token given to MAX companion must be rejected!"
+
+
+@pytest.mark.asyncio
+async def test_negative_production_mode_fails_closed_when_pm2_missing():
+    """Verify that in production mode, missing PM2 raises RuntimeError rather than skipping."""
+    # When PM2 is absent (e.g. in test runner), production=True must raise RuntimeError
+    with pytest.raises(RuntimeError, match="PRODUCTION VERIFICATION FAILED"):
+        await verify_post_deploy(production=True)
 
 
 def test_simulate_partial_failure_rollback_script():
