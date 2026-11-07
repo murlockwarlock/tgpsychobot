@@ -8,6 +8,7 @@ import logging
 import re
 import html
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import or_, select
@@ -166,6 +167,24 @@ async def _execute_action(session, bot, event, handler, action, user) -> None:
             recipients = [action.recipient_user_id]
         else:
             raise ValueError("Не выбран получатель сообщения")
+
+        # Snapshot scalar user and event attributes upfront so rollback or commit
+        # cannot expire attributes or trigger greenlet_spawn / await_only errors.
+        user_snapshot = SimpleNamespace(
+            id=getattr(user, "id", None),
+            name=getattr(user, "name", None),
+            first_name=getattr(user, "first_name", None),
+            username=getattr(user, "username", None),
+        )
+        event_snapshot = SimpleNamespace(
+            id=getattr(event, "id", None),
+            name=getattr(event, "name", None),
+            metadata_json=getattr(event, "metadata_json", None),
+            state_json=getattr(event, "state_json", None),
+            dialogue_id=getattr(event, "dialogue_id", None),
+            topic_id=getattr(event, "topic_id", None),
+        )
+
         errors = []
         for recipient_id in recipients:
             delivered = await session.scalar(
@@ -193,7 +212,7 @@ async def _execute_action(session, bot, event, handler, action, user) -> None:
                     ) or ""
                 else:
                     template = action.message_template or ""
-                text = render_message_template(template, event=event, user=user)
+                text = render_message_template(template, event=event_snapshot, user=user_snapshot)
                 if not text:
                     raise ValueError("Пустой шаблон сообщения")
                 await bot.send_message(recipient_id, text)
@@ -207,8 +226,41 @@ async def _execute_action(session, bot, event, handler, action, user) -> None:
                 # A timeout for one admin must not duplicate earlier deliveries.
                 await session.commit()
             except Exception as exc:
-                await session.rollback()
-                errors.append(f"{recipient_id}: {exc}")
+                if session.is_active and (session.dirty or session.new):
+                    await session.rollback()
+                err_str = str(exc).lower()
+                is_unreachable = any(
+                    needle in err_str
+                    for needle in (
+                        "chat not found",
+                        "bot was blocked",
+                        "user is deactivated",
+                        "chat_not_found",
+                        "bot_blocked",
+                    )
+                )
+                if is_unreachable:
+                    log.warning(
+                        "Automation message recipient %s unreachable for event %s (action %s): %s",
+                        recipient_id,
+                        event_id,
+                        action_id,
+                        exc,
+                    )
+                    # Record delivery receipt for unreachable chat to avoid endless retry loop
+                    try:
+                        session.add(AutomationMessageDelivery(
+                            event_id=event_id,
+                            handler_id=handler_id,
+                            action_id=action_id,
+                            recipient_id=recipient_id,
+                        ))
+                        await session.commit()
+                    except Exception:
+                        if session.is_active:
+                            await session.rollback()
+                else:
+                    errors.append(f"{recipient_id}: {exc}")
         if errors:
             raise RuntimeError("; ".join(errors))
 

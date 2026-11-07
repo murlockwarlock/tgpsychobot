@@ -34,14 +34,15 @@ class FakeBot:
 
 
 class PartiallyFailingBot(FakeBot):
-    def __init__(self, failing_recipient):
+    def __init__(self, failing_recipient, error_factory=None):
         super().__init__()
         self.failing_recipient = failing_recipient
         self.fail = True
+        self.error_factory = error_factory or (lambda: TimeoutError("temporary timeout"))
 
     async def send_message(self, chat_id, text):
         if self.fail and chat_id == self.failing_recipient:
-            raise TimeoutError("temporary timeout")
+            raise self.error_factory()
         return await super().send_message(chat_id, text)
 
 
@@ -177,4 +178,52 @@ class AutomationEventTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(bot.sent, [(9001, "Лид 43"), (9002, "Лид 43")])
         self.assertEqual(deliveries, 2)
+        self.assertIsNotNone(stored_event.processed_at)
+
+    async def test_unreachable_recipient_records_delivery_and_does_not_abort_others(self):
+        async with self.sessions() as session:
+            user = User(id=44, first_name="Анна", name="Анна", username="anna", current_dialogue_id=1)
+            handler = AutomationHandler(name="Лид", is_active=True, include_main_dialogue=True)
+            handler.conditions.append(AutomationCondition(
+                condition_type="event", expected_value="LEAD_READY", operator="equals",
+            ))
+            handler.actions.append(AutomationAction(
+                action_type="send_message",
+                recipient_type="all_admins",
+                message_template="Лид {name} ({user_id})",
+            ))
+            session.add_all([
+                user,
+                handler,
+                AutomationEvent(
+                    user_id=44,
+                    dialogue_id=1,
+                    topic_id=0,
+                    name="LEAD_READY",
+                    state_json="{}",
+                    metadata_json="{}",
+                ),
+            ])
+            await session.commit()
+
+        # Recipient 9001 has chat not found (deleted chat / never started)
+        bot = PartiallyFailingBot(
+            failing_recipient=9001,
+            error_factory=lambda: RuntimeError("Telegram server says - Bad Request: chat not found"),
+        )
+        with (
+            patch.object(automation_events, "async_session_maker", self.sessions),
+            patch.object(automation_events, "get_all_admin_ids", AsyncMock(return_value={9001, 9002})),
+        ):
+            # Should not crash, should succeed immediately because 9001 is recorded as unreachable
+            # and 9002 is delivered.
+            processed = await process_pending_events(bot)
+
+        async with self.sessions() as session:
+            deliveries = (await session.execute(select(AutomationMessageDelivery))).scalars().all()
+            stored_event = await session.scalar(select(AutomationEvent))
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(bot.sent, [(9002, "Лид Анна (44)")])
+        self.assertEqual(len(deliveries), 2)
         self.assertIsNotNone(stored_event.processed_at)
