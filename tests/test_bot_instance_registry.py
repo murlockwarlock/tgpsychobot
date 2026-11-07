@@ -41,14 +41,29 @@ def _registry(*entries):
     return {"schema_version": 1, "instances": list(entries)}
 
 
-def _process(name, token, database_url, *, path="/root/telegram_bots/newbots/main.py"):
+def _process(
+    name,
+    token,
+    database_url,
+    *,
+    path="/root/telegram_bots/newbots/main.py",
+    bot_instance_id=None,
+    companion_token=None,
+):
+    env = {
+        "BOT_TOKEN": token,
+        "DATABASE_URL": database_url,
+        "BOT_INSTANCE_ID": bot_instance_id or name,
+    }
+    if companion_token:
+        env["COMPANION_TELEGRAM_BOT_TOKEN"] = companion_token
     return {
         "name": name,
         "pm2_env": {
             "status": "online",
             "pid": 0,
             "pm_exec_path": path,
-            "env": {"BOT_TOKEN": token, "DATABASE_URL": database_url},
+            "env": env,
         },
     }
 
@@ -150,7 +165,14 @@ def _production_migration_fixture():
         runtime_environment = {
             entry["runtime_token_env"]: token,
             entry["runtime_database_env"]: database_url,
+            "BOT_INSTANCE_ID": entry.get("bot_instance_id") or entry["pm2_name"],
         }
+        if entry["platform"] == "max":
+            companion_token_env = entry.get("companion_token_env")
+            if companion_token_env:
+                companion_token = environment.get(companion_token_env) or f"88888{index}:companion_token_secret{index}"
+                environment.setdefault(companion_token_env, companion_token)
+                runtime_environment["COMPANION_TELEGRAM_BOT_TOKEN"] = companion_token
         path = "/root/telegram_bots/newbots/main.py"
         if entry["platform"] == "max":
             path = "/root/telegram_bots/newbots/max_messenger_bot/app.py"
@@ -588,3 +610,121 @@ def test_registry_duplicate_username_with_conflicting_database_is_rejected():
     errors = verifier.validate_registry(_registry(first, second))
 
     assert "duplicate_identity_conflicting_database:telegram:demo_bot" in errors
+
+
+def test_runtime_check_rejects_missing_bot_instance_id():
+    entry = _entry()
+    registry = _registry(entry)
+    token = "123456:abcdefghijklmnopqrstuvwxyz"
+    database_url = "postgresql+asyncpg://user:password@host/demo_db"
+    process = _process(entry["pm2_name"], token, database_url)
+    process["pm2_env"]["env"].pop("BOT_INSTANCE_ID", None)
+
+    _, errors = verifier.runtime_rows(
+        registry,
+        {entry["pm2_name"]: process},
+        {entry["token_env"]: token, entry["database_env"]: database_url},
+    )
+
+    assert f"missing_process_instance_id:{entry['pm2_name']}" in errors
+
+
+def test_runtime_check_rejects_bot_instance_id_mismatch():
+    entry = _entry()
+    registry = _registry(entry)
+    token = "123456:abcdefghijklmnopqrstuvwxyz"
+    database_url = "postgresql+asyncpg://user:password@host/demo_db"
+    process = _process(
+        entry["pm2_name"],
+        token,
+        database_url,
+        bot_instance_id="tg_different_bot_new",
+    )
+
+    _, errors = verifier.runtime_rows(
+        registry,
+        {entry["pm2_name"]: process},
+        {entry["token_env"]: token, entry["database_env"]: database_url},
+    )
+
+    assert f"bot_instance_id_mismatch:{entry['pm2_name']}" in errors
+
+
+def test_runtime_check_rejects_missing_max_companion_token():
+    entry = _entry()
+    entry.update(
+        {
+            "platform": "max",
+            "username": "max_demo_bot",
+            "platform_id": 987654321,
+            "pm2_name": "max_max_demo_bot_new",
+            "token_env": "MAX_MAX_DEMO_BOT_TOKEN",
+            "runtime_token_env": "MAX_BOT_TOKEN",
+            "database_env": "MAX_MAX_DEMO_BOT_DATABASE_URL",
+            "companion_instance": "tg_demo_bot_new",
+            "companion_token_env": "TELEGRAM_DEMO_BOT_TOKEN",
+        }
+    )
+    registry = _registry(entry)
+    token = "max-secret-token"
+    companion_token = "123456:abcdefghijklmnopqrstuvwxyz"
+    database_url = "postgresql+asyncpg://user:password@host/demo_db"
+    process = _process(
+        entry["pm2_name"],
+        token,
+        database_url,
+        path="/root/telegram_bots/newbots/max_messenger_bot/app.py",
+    )
+    process["pm2_env"]["env"]["MAX_BOT_TOKEN"] = token
+
+    _, errors = verifier.runtime_rows(
+        registry,
+        {entry["pm2_name"]: process},
+        {
+            entry["token_env"]: token,
+            entry["database_env"]: database_url,
+            entry["companion_token_env"]: companion_token,
+        },
+    )
+
+    assert f"missing_process_companion_token:{entry['pm2_name']}" in errors
+
+
+def test_runtime_check_rejects_max_companion_token_mismatch():
+    entry = _entry()
+    entry.update(
+        {
+            "platform": "max",
+            "username": "max_demo_bot",
+            "platform_id": 987654321,
+            "pm2_name": "max_max_demo_bot_new",
+            "token_env": "MAX_MAX_DEMO_BOT_TOKEN",
+            "runtime_token_env": "MAX_BOT_TOKEN",
+            "database_env": "MAX_MAX_DEMO_BOT_DATABASE_URL",
+            "companion_instance": "tg_demo_bot_new",
+            "companion_token_env": "TELEGRAM_DEMO_BOT_TOKEN",
+        }
+    )
+    registry = _registry(entry)
+    token = "max-secret-token"
+    database_url = "postgresql+asyncpg://user:password@host/demo_db"
+    process = _process(
+        entry["pm2_name"],
+        token,
+        database_url,
+        path="/root/telegram_bots/newbots/max_messenger_bot/app.py",
+        companion_token="123456:wrong_companion_token",
+    )
+    process["pm2_env"]["env"]["MAX_BOT_TOKEN"] = token
+
+    _, errors = verifier.runtime_rows(
+        registry,
+        {entry["pm2_name"]: process},
+        {
+            entry["token_env"]: token,
+            entry["database_env"]: database_url,
+            entry["companion_token_env"]: "123456:expected_companion_token",
+        },
+    )
+
+    assert f"companion_token_mismatch:{entry['pm2_name']}" in errors
