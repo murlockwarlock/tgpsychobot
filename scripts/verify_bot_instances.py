@@ -613,11 +613,19 @@ def runtime_rows(
             errors.append(f"database_name_mismatch:{process_name}")
 
         identity = "not_requested"
-        if identity_check and actual_token:
-            identity_result = verify_identity(entry, actual_token, environment)
-            identity = identity_result["status"]
-            if identity == "mismatch":
-                errors.append(f"identity_mismatch:{process_name}")
+        if identity_check:
+            if not actual_token:
+                identity = "missing_token"
+                errors.append(f"identity_missing_token:{process_name}")
+            else:
+                identity_result = verify_identity(entry, actual_token, environment)
+                identity = identity_result["status"]
+                if identity == "mismatch":
+                    errors.append(f"identity_mismatch:{process_name}")
+                elif identity == "unavailable":
+                    errors.append(f"identity_unavailable:{process_name}")
+                elif identity != "verified":
+                    errors.append(f"identity_error:{process_name}")
         rows.append(
             {
                 "platform": entry["platform"],

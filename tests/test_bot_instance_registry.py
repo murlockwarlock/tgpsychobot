@@ -456,6 +456,42 @@ def test_identity_mismatch_is_reported_without_printing_token(monkeypatch, capsy
     assert token not in capsys.readouterr().out
 
 
+def test_identity_unavailable_blocks_production_readiness(monkeypatch):
+    entry = _entry()
+    token = "123456:abcdefghijklmnopqrstuvwxyz"
+    database_url = "postgresql://u:p@h/demo_db"
+    monkeypatch.setattr(
+        verifier,
+        "verify_identity",
+        lambda *_args: {"status": "unavailable"},
+    )
+
+    rows, errors = verifier.runtime_rows(
+        _registry(entry),
+        {entry["pm2_name"]: _process(entry["pm2_name"], token, database_url)},
+        {entry["token_env"]: token, entry["database_env"]: database_url},
+        identity_check=True,
+    )
+
+    assert "identity_unavailable:tg_demo_bot_new" in errors
+    assert rows[0]["identity"] == "unavailable"
+
+
+def test_identity_check_fails_closed_when_process_token_missing():
+    entry = _entry()
+    database_url = "postgresql://u:p@h/demo_db"
+
+    rows, errors = verifier.runtime_rows(
+        _registry(entry),
+        {entry["pm2_name"]: _process(entry["pm2_name"], None, database_url)},
+        {entry["token_env"]: "123456:abcdef", entry["database_env"]: database_url},
+        identity_check=True,
+    )
+
+    assert "identity_missing_token:tg_demo_bot_new" in errors
+    assert rows[0]["identity"] == "missing_token"
+
+
 def test_telegram_identity_verification_uses_read_only_getme(monkeypatch):
     entry = _entry()
     calls = []
