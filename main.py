@@ -411,6 +411,12 @@ def main():
         logging.critical("SERVER_IP не задан. Остановка.")
         return
 
+    try:
+        from notification_routing import validate_process_notification_configuration
+        validate_process_notification_configuration()
+    except Exception as _exc:
+        logging.warning("Notification configuration diagnostic check warning: %s", _exc)
+
     bot = create_telegram_bot(
         BOT_TOKEN,
         default=DefaultBotProperties(parse_mode="HTML"),

@@ -3914,6 +3914,11 @@ def build_max_global_commands(
 async def create_web_app() -> web.Application:
     settings = get_settings()
     validate_webhook_runtime_settings(settings)
+    try:
+        from notification_routing import validate_process_notification_configuration
+        validate_process_notification_configuration()
+    except Exception as _exc:
+        log.warning("Notification configuration diagnostic check warning: %s", _exc)
     await init_db()
     await init_storage()
 

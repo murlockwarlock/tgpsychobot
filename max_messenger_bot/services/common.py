@@ -223,22 +223,16 @@ async def require_media_collection_admin(
 
 
 async def notify_telegram_admins(text: str) -> None:
-    import os
-    bot_token = os.getenv("BOT_TOKEN")
-    if bot_token:
-        from database import get_all_admin_ids, SubscriptionConfig
-        
-        async with async_session_maker() as session:
-            config = await session.get(SubscriptionConfig, 1)
-            if not config or not config.notifications_enabled:
-                return
-
-        async with create_telegram_bot(bot_token) as bot:
-            for admin_id in await get_all_admin_ids():
-                try:
-                    await bot.send_message(admin_id, text, parse_mode="HTML")
-                except Exception:
-                    pass
+    """
+    Deliver administrative notifications strictly using isolated routing.
+    Routes MAX bot events to its companion Telegram bot and verified Telegram admins.
+    Never sends via foreign bots (e.g. Autobus) and never raises unhandled exceptions.
+    """
+    try:
+        from notification_routing import send_admin_notification, EventCategory
+        await send_admin_notification(text, category=EventCategory.USER_EVENT)
+    except Exception as exc:
+        log.error("Failed to route admin notification: %s", exc)
 
 
 async def ensure_user(

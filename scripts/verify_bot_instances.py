@@ -521,6 +521,9 @@ def validate_runtime_env(
             key = entry[field]
             if not environment.get(key) and not allow_legacy:
                 errors.append(f"missing_runtime_secret:{key}")
+        companion_token_env = entry.get("companion_token_env")
+        if companion_token_env and not environment.get(companion_token_env) and not allow_legacy:
+            errors.append(f"missing_runtime_secret:{companion_token_env}")
     return errors
 
 

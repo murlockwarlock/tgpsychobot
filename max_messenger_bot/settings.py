@@ -16,14 +16,14 @@ LEGACY_CONFIG_PATH = PROJECT_ROOT / "config.ini"
 def apply_legacy_env_defaults() -> None:
     """
     The legacy project keeps runtime configuration in env vars.
-    For the isolated MAX app we transparently backfill them from config.ini
-    so database.py can be imported without changing the old code.
+    NOTE: BOT_TOKEN is strictly NEVER backfilled from config.ini to prevent
+    accidental cross-bot routing contamination.
     """
     parser = configparser.ConfigParser()
-    parser.read(LEGACY_CONFIG_PATH, encoding="utf-8")
+    if LEGACY_CONFIG_PATH.exists():
+        parser.read(LEGACY_CONFIG_PATH, encoding="utf-8")
 
-    if "BOT_TOKEN" not in os.environ:
-        os.environ["BOT_TOKEN"] = parser.get("bot", "token", fallback="")
+    # Explicitly do NOT set BOT_TOKEN from config.ini
     if "DATABASE_URL" not in os.environ:
         os.environ["DATABASE_URL"] = parser.get("database", "url", fallback="")
     if "OWNER_IDS" not in os.environ:

@@ -271,7 +271,13 @@
       "port": 8098,
       "profile": "/bot10",
       "deploy_managed": true,
-      "active": true
+      "active": true,
+      "telegram_owner_ids": [
+        979514796,
+        272982544,
+        806750628,
+        1372041348
+      ]
     },
     {
       "platform": "max",
@@ -288,7 +294,15 @@
       "port": 8099,
       "profile": "max_messenger_bot.app",
       "deploy_managed": true,
-      "active": true
+      "active": true,
+      "companion_instance": "tg_veraveda777_bot_legacy",
+      "companion_token_env": "TELEGRAM_VERAVEDA777_BOT_TOKEN",
+      "companion_platform_id": 8224473896,
+      "telegram_owner_ids": [
+        979514796,
+        272982544,
+        806750628
+      ]
     },
     {
       "platform": "max",
@@ -305,7 +319,16 @@
       "port": 8097,
       "profile": "max_messenger_bot.app",
       "deploy_managed": true,
-      "active": true
+      "active": true,
+      "companion_instance": "tg_yourself_way_bot_new",
+      "companion_token_env": "TELEGRAM_YOURSELF_WAY_BOT_TOKEN",
+      "companion_platform_id": 8481853696,
+      "telegram_owner_ids": [
+        979514796,
+        272982544,
+        806750628,
+        1372041348
+      ]
     },
     {
       "platform": "telegram",
