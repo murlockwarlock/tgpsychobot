@@ -3914,16 +3914,17 @@ def build_max_global_commands(
 async def create_web_app() -> web.Application:
     settings = get_settings()
     validate_webhook_runtime_settings(settings)
-    try:
-        from notification_routing import validate_process_notification_configuration
-        validate_process_notification_configuration()
-    except Exception as _exc:
-        log.warning("Notification configuration diagnostic check warning: %s", _exc)
+    if not settings.max_token:
+        raise RuntimeError("MAX_BOT_TOKEN не задан в переменных окружения.")
+
+    # Mandatory fail-closed startup validation: verify routing and companion bot identity
+    from notification_routing import validate_process_notification_configuration_async
+    # In live execution or test suites with mock transport, verify configuration fail-closed
+    verify_live_flag = os.environ.get("SKIP_LIVE_BOT_VERIFICATION") != "1"
+    await validate_process_notification_configuration_async(fail_closed=True, verify_live=verify_live_flag)
+
     await init_db()
     await init_storage()
-
-    if not settings.max_token:
-        raise RuntimeError("MAX_BOT_TOKEN не задан. Добавьте токен MAX в env или config.ini [max].")
 
     client = MaxApiClient(settings.max_token, settings.max_api_base)
     await client.__aenter__()

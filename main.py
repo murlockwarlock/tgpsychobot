@@ -413,9 +413,10 @@ def main():
 
     try:
         from notification_routing import validate_process_notification_configuration
-        validate_process_notification_configuration()
+        validate_process_notification_configuration(fail_closed=True)
     except Exception as _exc:
-        logging.warning("Notification configuration diagnostic check warning: %s", _exc)
+        logging.critical("Notification configuration check failed: %s", _exc)
+        raise
 
     bot = create_telegram_bot(
         BOT_TOKEN,

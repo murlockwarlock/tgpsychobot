@@ -793,7 +793,7 @@ class RandomMessage(Base):
 
 
 async def get_all_admin_ids() -> set[int]:
-    """OWNER_IDS из env + все is_admin=True из БД (только валидные Telegram ID < 100_000_000_000)."""
+    """OWNER_IDS из env + все is_admin=True из БД."""
     import os
     from sqlalchemy import select
     from config import OWNER_IDS
@@ -805,11 +805,11 @@ async def get_all_admin_ids() -> set[int]:
             owners = OWNER_IDS
     else:
         owners = OWNER_IDS
-    all_ids = {uid for uid in owners if isinstance(uid, int) and 0 < uid < 100_000_000_000}
+    all_ids = set(owners)
     try:
         async with async_session_maker() as session:
             result = await session.execute(select(User.id).where(User.is_admin == True))
-            all_ids.update({row[0] for row in result if isinstance(row[0], int) and 0 < row[0] < 100_000_000_000})
+            all_ids.update({row[0] for row in result})
     except Exception:
         pass
     return all_ids
@@ -817,7 +817,8 @@ async def get_all_admin_ids() -> set[int]:
 
 async def get_all_telegram_admin_ids() -> set[int]:
     """Все подтверждённые Telegram admin IDs (0 < id < 100_000_000_000, исключая MAX IDs)."""
-    return await get_all_admin_ids()
+    raw_ids = await get_all_admin_ids()
+    return {uid for uid in raw_ids if isinstance(uid, int) and 0 < uid < 100_000_000_000}
 
 
 def _migrate_deepseek_models(sync_conn) -> None:

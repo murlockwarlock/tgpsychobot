@@ -357,6 +357,10 @@ const apps = [
 ];
 
 apps.forEach(app => {
+  app.env = app.env || {};
+  if (app.name) {
+    app.env.BOT_INSTANCE_ID = app.name;
+  }
   if (GEMINI_PROXY) {
     app.env.GEMINI_PROXY = GEMINI_PROXY;
   }

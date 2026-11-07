@@ -72,6 +72,16 @@ class RecordingSession(BaseSession):
     async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
         if self.fail_with is not None:
             raise self.fail_with
+        from aiogram.methods import GetMe
+        if isinstance(method, GetMe):
+            from notification_routing import load_bot_registry
+            registry = load_bot_registry()
+            username = "TestBot"
+            for inst in registry.get("instances", []):
+                if inst.get("platform_id") == bot.id:
+                    username = inst.get("username", "TestBot")
+                    break
+            return User(id=bot.id, is_bot=True, first_name="TestBot", username=username)
         if isinstance(method, SendMessage):
             self.requests.append((bot.token, bot.id, method))
             return Message(
@@ -94,11 +104,13 @@ class RecordingSession(BaseSession):
 def clean_env():
     """Ensure clean test environment for routing isolation."""
     nr.clear_registry_cache()
+    nr.clear_bot_identity_cache()
     saved_env = os.environ.copy()
     yield
     os.environ.clear()
     os.environ.update(saved_env)
     nr.clear_registry_cache()
+    nr.clear_bot_identity_cache()
 
 
 # -----------------------------------------------------------------------------
@@ -740,9 +752,10 @@ async def test_verify_bot_identity_live_matches_getme_and_catches_mismatch():
 
 
 @pytest.mark.asyncio
-async def test_audit_database_get_all_admin_ids_filters_max_ids():
+async def test_audit_database_get_all_admin_ids_preserves_max_while_telegram_filters():
     """
-    database.get_all_admin_ids and get_all_telegram_admin_ids MUST NEVER return MAX user IDs.
+    database.get_all_admin_ids preserves all admins (including MAX admins for MAX bot functions),
+    while get_all_telegram_admin_ids strictly filters out MAX user IDs.
     """
     from database import get_all_admin_ids, get_all_telegram_admin_ids
 
@@ -753,11 +766,311 @@ async def test_audit_database_get_all_admin_ids_filters_max_ids():
         admin_ids = await get_all_admin_ids()
         telegram_admin_ids = await get_all_telegram_admin_ids()
 
+        # get_all_admin_ids preserves MAX admin IDs
+        assert 100263465646 in admin_ids
+        assert 100005511792 in admin_ids
         assert 272982544 in admin_ids
         assert 806750628 in admin_ids
-        assert 100263465646 not in admin_ids
-        assert 100005511792 not in admin_ids
 
-        assert admin_ids == telegram_admin_ids
+        # get_all_telegram_admin_ids strictly excludes MAX admin IDs
+        assert 272982544 in telegram_admin_ids
+        assert 806750628 in telegram_admin_ids
+        assert 100263465646 not in telegram_admin_ids
+        assert 100005511792 not in telegram_admin_ids
+        for aid in telegram_admin_ids:
+            assert 0 < aid < 100_000_000_000
+
+
+# -----------------------------------------------------------------------------
+# 5. CI REGRESSION CONTRACT & ARCHITECTURAL INVARIANTS
+# -----------------------------------------------------------------------------
+
+def test_runtime_env_permission_error_and_missing_file_safety():
+    """
+    Path.is_file or Path.read_text raising PermissionError (e.g. on non-root Linux CI runners)
+    is caught safely and returns empty dict without throwing unhandled exceptions.
+    """
+    from notification_routing import read_runtime_env_file
+
+    with patch.object(Path, "is_file", side_effect=PermissionError("[Errno 13] Permission denied: '/root/telegram_bots/runtime.env'")):
+        res = read_runtime_env_file("/root/telegram_bots/runtime.env")
+        assert res == {}
+
+    with patch.object(Path, "read_text", side_effect=PermissionError("[Errno 13] Permission denied")):
+        res = read_runtime_env_file("/root/telegram_bots/runtime.env")
+        assert res == {}
+
+
+def test_resolve_target_bot_token_skips_disk_when_token_in_env():
+    """
+    When candidate token is already present in environment variables,
+    resolve_target_bot_token resolves it directly without accessing disk.
+    """
+    from notification_routing import resolve_target_bot_token, get_instance_by_pm2_name
+
+    target = get_instance_by_pm2_name("tg_yourself_way_bot_new")
+    token = "8481853696:AAF_VALID_ENV_TOKEN_FOR_YOURSELF"
+
+    with patch.dict(os.environ, {"TELEGRAM_YOURSELF_WAY_BOT_TOKEN": token}, clear=True), \
+         patch("notification_routing.read_runtime_env_file") as mock_read:
+        resolved = resolve_target_bot_token(target, is_companion=False)
+        assert resolved == token
+        # read_runtime_env_file must NOT be called when token is in env!
+        mock_read.assert_not_called()
+
+
+def test_settings_strictly_never_reads_max_token_from_config_ini():
+    """
+    get_settings() must NEVER fallback to config.ini for max_token, webhook_secret, or bot_name.
+    """
+    from max_messenger_bot.settings import get_settings, clear_settings_cache
+
+    clear_settings_cache()
+    # Ensure MAX_BOT_TOKEN and MAX_TOKEN are NOT in env
+    clean_env = {k: v for k, v in os.environ.items() if not k.startswith("MAX_")}
+    with patch.dict(os.environ, clean_env, clear=True):
+        clear_settings_cache()
+        settings = get_settings()
+        # Must be empty, never read from config.ini
+        assert settings.max_token == ""
+        assert settings.webhook_secret == ""
+        assert settings.bot_name == ""
+    clear_settings_cache()
+
+
+@pytest.mark.asyncio
+async def test_admin_recipients_strictly_isolated_from_max_process_env():
+    """
+    A MAX process environment containing an alien Telegram admin ID (e.g. from Autobus)
+    MUST NEVER leak that admin ID into the companion Telegram bot's recipient list!
+    """
+    from notification_routing import resolve_target_admin_ids, get_instance_by_pm2_name
+
+    companion_target = get_instance_by_pm2_name("tg_yourself_way_bot_new")
+    max_source = get_instance_by_pm2_name("max_id519010411655_bot_new")
+
+    # MAX process env contains valid owner 272982544 + alien admin ID 999888777
+    with patch.dict(os.environ, {
+        "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
+        "OWNER_IDS": "272982544,999888777",
+    }, clear=True):
+        admin_ids = await resolve_target_admin_ids(companion_target, current_instance=max_source)
+
+        # 999888777 is an alien ID not belonging to tg_yourself_way_bot_new -> MUST NOT be in admins!
+        assert 999888777 not in admin_ids
+        # Authorized owners of tg_yourself_way_bot_new MUST be present
+        assert 272982544 in admin_ids
+        assert 979514796 in admin_ids
         for aid in admin_ids:
             assert 0 < aid < 100_000_000_000
+
+
+def test_detect_current_instance_refuses_to_guess_with_foreign_bot_token_and_shared_db():
+    """
+    When MAX credentials are incomplete or ambiguous, detect_current_instance MUST NOT
+    guess identity based on Autobus BOT_TOKEN or shared database. It must fail closed.
+    """
+    from notification_routing import detect_current_instance
+
+    # Ambiguous MAX process: has MAX_BOT_TOKEN and Autobus BOT_TOKEN, but no BOT_INSTANCE_ID/PM2_APP_NAME
+    with patch.dict(os.environ, {
+        "MAX_BOT_TOKEN": "unregistered_max_token",
+        "BOT_TOKEN": "8346799080:AAF_AUTOBUS_TOKEN",
+        "DATABASE_URL": "postgresql://localhost/psy5d2_db",
+    }, clear=True):
+        inst = detect_current_instance()
+        # MUST return None, NEVER Autobus!
+        assert inst is None
+
+
+def test_resolve_companion_telegram_instance_no_database_guessing():
+    """
+    resolve_companion_telegram_instance MUST NOT guess a Telegram companion by shared database.
+    If companion is unmapped, it must return None.
+    """
+    from notification_routing import resolve_companion_telegram_instance
+
+    unmapped_max = {
+        "platform": "max",
+        "pm2_name": "max_unmapped_bot",
+        "username": "unmapped_bot",
+        "database": "yourself_way_db",  # Shares DB with yourself_way_bot!
+        # NO companion_instance defined
+    }
+    companion = resolve_companion_telegram_instance(unmapped_max)
+    # MUST return None, refusing to guess by database
+    assert companion is None
+
+
+def test_user_event_refuses_to_route_to_autobus():
+    """
+    Non-diagnostic events (user_event, payment, ai_error) MUST NEVER route to Autobus
+    from any instance other than Autobus itself.
+    """
+    from notification_routing import resolve_notification_route, EventCategory, get_instance_by_pm2_name
+
+    source_inst = get_instance_by_pm2_name("tg_yourself_way_bot_new")
+
+    # If someone tries to pass Autobus token or force Autobus for a user event:
+    autobus_token = "8346799080:AAF_AUTOBUS_TOKEN"
+    route = resolve_notification_route(
+        category=EventCategory.USER_EVENT,
+        current_instance=source_inst,
+        bot_token_override=autobus_token,
+    )
+    # The Autobus token must be rejected for yourself_way_bot (mismatched platform ID)
+    assert route is None
+
+
+def test_startup_validation_fails_closed_when_misconfigured():
+    """
+    validate_process_notification_configuration(fail_closed=True) raises ConfigurationError
+    when context cannot be determined or companion bot is missing.
+    """
+    from notification_routing import validate_process_notification_configuration, ConfigurationError
+
+    # Empty env -> instance cannot be determined
+    with patch.dict(os.environ, {}, clear=True):
+        with pytest.raises(ConfigurationError, match="Current process instance could not be determined"):
+            validate_process_notification_configuration(fail_closed=True)
+
+
+# -----------------------------------------------------------------------------
+# 6. FULL BUSINESS FLOW END-TO-END TESTS
+# -----------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_e2e_real_promo_code_business_flow():
+    """
+    Real business path end-to-end:
+    MAX promo code activation -> apply_promo_code() -> DB write -> notify_telegram_admins()
+    -> notification_routing -> aiogram Bot.send_message -> Telegram transport.
+
+    Guarantees:
+    - DB is actually committed (promo.times_used == 1).
+    - Sent strictly via @yourself_way_bot (8481853696).
+    - Zero messages via Autobus (8346799080).
+    - Zero messages to MAX IDs (>= 100_000_000_000).
+    - Allowed recipients match @yourself_way_bot Telegram owners.
+    """
+    from max_messenger_bot.services.subscriptions import apply_promo_code
+    from max_messenger_bot.storage import StateStore, init_storage
+    from max_messenger_bot.legacy import User as MaxUser, PromoCode, async_session_maker, init_db
+
+    await init_db()
+    await init_storage()
+
+    user_id = 100074367460  # MAX user (Maria)
+    async with async_session_maker() as session:
+        user = MaxUser(id=user_id, username="maria_test", first_name="Мария")
+        promo = PromoCode(code="PODAROK_E2E", discount_percent=0, free_days=1, times_used=0, max_uses=10)
+        session.add(user)
+        session.add(promo)
+        await session.commit()
+
+    recording_session = RecordingSession()
+    yourself_token = "8481853696:AAF_YOURSELF_WAY_CANONICAL_PROD_TOKEN"
+    autobus_token = "8346799080:AAF_AUTOBUS_CONTAMINATED_LEGACY_TOKEN"
+
+    client = AsyncMock()
+    states = StateStore()
+
+    with patch.dict(os.environ, {
+        "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
+        "PM2_APP_NAME": "max_id519010411655_bot_new",
+        "MAX_BOT_NAME": "id519010411655_bot",
+        "COMPANION_TELEGRAM_BOT_TOKEN": yourself_token,
+        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": yourself_token,
+        "BOT_TOKEN": autobus_token,  # Foreign Autobus token in env must be completely ignored!
+        "SKIP_LIVE_BOT_VERIFICATION": "1",
+    }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
+
+        await apply_promo_code(
+            client=client,
+            states=states,
+            chat_id=user_id,
+            user_id=user_id,
+            code_text="PODAROK_E2E",
+        )
+
+    # 1. Verify DB was updated
+    async with async_session_maker() as session:
+        db_promo = await session.get(PromoCode, promo.id)
+        assert db_promo.times_used == 1, "PromoCode times_used must be incremented"
+
+    # 2. Verify Transport Delivery
+    assert len(recording_session.requests) > 0, "Admin notifications must be dispatched"
+    for token, bot_id, method in recording_session.requests:
+        assert bot_id == 8481853696, "Bot ID must be yourself_way_bot (8481853696)"
+        assert bot_id != 8346799080, "Must NEVER dispatch via Autobus!"
+        assert token == yourself_token
+        target_chat_id = int(method.chat_id)
+        assert target_chat_id < 100_000_000_000, "Must never send to a MAX user ID!"
+        assert target_chat_id in DEFAULT_TELEGRAM_OWNER_IDS["tg_yourself_way_bot_new"]
+        assert "PODAROK_E2E" in method.text
+        assert "74367460" in method.text
+
+
+@pytest.mark.asyncio
+async def test_e2e_real_subscription_cancellation_flow():
+    """
+    Real business path end-to-end:
+    MAX subscription auto-renewal toggle -> set_renewal(enabled=False) -> DB update
+    -> notify_telegram_admins(category='payment') -> Telegram transport.
+    """
+    from max_messenger_bot.services.subscriptions import set_renewal
+    from max_messenger_bot.legacy import User as MaxUser, UserSubscription, SubscriptionPlan, async_session_maker, init_db
+    from datetime import datetime, timezone, timedelta
+
+    await init_db()
+
+    user_id = 100074367461
+    now = datetime.now(timezone.utc)
+    async with async_session_maker() as session:
+        user = MaxUser(id=user_id, username="maria_cancel", first_name="Мария")
+        plan = SubscriptionPlan(id=991, name="Премиум 1 мес", price=990, duration_value=30, duration_unit="days")
+        sub = UserSubscription(
+            user_id=user_id,
+            plan_id=991,
+            start_date=now,
+            end_date=now + timedelta(days=30),
+            auto_renewal=True,
+            payment_provider="Yookassa",
+            payment_attempt_count=0,
+            discount_percent=0,
+        )
+        session.add(user)
+        session.add(plan)
+        session.add(sub)
+        await session.commit()
+
+    recording_session = RecordingSession()
+    yourself_token = "8481853696:AAF_YOURSELF_WAY_CANONICAL_PROD_TOKEN"
+
+    client = AsyncMock()
+
+    with patch.dict(os.environ, {
+        "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
+        "COMPANION_TELEGRAM_BOT_TOKEN": yourself_token,
+        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": yourself_token,
+        "DATABASE_URL": os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///:memory:"),
+        "SKIP_LIVE_BOT_VERIFICATION": "1",
+    }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
+
+        await set_renewal(client, chat_id=user_id, user_id=user_id, enabled=False)
+
+    # 1. Verify DB was updated
+    from sqlalchemy import select
+    async with async_session_maker() as session:
+        db_sub = await session.scalar(select(UserSubscription).where(UserSubscription.user_id == user_id))
+        print("DEBUG CHECK:", "db_sub.id=", getattr(db_sub, "id", None), "auto_renewal=", getattr(db_sub, "auto_renewal", None))
+        assert db_sub is not None
+        assert db_sub.auto_renewal is False, "auto_renewal must be disabled"
+
+    # 2. Verify Transport Delivery
+    assert len(recording_session.requests) > 0
+    for token, bot_id, method in recording_session.requests:
+        assert bot_id == 8481853696
+        assert token == yourself_token
+        assert int(method.chat_id) < 100_000_000_000
+        assert "отключил автопродление" in method.text

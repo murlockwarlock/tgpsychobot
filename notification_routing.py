@@ -77,6 +77,10 @@ class RoutingError(RuntimeError):
     """Raised when routing invariants or identity checks are violated."""
 
 
+class ConfigurationError(RuntimeError):
+    """Raised when process notification routing configuration is invalid or missing."""
+
+
 @dataclass(frozen=True)
 class NotificationRoute:
     category: EventCategory
@@ -112,12 +116,14 @@ def is_valid_telegram_user_id(uid: Any) -> bool:
 
 def read_runtime_env_file(path: str | Path | None = None) -> dict[str, str]:
     """Safely parse key=value lines from host runtime.env file if available."""
-    target_path = Path(path or os.environ.get("PROD_RUNTIME_ENV", "/root/telegram_bots/runtime.env"))
-    if not target_path.is_file():
-        return {}
-    env_vars: dict[str, str] = {}
     try:
+        raw_path = path or os.environ.get("PROD_RUNTIME_ENV", "/root/telegram_bots/runtime.env")
+        target_path = Path(raw_path)
+        # Handle cases where parent directory has restrictive permissions (e.g. /root on non-root Linux CI runner)
+        if not target_path.is_file():
+            return {}
         content = target_path.read_text(encoding="utf-8")
+        env_vars: dict[str, str] = {}
         for raw_line in content.splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#"):
@@ -126,12 +132,13 @@ def read_runtime_env_file(path: str | Path | None = None) -> dict[str, str]:
                 key, _, val = line.partition("=")
                 key = key.strip()
                 val = val.strip()
-                if (val.startswith('"') and val.endsWith('"')) or (val.startswith("'") and val.endsWith("'")):
+                if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
                     val = val[1:-1]
                 env_vars[key] = val
-    except Exception as exc:
-        logger.debug("Could not read runtime.env from %s: %s", target_path, exc)
-    return env_vars
+        return env_vars
+    except (PermissionError, OSError, Exception) as exc:
+        logger.debug("Could not read runtime.env from %s: %s", path, exc)
+        return {}
 
 
 @lru_cache(maxsize=1)
@@ -149,12 +156,21 @@ def clear_registry_cache() -> None:
     load_bot_registry.cache_clear()
 
 
-def get_instance_by_pm2_name(pm2_name: str) -> dict[str, Any] | None:
+def get_instance_by_id(instance_id: str) -> dict[str, Any] | None:
     registry = load_bot_registry()
+    clean_id = instance_id.strip()
     for inst in registry.get("instances", []):
-        if inst.get("pm2_name") == pm2_name or inst.get("legacy_pm2_name") == pm2_name:
+        if (
+            inst.get("bot_instance_id") == clean_id
+            or inst.get("pm2_name") == clean_id
+            or inst.get("legacy_pm2_name") == clean_id
+        ):
             return inst
     return None
+
+
+def get_instance_by_pm2_name(pm2_name: str) -> dict[str, Any] | None:
+    return get_instance_by_id(pm2_name)
 
 
 def get_instance_by_username(username: str, platform: str | None = None) -> dict[str, Any] | None:
@@ -167,72 +183,48 @@ def get_instance_by_username(username: str, platform: str | None = None) -> dict
     return None
 
 
-def get_instance_by_database(database_name: str, platform: str | None = None) -> dict[str, Any] | None:
-    registry = load_bot_registry()
-    for inst in registry.get("instances", []):
-        if inst.get("database") == database_name:
-            if platform is None or inst.get("platform") == platform:
-                return inst
-    return None
-
-
 def detect_current_instance() -> dict[str, Any] | None:
     """
-    Detect the active instance context using environment variables, process names,
-    tokens, or database connection strings.
+    Detect the active instance context using unambiguous BOT_INSTANCE_ID or PM2 name.
+    Strictly fails closed without guessing if configuration is ambiguous, incomplete, or conflicting.
     """
-    # 1. Check explicit PM2 app name
+    # 1. Primary contract: BOT_INSTANCE_ID
+    bot_instance_id = os.environ.get("BOT_INSTANCE_ID")
+    if bot_instance_id:
+        inst = get_instance_by_id(bot_instance_id.strip())
+        if inst:
+            return inst
+        logger.error("[Notification Routing] Configured BOT_INSTANCE_ID %r not found in registry", bot_instance_id)
+        return None
+
+    # 2. PM2 process name contract
     pm2_name = (
         os.environ.get("PM2_APP_NAME")
         or os.environ.get("name")
         or os.environ.get("APP_NAME")
     )
     if pm2_name:
-        inst = get_instance_by_pm2_name(pm2_name.strip())
+        inst = get_instance_by_id(pm2_name.strip())
         if inst:
             return inst
+        logger.error("[Notification Routing] PM2 process name %r not found in registry", pm2_name)
+        return None
 
-    # 2. Check explicit MAX bot name
+    # 3. Explicit MAX bot name (only for MAX instances)
     max_bot_name = os.environ.get("MAX_BOT_NAME")
     if max_bot_name:
         inst = get_instance_by_username(max_bot_name.strip(), platform="max")
         if inst:
             return inst
 
-    # 3. Check explicit BOT_NAME or BOT_USERNAME
+    # 4. Explicit Telegram bot username (only for Telegram instances)
     bot_name = os.environ.get("BOT_NAME") or os.environ.get("BOT_USERNAME")
     if bot_name:
-        inst = get_instance_by_username(bot_name.strip())
+        inst = get_instance_by_username(bot_name.strip(), platform="telegram")
         if inst:
             return inst
 
-    # 4. Check MAX_BOT_TOKEN identity
-    max_token = os.environ.get("MAX_BOT_TOKEN")
-    if max_token:
-        # Match against MAX instance platform_id if available, or database
-        pass
-
-    # 5. Check BOT_TOKEN prefix against Telegram instances
-    bot_token = os.environ.get("BOT_TOKEN")
-    bot_id = extract_telegram_bot_id(bot_token)
-    if bot_id:
-        registry = load_bot_registry()
-        for inst in registry.get("instances", []):
-            if inst.get("platform") == "telegram" and inst.get("platform_id") == bot_id:
-                return inst
-
-    # 6. Check DATABASE_URL
-    db_url = os.environ.get("DATABASE_URL")
-    if db_url:
-        match = re.search(r"/([a-zA-Z0-9_]+)(?:\?|$)", db_url)
-        if match:
-            db_name = match.group(1)
-            # If MAX_BOT_TOKEN is in env, prefer max instance
-            platform_hint = "max" if max_token else None
-            inst = get_instance_by_database(db_name, platform=platform_hint)
-            if inst:
-                return inst
-
+    # STRICT: Never guess identity by foreign BOT_TOKEN or DATABASE_URL!
     return None
 
 
@@ -240,28 +232,35 @@ def resolve_companion_telegram_instance(source_instance: dict[str, Any]) -> dict
     """
     Resolve the companion Telegram bot instance for a MAX instance.
     For Telegram instances, returns the instance itself.
+    Strictly fails closed without guessing by shared database, tokens, or usernames.
     """
     platform = source_instance.get("platform")
-    pm2_name = source_instance.get("pm2_name", "")
-    username = source_instance.get("username", "")
-
     if platform == "telegram":
         return source_instance
 
     if platform == "max":
-        # 1. Explicit mapping lookup
-        companion_pm2 = MAX_COMPANION_MAPPING.get(pm2_name) or MAX_COMPANION_MAPPING.get(username)
-        if companion_pm2:
-            companion = get_instance_by_pm2_name(companion_pm2)
-            if companion and companion.get("platform") == "telegram":
-                return companion
+        comp_id = (
+            source_instance.get("companion_instance")
+            or MAX_COMPANION_MAPPING.get(source_instance.get("pm2_name", ""))
+            or MAX_COMPANION_MAPPING.get(source_instance.get("username", ""))
+        )
+        if not comp_id:
+            logger.error(
+                "[Notification Routing] MAX instance %s has no explicit companion Telegram bot configured. Refusing to guess.",
+                source_instance.get("pm2_name"),
+            )
+            return None
 
-        # 2. Match by shared database
-        db_name = source_instance.get("database")
-        if db_name:
-            companion = get_instance_by_database(db_name, platform="telegram")
-            if companion:
-                return companion
+        companion = get_instance_by_id(comp_id)
+        if companion and companion.get("platform") == "telegram":
+            return companion
+
+        logger.error(
+            "[Notification Routing] Configured companion %s for MAX instance %s is missing or not a Telegram instance",
+            comp_id,
+            source_instance.get("pm2_name"),
+        )
+        return None
 
     return None
 
@@ -273,12 +272,13 @@ def resolve_target_bot_token(
     candidate_token: str | None = None,
 ) -> str | None:
     """
-    Resolve and cryptographically validate the target bot's Telegram token.
+    Resolve and validate the target bot's Telegram token.
 
     STRICT GUARANTEES:
     - The token MUST have a prefix matching target_instance['platform_id'].
     - If a token from Autobus or any other foreign bot is supplied, it is REJECTED.
     - NEVER falls back to legacy config.ini.
+    - Prefers environment variables and only checks runtime.env on disk if not found.
     """
     expected_id = target_instance.get("platform_id")
     if not expected_id or not isinstance(expected_id, int):
@@ -298,7 +298,6 @@ def resolve_target_bot_token(
         if target_token_env:
             candidates.append(os.environ.get(target_token_env))
         # Note: We check os.environ.get("BOT_TOKEN") as well, BUT ONLY IF it matches expected_id!
-        # If BOT_TOKEN holds Autobus's token, the prefix check below will strictly discard it!
         candidates.append(os.environ.get("BOT_TOKEN"))
     else:
         # Direct Telegram bot
@@ -307,14 +306,7 @@ def resolve_target_bot_token(
             candidates.append(os.environ.get(target_token_env))
         candidates.append(os.environ.get("BOT_TOKEN"))
 
-    # 3. Check runtime.env from disk if available
-    target_token_env = target_instance.get("token_env")
-    if target_token_env:
-        host_env = read_runtime_env_file()
-        if host_env.get(target_token_env):
-            candidates.append(host_env[target_token_env])
-
-    # Validate candidates against expected_id
+    # Validate candidates from environment first
     for cand in candidates:
         if not cand or not isinstance(cand, str):
             continue
@@ -330,6 +322,16 @@ def resolve_target_bot_token(
                 target_instance.get("pm2_name"),
             )
 
+    # 3. Only check runtime.env from disk if no valid env candidate was found
+    target_token_env = target_instance.get("token_env")
+    if target_token_env:
+        host_env = read_runtime_env_file()
+        file_cand = host_env.get(target_token_env)
+        if file_cand and isinstance(file_cand, str):
+            cleaned = file_cand.strip()
+            if extract_telegram_bot_id(cleaned) == expected_id:
+                return cleaned
+
     logger.error(
         "[Notification Routing] No valid token found matching platform_id %s for instance %s",
         expected_id,
@@ -340,6 +342,8 @@ def resolve_target_bot_token(
 
 async def resolve_target_admin_ids(
     target_instance: dict[str, Any],
+    *,
+    current_instance: dict[str, Any] | None = None,
     session: Any | None = None,
 ) -> tuple[int, ...]:
     """
@@ -348,55 +352,65 @@ async def resolve_target_admin_ids(
     STRICT GUARANTEES:
     - Filters out all MAX IDs (>= 100_000_000_000).
     - Filters out non-positive IDs.
-    - Resolves from target instance's configured Telegram owners + DB is_admin=True.
+    - Resolves strictly from target Telegram instance's configured Telegram owners.
+    - NEVER includes owner IDs from an unrelated process (e.g. alien IDs in MAX process env).
+    - Supports dynamic database admins (is_admin=True) ONLY if the database matches target instance.
     """
     admin_ids: set[int] = set()
-    pm2_name = target_instance.get("pm2_name", "")
+    target_pm2 = target_instance.get("pm2_name", "")
 
-    # 1. Configured Telegram owners from default mapping
-    if pm2_name in DEFAULT_TELEGRAM_OWNER_IDS:
-        for oid in DEFAULT_TELEGRAM_OWNER_IDS[pm2_name]:
+    # 1. Authoritative base owners for the target Telegram instance
+    if target_pm2 in DEFAULT_TELEGRAM_OWNER_IDS:
+        for oid in DEFAULT_TELEGRAM_OWNER_IDS[target_pm2]:
             if is_valid_telegram_user_id(oid):
                 admin_ids.add(oid)
 
-    # 2. Check telegram_owner_ids in instance entry
     inst_owners = target_instance.get("telegram_owner_ids")
     if isinstance(inst_owners, (list, tuple)):
         for oid in inst_owners:
             if is_valid_telegram_user_id(oid):
                 admin_ids.add(oid)
 
-    # 3. Check environment OWNER_IDS (only keep valid Telegram IDs)
-    raw_env_owners = os.environ.get("OWNER_IDS", "")
-    if raw_env_owners:
-        for part in raw_env_owners.split(","):
-            part_str = part.strip()
-            if part_str.isdigit():
-                try:
-                    uid = int(part_str)
-                    if is_valid_telegram_user_id(uid):
-                        admin_ids.add(uid)
-                except ValueError:
-                    pass
+    # 2. Environment OWNER_IDS is ONLY used if current process IS the target Telegram instance!
+    # If the current process is a MAX bot, its OWNER_IDS belongs to MAX, NOT to target Telegram bot!
+    curr_pm2 = current_instance.get("pm2_name", "") if current_instance else ""
+    if curr_pm2 == target_pm2 and target_instance.get("platform") == "telegram":
+        raw_env_owners = os.environ.get("OWNER_IDS", "")
+        if raw_env_owners:
+            for part in raw_env_owners.split(","):
+                part_str = part.strip()
+                if part_str.isdigit():
+                    try:
+                        uid = int(part_str)
+                        if is_valid_telegram_user_id(uid):
+                            admin_ids.add(uid)
+                    except ValueError:
+                        pass
 
-    # 4. Check database users with is_admin=True (filtered)
-    try:
-        from sqlalchemy import select
-        from database import User, async_session_maker
+    # 3. Dynamic database admins (User.is_admin == True)
+    # Allowed ONLY if the database is confirmed to match target instance's database
+    target_db = target_instance.get("database")
+    curr_db = current_instance.get("database") if current_instance else None
+    db_matches = bool(target_db and curr_db and target_db == curr_db) or (curr_pm2 == target_pm2)
 
-        async def _query_db_admins(s: Any) -> set[int]:
-            res = await s.execute(select(User.id).where(User.is_admin == True))
-            return {row[0] for row in res if is_valid_telegram_user_id(row[0])}
+    if db_matches:
+        try:
+            from sqlalchemy import select
+            from database import User, async_session_maker
 
-        if session is not None:
-            db_admins = await _query_db_admins(session)
-            admin_ids.update(db_admins)
-        else:
-            async with async_session_maker() as s:
-                db_admins = await _query_db_admins(s)
+            async def _query_db_admins(s: Any) -> set[int]:
+                res = await s.execute(select(User.id).where(User.is_admin == True))
+                return {row[0] for row in res if is_valid_telegram_user_id(row[0])}
+
+            if session is not None:
+                db_admins = await _query_db_admins(session)
                 admin_ids.update(db_admins)
-    except Exception as exc:
-        logger.debug("[Notification Routing] DB admin lookup skipped/failed: %s", exc)
+            else:
+                async with async_session_maker() as s:
+                    db_admins = await _query_db_admins(s)
+                    admin_ids.update(db_admins)
+        except Exception as exc:
+            logger.debug("[Notification Routing] DB dynamic admin lookup skipped/failed: %s", exc)
 
     return tuple(sorted(admin_ids))
 
@@ -465,6 +479,19 @@ def resolve_notification_route(
         logger.error("[Notification Routing] Unsupported source platform: %s", source_platform)
         return None
 
+    # CRITICAL INVARIANT: Non-diagnostic events MUST NEVER route to Autobus from another instance!
+    if (
+        category != EventCategory.SYSTEM_DIAGNOSTIC
+        and target_inst.get("pm2_name") == SYSTEM_DIAGNOSTIC_BOT_PM2
+        and source_inst.get("pm2_name") != SYSTEM_DIAGNOSTIC_BOT_PM2
+    ):
+        logger.critical(
+            "[Notification Routing] VIOLATION: Non-diagnostic event %s from %s attempted to route to Autobus! Dropping.",
+            category,
+            source_inst.get("pm2_name"),
+        )
+        return None
+
     # Resolve token strictly matching target_inst["platform_id"]
     token = resolve_target_bot_token(
         target_inst,
@@ -514,8 +541,7 @@ async def send_admin_notification(
     Guarantees:
     - Never raises exceptions to caller.
     - Never sends to wrong bot or wrong admins.
-    - Checks SubscriptionConfig.notifications_enabled if applicable.
-    - Aiogram Bot identity is verified before dispatch.
+    - Live getMe bot identity is verified before dispatch.
     - Returns True if delivered to at least one admin, False otherwise.
     """
     try:
@@ -533,13 +559,27 @@ async def send_admin_notification(
         if not target_inst:
             return False
 
+        source_inst = detect_current_instance()
+
         # Resolve full list of Telegram admin IDs
-        admin_ids = await resolve_target_admin_ids(target_inst, session=session)
+        admin_ids = await resolve_target_admin_ids(target_inst, current_instance=source_inst, session=session)
         if not admin_ids:
             logger.warning(
                 "[Notification Routing] Alert dropped: No allowed Telegram admins for target %s",
                 route.target_instance,
             )
+            return False
+
+        # Live getMe identity verification before sending (cached safely)
+        try:
+            await verify_bot_identity_live(
+                route.target_bot_token,
+                expected_username=route.target_username,
+                expected_id=route.target_platform_id,
+                use_cache=True,
+            )
+        except Exception as exc:
+            logger.error("[Notification Routing] Live bot identity verification failed before dispatch: %s", exc)
             return False
 
         # Dispatch via verified Aiogram Bot
@@ -577,61 +617,16 @@ async def send_admin_notification(
         return False
 
 
-def validate_process_notification_configuration() -> dict[str, Any]:
-    """
-    Validate notification routing configuration on process startup.
-    Produces a safe, non-leaking diagnostic summary.
-    """
-    current_inst = detect_current_instance()
-    if not current_inst:
-        res = {
-            "status": "warning",
-            "message": "Current instance could not be determined from environment",
-        }
-        logger.warning("[Notification Routing Diagnostic] %s", res["message"])
-        return res
+_VERIFIED_BOT_IDENTITY_CACHE: dict[str, dict[str, Any]] = {}
 
-    platform = current_inst.get("platform")
-    pm2_name = current_inst.get("pm2_name")
-    companion = resolve_companion_telegram_instance(current_inst) if platform == "max" else current_inst
 
-    if not companion:
-        res = {
-            "status": "error",
-            "instance": pm2_name,
-            "platform": platform,
-            "message": "Companion Telegram bot not configured",
-        }
-        logger.error("[Notification Routing Diagnostic] %s", res)
-        return res
+def _token_cache_key(token: str) -> str:
+    import hashlib
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    target_token = resolve_target_bot_token(companion, is_companion=(platform == "max"))
-    token_status = "VALID" if target_token else "MISSING"
 
-    target_id = companion.get("platform_id")
-    admin_count = len(DEFAULT_TELEGRAM_OWNER_IDS.get(companion.get("pm2_name", ""), ()))
-
-    res = {
-        "status": "ok" if target_token else "warning",
-        "instance": pm2_name,
-        "platform": platform,
-        "target_bot": companion.get("username"),
-        "target_pm2": companion.get("pm2_name"),
-        "target_platform_id": target_id,
-        "token_status": token_status,
-        "configured_admins_count": admin_count,
-    }
-    logger.info(
-        "[Notification Routing Diagnostic] Instance: %s (%s) | Target Bot: %s (%s, ID: %s) | Token: %s | Default Admins: %d",
-        pm2_name,
-        platform,
-        companion.get("username"),
-        companion.get("pm2_name"),
-        target_id,
-        token_status,
-        admin_count,
-    )
-    return res
+def clear_bot_identity_cache() -> None:
+    _VERIFIED_BOT_IDENTITY_CACHE.clear()
 
 
 async def verify_bot_identity_live(
@@ -639,15 +634,33 @@ async def verify_bot_identity_live(
     *,
     expected_username: str | None = None,
     expected_id: int | None = None,
+    use_cache: bool = True,
 ) -> dict[str, Any]:
     """
     Safely verify live Telegram bot identity via getMe without exposing token secrets.
 
     Guarantees:
     - Validates bot ID and username against expected values.
+    - Caches verified results in-memory by token digest.
     - Raises RoutingError if identity does not match.
     - Diagnostic output contains only public username and ID, never raw secrets.
     """
+    token_str = bot_or_token if isinstance(bot_or_token, str) else getattr(bot_or_token, "token", None)
+    if use_cache and token_str:
+        cache_key = _token_cache_key(token_str)
+        cached = _VERIFIED_BOT_IDENTITY_CACHE.get(cache_key)
+        if cached:
+            if expected_id is not None and cached["id"] != expected_id:
+                raise RoutingError(
+                    f"Bot identity mismatch: cached ID {cached['id']} does not match expected {expected_id}"
+                )
+            if expected_username is not None:
+                if cached["username"].lstrip("@").lower() != expected_username.lstrip("@").lower():
+                    raise RoutingError(
+                        f"Bot identity mismatch: cached @{cached['username']} does not match expected @{expected_username}"
+                    )
+            return cached
+
     from telegram_client import create_telegram_bot
 
     if isinstance(bot_or_token, str):
@@ -668,16 +681,140 @@ async def verify_bot_identity_live(
                 raise RoutingError(
                     f"Bot identity mismatch: getMe returned @{me.username}, expected @{expected_username}"
                 )
-        return {
+        identity = {
             "verified": True,
             "id": me.id,
             "username": me.username,
             "is_bot": bool(me.is_bot),
         }
+        if token_str:
+            _VERIFIED_BOT_IDENTITY_CACHE[_token_cache_key(token_str)] = identity
+        return identity
 
     if hasattr(bot_ctx, "__aenter__"):
         async with bot_ctx as bot:
             return await _inspect(bot)
     else:
         return await _inspect(bot_ctx)
+
+
+def validate_process_notification_configuration(*, fail_closed: bool = False) -> dict[str, Any]:
+    """
+    Validate notification routing configuration on process startup.
+    Produces a safe, non-leaking diagnostic summary.
+    If fail_closed is True, raises ConfigurationError on any misconfiguration.
+    """
+    current_inst = detect_current_instance()
+    if not current_inst:
+        msg = "Current process instance could not be determined from environment"
+        logger.error("[Notification Routing Diagnostic] %s", msg)
+        if fail_closed:
+            raise ConfigurationError(msg)
+        return {"status": "error", "message": msg}
+
+    platform = current_inst.get("platform")
+    pm2_name = current_inst.get("pm2_name")
+    companion = resolve_companion_telegram_instance(current_inst) if platform == "max" else current_inst
+
+    if not companion:
+        msg = f"Companion Telegram bot not configured for instance {pm2_name}"
+        logger.error("[Notification Routing Diagnostic] %s", msg)
+        if fail_closed:
+            raise ConfigurationError(msg)
+        return {
+            "status": "error",
+            "instance": pm2_name,
+            "platform": platform,
+            "message": msg,
+        }
+
+    target_token = resolve_target_bot_token(companion, is_companion=(platform == "max"))
+    if not target_token:
+        msg = f"No valid Telegram bot token found for target {companion.get('pm2_name')}"
+        logger.error("[Notification Routing Diagnostic] %s", msg)
+        if fail_closed:
+            raise ConfigurationError(msg)
+        return {
+            "status": "error",
+            "instance": pm2_name,
+            "platform": platform,
+            "message": msg,
+        }
+
+    target_id = companion.get("platform_id")
+    admin_count = len(DEFAULT_TELEGRAM_OWNER_IDS.get(companion.get("pm2_name", ""), ()))
+
+    if admin_count == 0:
+        msg = f"No allowed Telegram admin IDs configured for target {companion.get('pm2_name')}"
+        logger.error("[Notification Routing Diagnostic] %s", msg)
+        if fail_closed:
+            raise ConfigurationError(msg)
+        return {
+            "status": "error",
+            "instance": pm2_name,
+            "platform": platform,
+            "message": msg,
+        }
+
+    res = {
+        "status": "ok",
+        "instance": pm2_name,
+        "platform": platform,
+        "target_bot": companion.get("username"),
+        "target_pm2": companion.get("pm2_name"),
+        "target_platform_id": target_id,
+        "token_status": "VALID",
+        "configured_admins_count": admin_count,
+    }
+    logger.info(
+        "[Notification Routing Diagnostic] Instance: %s (%s) | Target Bot: %s (%s, ID: %s) | Token: VALID | Default Admins: %d",
+        pm2_name,
+        platform,
+        companion.get("username"),
+        companion.get("pm2_name"),
+        target_id,
+        admin_count,
+    )
+    return res
+
+
+async def validate_process_notification_configuration_async(
+    *,
+    fail_closed: bool = True,
+    verify_live: bool = True,
+) -> dict[str, Any]:
+    """
+    Asynchronous process notification startup validator with live getMe verification.
+    Guarantees that a process never starts up without a proven, working admin notification route.
+    """
+    res = validate_process_notification_configuration(fail_closed=fail_closed)
+    if res.get("status") != "ok":
+        return res
+
+    current_inst = detect_current_instance()
+    platform = current_inst.get("platform") if current_inst else None
+    companion = resolve_companion_telegram_instance(current_inst) if platform == "max" else current_inst
+
+    if verify_live and companion:
+        target_token = resolve_target_bot_token(companion, is_companion=(platform == "max"))
+        if target_token:
+            try:
+                verified = await verify_bot_identity_live(
+                    target_token,
+                    expected_username=companion.get("username"),
+                    expected_id=companion.get("platform_id"),
+                    use_cache=True,
+                )
+                res["live_identity_verified"] = True
+                res["live_bot_id"] = verified["id"]
+                res["live_username"] = verified["username"]
+            except Exception as exc:
+                msg = f"Live bot identity verification failed for {companion.get('pm2_name')}: {exc}"
+                logger.error("[Notification Routing Diagnostic] %s", msg)
+                if fail_closed:
+                    raise ConfigurationError(msg) from exc
+                res["status"] = "error"
+                res["message"] = msg
+
+    return res
 

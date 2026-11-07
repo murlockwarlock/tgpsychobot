@@ -511,15 +511,17 @@ async def set_renewal(client: MaxApiClient, chat_id: int, user_id: int, enabled:
             plan_name_cr = sub.plan.name if sub.plan else "Unknown"
             end_date_msk_cr = format_msk(sub.end_date) if sub.end_date else "Неизвестно"
             
-            from .common import notify_telegram_admins
-            await notify_telegram_admins(
-                f"🔕 Пользователь отключил автопродление\n"
-                f"Пользователь: {user_ref_cr} (MAX)\n"
-                f"Тариф: {plan_name_cr}\n"
-                f"Подписка до: {end_date_msk_cr} МСК",
-                category="payment",
-            )
         await session.commit()
+
+    if not enabled:
+        from .common import notify_telegram_admins
+        await notify_telegram_admins(
+            f"🔕 Пользователь отключил автопродление\n"
+            f"Пользователь: {user_ref_cr} (MAX)\n"
+            f"Тариф: {plan_name_cr}\n"
+            f"Подписка до: {end_date_msk_cr} МСК",
+            category="payment",
+        )
     await show_subscription_info(client, chat_id, user_id)
 
 
