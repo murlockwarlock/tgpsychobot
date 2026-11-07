@@ -3,15 +3,22 @@ Tests for post-deploy verification and simulated rollback mechanics (PR #86).
 """
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import notification_routing
-from scripts.verify_post_deploy import verify_post_deploy
+from scripts.verify_post_deploy import (
+    REPO_ROOT,
+    run_instance_in_subprocess,
+    run_single_instance_worker,
+    verify_post_deploy,
+)
 
 
 @pytest.mark.asyncio
@@ -178,3 +185,207 @@ def test_simulate_partial_failure_rollback_script():
     res = subprocess.run([sys.executable, str(script_path)], capture_output=True, text=True)
     assert res.returncode == 0, f"Script failed with output:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
     assert "SIMULATION COMPLETED SUCCESSFULLY (EXIT 0)" in res.stdout
+
+
+# --------------------------------------------------------------------------
+# Automated Negative Tests for Subprocess Isolation & Strict Delivery Criterion
+# --------------------------------------------------------------------------
+
+def test_negative_subprocess_swapped_max_environments_fails():
+    """
+    Verify that if an isolated child process for MAX Yourself Way is executed with
+    VeraVeda's companion token, the verification fails closed with a routing/token error.
+    """
+    child_env = {
+        k: v for k, v in os.environ.items()
+        if k in {"PATH", "PYTHONPATH", "LANG", "LC_ALL", "USER", "HOME", "TERM"}
+    }
+    child_env["PYTHONPATH"] = str(REPO_ROOT)
+    child_env["BOT_INSTANCE_ID"] = "max_id519010411655_bot_new"
+    # Swapped token: VeraVeda companion ID 8224473896 instead of Yourself Way 8481853696
+    child_env["COMPANION_TELEGRAM_BOT_TOKEN"] = "8224473896:AASwappedToken12345"
+    child_env["DATABASE_URL"] = "postgresql+asyncpg://user:pass@localhost:5432/yourself_way_db"
+
+    with pytest.raises(RuntimeError) as exc_info:
+        run_instance_in_subprocess(
+            "max_id519010411655_bot_new",
+            child_env=child_env,
+            production=False,
+        )
+    err = str(exc_info.value)
+    assert "ROUTING FAILED" in err or "Token prefix mismatch" in err
+
+
+def test_negative_subprocess_database_mismatch_fails():
+    """
+    Verify that if an isolated child process has a DATABASE_URL not matching the
+    target instance database, verification strictly fails closed on database identity check.
+    """
+    child_env = {
+        k: v for k, v in os.environ.items()
+        if k in {"PATH", "PYTHONPATH", "LANG", "LC_ALL", "USER", "HOME", "TERM"}
+    }
+    child_env["PYTHONPATH"] = str(REPO_ROOT)
+    child_env["BOT_INSTANCE_ID"] = "max_id519010411655_bot_new"
+    child_env["COMPANION_TELEGRAM_BOT_TOKEN"] = "8481853696:AAValidTokenPrefix12345"
+    # Mismatched database: veraveda_db instead of yourself_way_db
+    child_env["DATABASE_URL"] = "postgresql+asyncpg://user:pass@localhost:5432/veraveda_db"
+
+    with pytest.raises(RuntimeError) as exc_info:
+        run_instance_in_subprocess(
+            "max_id519010411655_bot_new",
+            child_env=child_env,
+            production=False,
+        )
+    err = str(exc_info.value)
+    assert "DATABASE IDENTITY MISMATCH" in err or "does not match expected database" in err
+
+
+def test_negative_subprocess_missing_mandatory_token_fails():
+    """
+    Verify that in production mode, missing mandatory bot token causes the
+    isolated child process to fail closed with exit code != 0.
+    """
+    child_env = {
+        k: v for k, v in os.environ.items()
+        if k in {"PATH", "PYTHONPATH", "LANG", "LC_ALL", "USER", "HOME", "TERM"}
+    }
+    child_env["PYTHONPATH"] = str(REPO_ROOT)
+    child_env["BOT_INSTANCE_ID"] = "tg_autobusbusbot_new"
+    child_env["DATABASE_URL"] = "postgresql+asyncpg://user:pass@localhost:5432/psy5d2_db"
+    child_env["PRODUCTION"] = "1"
+    # Explicitly ensure no BOT_TOKEN
+    child_env.pop("BOT_TOKEN", None)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        run_instance_in_subprocess(
+            "tg_autobusbusbot_new",
+            child_env=child_env,
+            production=True,
+        )
+    err = str(exc_info.value)
+    assert "Real token missing" in err or "PRODUCTION ERROR" in err
+
+
+@pytest.mark.asyncio
+async def test_negative_partial_delivery_fails_criterion(monkeypatch):
+    """
+    Verify that if live delivery succeeds for one admin but fails for another,
+    the worker records per-recipient results, sets delivery_criterion_met=False,
+    status='partial_delivery_failure', and raises RuntimeError.
+    """
+    monkeypatch.setenv("BOT_INSTANCE_ID", "max_id519010411655_bot_new")
+    monkeypatch.setenv("COMPANION_TELEGRAM_BOT_TOKEN", "8481853696:AAValidTokenPrefix12345")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/yourself_way_db")
+
+    # Mock getMe verification
+    mock_get_me = AsyncMock(return_value={"verified": True, "id": 8481853696, "username": "yourself_way_bot"})
+
+    # Mock aiogram bot
+    mock_bot = MagicMock()
+    mock_bot.id = 8481853696
+
+    call_count = 0
+    async def fake_send_message(chat_id, text, parse_mode=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            msg = MagicMock()
+            msg.message_id = 1001
+            return msg
+        else:
+            raise Exception(f"Simulated Telegram delivery failure for recipient {chat_id}")
+
+    mock_bot.send_message = AsyncMock(side_effect=fake_send_message)
+
+    class MockBotContext:
+        async def __aenter__(self):
+            return mock_bot
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    with patch("notification_routing.verify_bot_identity_live", mock_get_me), \
+         patch("telegram_client.create_telegram_bot", return_value=MockBotContext()):
+        with pytest.raises(RuntimeError) as exc_info:
+            await run_single_instance_worker("max_id519010411655_bot_new", live_send=True)
+
+        err_msg = str(exc_info.value)
+        assert "DELIVERY CRITERION FAILED" in err_msg
+        rep = getattr(exc_info.value, "report", None)
+        assert rep is not None
+        assert rep["delivery_criterion_met"] is False
+        assert rep["status"] == "partial_delivery_failure"
+        assert len(rep["recipient_results"]) >= 2
+        # Check first succeeded and second failed
+        assert rep["recipient_results"][0]["success"] is True
+        assert rep["recipient_results"][0]["message_id"] == 1001
+        assert rep["recipient_results"][1]["success"] is False
+        assert "Simulated Telegram delivery failure" in rep["recipient_results"][1]["error"]
+
+
+@pytest.mark.asyncio
+async def test_negative_telegram_api_failure_handled(monkeypatch):
+    """
+    Verify that when Telegram API fails for all recipients, the error reason
+    is captured per recipient and delivery criterion rejection is triggered.
+    """
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_autobusbusbot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8346799080:AAValidTokenPrefix12345")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/psy5d2_db")
+
+    mock_get_me = AsyncMock(return_value={"verified": True, "id": 8346799080, "username": "autobusbusbot"})
+
+    mock_bot = MagicMock()
+    mock_bot.id = 8346799080
+    mock_bot.send_message = AsyncMock(side_effect=Exception("Telegram 502 Bad Gateway"))
+
+    class MockBotContext:
+        async def __aenter__(self):
+            return mock_bot
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    with patch("notification_routing.verify_bot_identity_live", mock_get_me), \
+         patch("telegram_client.create_telegram_bot", return_value=MockBotContext()):
+        with pytest.raises(RuntimeError) as exc_info:
+            await run_single_instance_worker("tg_autobusbusbot_new", live_send=True)
+
+        assert "DELIVERY CRITERION FAILED" in str(exc_info.value)
+        rep = getattr(exc_info.value, "report", None)
+        assert rep is not None
+        assert rep["delivery_criterion_met"] is False
+        for res in rep["recipient_results"]:
+            assert res["success"] is False
+            assert "Telegram 502 Bad Gateway" in res["error"]
+
+
+def test_database_engine_process_isolation():
+    """
+    Verify that distinct child processes create completely independent SQLAlchemy
+    engines based on their individual DATABASE_URL, with different PIDs and memory spaces.
+    Demonstrates that in-process mutation fails to switch engines, whereas child processes succeed.
+    """
+    script = (
+        "import os, sys, json; "
+        "import database; "
+        "print(json.dumps({'pid': os.getpid(), 'db_url': str(database.engine.url)}))"
+    )
+
+    env1 = os.environ.copy()
+    env1["DATABASE_URL"] = "postgresql+asyncpg://user:pass@localhost:5432/yourself_way_db"
+    res1 = subprocess.run([sys.executable, "-c", script], env=env1, capture_output=True, text=True)
+    assert res1.returncode == 0, f"Process 1 failed: {res1.stderr}"
+    data1 = json.loads(res1.stdout.strip().splitlines()[-1])
+
+    env2 = os.environ.copy()
+    env2["DATABASE_URL"] = "postgresql+asyncpg://user:pass@localhost:5432/veraveda_db"
+    res2 = subprocess.run([sys.executable, "-c", script], env=env2, capture_output=True, text=True)
+    assert res2.returncode == 0, f"Process 2 failed: {res2.stderr}"
+    data2 = json.loads(res2.stdout.strip().splitlines()[-1])
+
+    # Distinct processes
+    assert data1["pid"] != data2["pid"]
+    # Distinct engine configurations bound to respective databases
+    assert "yourself_way_db" in data1["db_url"]
+    assert "veraveda_db" in data2["db_url"]
+    assert data1["db_url"] != data2["db_url"]
