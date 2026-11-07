@@ -472,7 +472,8 @@ async def apply_promo_code(client: MaxApiClient, states: StateStore, chat_id: in
             f"🎁 Активирован промокод «{promo.code}»\n"
             f"Пользователь: {user_ref_pc} (MAX)\n"
             f"Скидка: {promo.discount_percent}%\n"
-            f"Дней: {promo.free_days}"
+            f"Дней: {promo.free_days}",
+            category="user_event",
         )
 
     await states.clear(user_id)
@@ -515,7 +516,8 @@ async def set_renewal(client: MaxApiClient, chat_id: int, user_id: int, enabled:
                 f"🔕 Пользователь отключил автопродление\n"
                 f"Пользователь: {user_ref_cr} (MAX)\n"
                 f"Тариф: {plan_name_cr}\n"
-                f"Подписка до: {end_date_msk_cr} МСК"
+                f"Подписка до: {end_date_msk_cr} МСК",
+                category="payment",
             )
         await session.commit()
     await show_subscription_info(client, chat_id, user_id)
@@ -671,7 +673,8 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                 await notify_telegram_admins(
                     f"🚫 Автопродление отключено (Robokassa, MAX)\n"
                     f"Пользователь: {user_ref}\n"
-                    f"Провайдер: Robokassa"
+                    f"Провайдер: Robokassa",
+                    category="payment",
                 )
                 await client.send_message(
                     chat_id=chat_id,
@@ -701,7 +704,8 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                     await notify_telegram_admins(
                         f"🚫 Автопродление отключено (3 попытки Robokassa, MAX)\n"
                         f"Пользователь: {user_ref}\n"
-                        f"Провайдер: Robokassa"
+                        f"Провайдер: Robokassa",
+                        category="payment",
                     )
                     await client.send_message(
                         chat_id=chat_id,
@@ -792,7 +796,8 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                             f"Попытка (Attempt ID): {rec_details.get('attempt_id')}\n"
                             f"ID подписки: {rec_details.get('subscription_id')}\n"
                             f"Тариф (Plan ID): {rec_details.get('paid_plan_id') or rec_details.get('plan_id')}\n"
-                            f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                            f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора.",
+                            category="payment",
                         )
                         await client.send_message(
                             chat_id=chat_id,
@@ -813,7 +818,8 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                             f"Текущий тариф: {curr_name} (ID {rec_details.get('current_plan_id')})\n"
                             f"Сумма: {charge_amount:.2f} руб\n"
                             f"PayId: {res.payment_id}\n"
-                            f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора."
+                            f"Действие: подписка НЕ продлена автоматически. Требуется ручное решение администратора.",
+                            category="payment",
                         )
                         await client.send_message(
                             chat_id=chat_id,
@@ -839,7 +845,8 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                     f"Тариф: {plan_to_charge.name}\n"
                     f"Сумма: {final_price:.2f} руб\n"
                     f"До: {format_msk(end_date_ref)} МСК\n"
-                    f"PayId: {res.payment_id}"
+                    f"PayId: {res.payment_id}",
+                    category="payment",
                 )
                 await show_subscription_info(client, chat_id, user_id)
                 return
@@ -893,7 +900,8 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                 await notify_telegram_admins(
                     f"🚫 Автопродление отключено (карта недоступна в YooKassa, MAX)\n"
                     f"Пользователь: {user_ref}\n"
-                    f"Провайдер: Yookassa"
+                    f"Провайдер: Yookassa",
+                    category="payment",
                 )
                 await client.send_message(
                     chat_id=chat_id,
@@ -925,7 +933,8 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                     f"Тариф: {plan_to_charge.name}\n"
                     f"AttemptId: {attempt.id}\n"
                     f"Причина: {res.failure_reason or 'missing_or_corrupt_payload'}\n"
-                    f"Автопродление приостановлено."
+                    f"Автопродление приостановлено.",
+                    category="payment",
                 )
                 await client.send_message(
                     chat_id=chat_id,
@@ -1039,7 +1048,8 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                     await notify_telegram_admins(
                         f"⚠️ Автопродление приостановлено (неизвестная причина отмены YooKassa, MAX)\n"
                         f"Пользователь: {user_ref}\nТариф: {plan_to_charge.name}\n"
-                        f"PayId: {res.payment_id}\nПричина: {res.failure_reason or 'не указана'}"
+                        f"PayId: {res.payment_id}\nПричина: {res.failure_reason or 'не указана'}",
+                        category="payment",
                     )
                     await client.send_message(
                         chat_id=chat_id,
@@ -1055,7 +1065,8 @@ async def handle_max_manual_retry(client: MaxApiClient, chat_id: int, user_id: i
                     await notify_telegram_admins(
                         f"🚫 Автопродление отключено (3 попытки YooKassa, MAX)\n"
                         f"Пользователь: {user_ref}\n"
-                        f"Провайдер: Yookassa"
+                        f"Провайдер: Yookassa",
+                        category="payment",
                     )
                     await client.send_message(
                         chat_id=chat_id,

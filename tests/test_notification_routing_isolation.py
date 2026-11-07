@@ -611,3 +611,153 @@ def test_validate_process_notification_configuration_diagnostic():
         assert report["token_status"] == "VALID"
         # Ensure secret value is NOT in report dict
         assert dummy_token not in str(report)
+
+
+# -----------------------------------------------------------------------------
+# 4. END-TO-END EXACT INCIDENT REPRODUCTION & VERIFICATION
+# -----------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_e2e_reproduce_incident_november_7_and_verify_correct_routing():
+    """
+    Exact end-to-end replay of the incident on 07.11.2026:
+    1. MAX bot max_id519010411655_bot_new activates promo code PODAROK for MAX user 100074367460 (Maria).
+    2. Deepseek AI timeout error occurs for MAX user 100026905347.
+    3. Legacy config.ini is present with Autobus token.
+    4. Even if stale PM2 environment initially lacked BOT_TOKEN,
+       the system resolves via runtime.env / companion configuration.
+
+    Guarantees:
+    - Sent strictly via @yourself_way_bot (ID: 8481853696).
+    - ZERO messages sent via Autobus (ID: 8346799080).
+    - ZERO messages sent to MAX user IDs (>= 100_000_000_000).
+    - Error alert header displays 'Бот: id519010411655_bot', NOT 'tgpsychobot'.
+    """
+    from max_messenger_bot.services.common import notify_telegram_admins
+    from error_reporting import send_terminal_ai_failure_alert
+
+    recording_session = RecordingSession()
+    yourself_token = "8481853696:AAF_YOURSELF_WAY_CANONICAL_PROD_TOKEN"
+    autobus_token = "8346799080:AAF_AUTOBUS_CONTAMINATED_LEGACY_TOKEN"
+
+    with patch.dict(os.environ, {
+        "PM2_APP_NAME": "max_id519010411655_bot_new",
+        "MAX_BOT_NAME": "id519010411655_bot",
+        "COMPANION_TELEGRAM_BOT_TOKEN": yourself_token,
+        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": yourself_token,
+        # Even if legacy Autobus token lingers in some other env key:
+        "LEGACY_AUTOBUS_TOKEN": autobus_token,
+    }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
+
+        # 1. Dispatch promo code notification (exact message from incident)
+        promo_text = (
+            "🎁 Активирован промокод «PODAROK»\n"
+            "Пользователь: Мария [id=<code>74367460</code>] (MAX)\n"
+            "Скидка: 0%\n"
+            "Дней: 1"
+        )
+        deliv1 = await notify_telegram_admins(promo_text, category="user_event")
+        assert deliv1 is True
+
+        # 2. Dispatch AI error notification (exact message from incident)
+        deliv2 = await send_terminal_ai_failure_alert(
+            bot=None,
+            platform="max",
+            user_id=100026905347,
+            classification="timeout",
+            primary_provider="Deepseek",
+            primary_model="deepseek-v4-flash",
+            fallback_provider="Deepseek",
+            fallback_model="deepseek-flash",
+            error_type="AIServiceError",
+            error_message="Fallback AI provider Deepseek timed out after 30.0s",
+            ai_log_ids=[3466, 3467],
+        )
+        assert deliv2 is True
+
+    # VERIFY EXACT TRANSPORT BEHAVIOR
+    assert len(recording_session.requests) > 0, "Requests must be delivered"
+
+    for token, bot_id, method in recording_session.requests:
+        # A) Cryptographic bot identity: MUST be yourself_way_bot, NEVER Autobus
+        assert bot_id == 8481853696, f"Bot ID {bot_id} is not yourself_way_bot (8481853696)"
+        assert bot_id != 8346799080, "CRITICAL: Notification must NEVER use Autobus bot ID!"
+        assert token == yourself_token
+        assert token != autobus_token
+
+        # B) Recipient isolation: chat_id must be a Telegram admin, NEVER a MAX user ID
+        target_chat_id = int(method.chat_id)
+        assert target_chat_id < 100_000_000_000, f"Chat ID {target_chat_id} is a MAX user ID!"
+        assert target_chat_id in DEFAULT_TELEGRAM_OWNER_IDS["tg_yourself_way_bot_new"]
+
+        # C) Content verification
+        if "PODAROK" in method.text:
+            assert "74367460" in method.text
+        if "Сбой ИИ" in method.text:
+            assert "id519010411655_bot" in method.text
+            assert "tgpsychobot" not in method.text
+            assert "100026905347" in method.text
+
+
+@pytest.mark.asyncio
+async def test_verify_bot_identity_live_matches_getme_and_catches_mismatch():
+    """verify_bot_identity_live accurately checks getMe without leaking secrets."""
+    from notification_routing import verify_bot_identity_live, RoutingError
+
+    class MockAiogramBot:
+        def __init__(self, bot_id: int, username: str):
+            self.id = bot_id
+            self.username = username
+        async def get_me(self):
+            return User(id=self.id, is_bot=True, first_name="MockBot", username=self.username)
+
+    # 1. Matching identity passes
+    valid_bot = MockAiogramBot(8481853696, "yourself_way_bot")
+    res = await verify_bot_identity_live(
+        valid_bot,
+        expected_username="yourself_way_bot",
+        expected_id=8481853696,
+    )
+    assert res["verified"] is True
+    assert res["id"] == 8481853696
+    assert res["username"] == "yourself_way_bot"
+
+    # 2. Mismatched ID raises RoutingError
+    with pytest.raises(RoutingError, match="Bot identity mismatch: getMe returned ID 8481853696, expected 8346799080"):
+        await verify_bot_identity_live(
+            valid_bot,
+            expected_username="yourself_way_bot",
+            expected_id=8346799080,  # Expected Autobus!
+        )
+
+    # 3. Mismatched username raises RoutingError
+    with pytest.raises(RoutingError, match="Bot identity mismatch: getMe returned @yourself_way_bot, expected @autobusbusbot"):
+        await verify_bot_identity_live(
+            valid_bot,
+            expected_username="autobusbusbot",
+            expected_id=8481853696,
+        )
+
+
+@pytest.mark.asyncio
+async def test_audit_database_get_all_admin_ids_filters_max_ids():
+    """
+    database.get_all_admin_ids and get_all_telegram_admin_ids MUST NEVER return MAX user IDs.
+    """
+    from database import get_all_admin_ids, get_all_telegram_admin_ids
+
+    # Environment contains mixed IDs: MAX owners + Telegram owner
+    with patch.dict(os.environ, {
+        "OWNER_IDS": "100263465646,100005511792,272982544,806750628",
+    }, clear=True):
+        admin_ids = await get_all_admin_ids()
+        telegram_admin_ids = await get_all_telegram_admin_ids()
+
+        assert 272982544 in admin_ids
+        assert 806750628 in admin_ids
+        assert 100263465646 not in admin_ids
+        assert 100005511792 not in admin_ids
+
+        assert admin_ids == telegram_admin_ids
+        for aid in admin_ids:
+            assert 0 < aid < 100_000_000_000

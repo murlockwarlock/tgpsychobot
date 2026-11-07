@@ -15,19 +15,11 @@ LEGACY_CONFIG_PATH = PROJECT_ROOT / "config.ini"
 
 def apply_legacy_env_defaults() -> None:
     """
-    The legacy project keeps runtime configuration in env vars.
-    NOTE: BOT_TOKEN is strictly NEVER backfilled from config.ini to prevent
-    accidental cross-bot routing contamination.
+    Legacy helper maintained for backward compatibility.
+    Strictly does NOT backfill BOT_TOKEN, DATABASE_URL, or OWNER_IDS from legacy config.ini
+    to prevent accidental cross-bot, cross-database, or cross-admin contamination.
     """
-    parser = configparser.ConfigParser()
-    if LEGACY_CONFIG_PATH.exists():
-        parser.read(LEGACY_CONFIG_PATH, encoding="utf-8")
-
-    # Explicitly do NOT set BOT_TOKEN from config.ini
-    if "DATABASE_URL" not in os.environ:
-        os.environ["DATABASE_URL"] = parser.get("database", "url", fallback="")
-    if "OWNER_IDS" not in os.environ:
-        os.environ["OWNER_IDS"] = parser.get("bot", "owner_ids", fallback="")
+    pass
 
 
 @dataclass(frozen=True)

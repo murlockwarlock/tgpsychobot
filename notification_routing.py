@@ -381,6 +381,7 @@ async def resolve_target_admin_ids(
 
     # 4. Check database users with is_admin=True (filtered)
     try:
+        from sqlalchemy import select
         from database import User, async_session_maker
 
         async def _query_db_admins(s: Any) -> set[int]:
@@ -541,25 +542,6 @@ async def send_admin_notification(
             )
             return False
 
-        # For user/payment notifications, check SubscriptionConfig
-        if category in (EventCategory.USER_EVENT, EventCategory.PAYMENT):
-            try:
-                from database import SubscriptionConfig, async_session_maker
-
-                async def _check_enabled(s: Any) -> bool:
-                    cfg = await s.get(SubscriptionConfig, 1)
-                    return bool(cfg and cfg.notifications_enabled)
-
-                if session is not None:
-                    if not await _check_enabled(session):
-                        return False
-                else:
-                    async with async_session_maker() as s:
-                        if not await _check_enabled(s):
-                            return False
-            except Exception as exc:
-                logger.debug("[Notification Routing] SubscriptionConfig check failed (continuing): %s", exc)
-
         # Dispatch via verified Aiogram Bot
         from telegram_client import create_telegram_bot
 
@@ -650,3 +632,52 @@ def validate_process_notification_configuration() -> dict[str, Any]:
         admin_count,
     )
     return res
+
+
+async def verify_bot_identity_live(
+    bot_or_token: Any,
+    *,
+    expected_username: str | None = None,
+    expected_id: int | None = None,
+) -> dict[str, Any]:
+    """
+    Safely verify live Telegram bot identity via getMe without exposing token secrets.
+
+    Guarantees:
+    - Validates bot ID and username against expected values.
+    - Raises RoutingError if identity does not match.
+    - Diagnostic output contains only public username and ID, never raw secrets.
+    """
+    from telegram_client import create_telegram_bot
+
+    if isinstance(bot_or_token, str):
+        bot_ctx = create_telegram_bot(bot_or_token)
+    else:
+        bot_ctx = bot_or_token
+
+    async def _inspect(bot: Any) -> dict[str, Any]:
+        me = await bot.get_me()
+        clean_user = (me.username or "").lstrip("@").lower()
+        if expected_id is not None and me.id != expected_id:
+            raise RoutingError(
+                f"Bot identity mismatch: getMe returned ID {me.id}, expected {expected_id}"
+            )
+        if expected_username is not None:
+            clean_expected = expected_username.lstrip("@").lower()
+            if clean_user != clean_expected:
+                raise RoutingError(
+                    f"Bot identity mismatch: getMe returned @{me.username}, expected @{expected_username}"
+                )
+        return {
+            "verified": True,
+            "id": me.id,
+            "username": me.username,
+            "is_bot": bool(me.is_bot),
+        }
+
+    if hasattr(bot_ctx, "__aenter__"):
+        async with bot_ctx as bot:
+            return await _inspect(bot)
+    else:
+        return await _inspect(bot_ctx)
+
