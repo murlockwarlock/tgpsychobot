@@ -521,6 +521,9 @@ def validate_runtime_env(
             key = entry[field]
             if not environment.get(key) and not allow_legacy:
                 errors.append(f"missing_runtime_secret:{key}")
+        companion_token_env = entry.get("companion_token_env")
+        if companion_token_env and not environment.get(companion_token_env) and not allow_legacy:
+            errors.append(f"missing_runtime_secret:{companion_token_env}")
     return errors
 
 
@@ -577,6 +580,7 @@ def runtime_rows(
                     "database": entry["database"],
                     "token_env": entry["token_env"],
                     "token_fingerprint": None,
+                    "bot_instance_id": None,
                     "identity": "missing_process",
                     "runtime_process": None,
                 }
@@ -609,17 +613,49 @@ def runtime_rows(
         if actual_database and database_name(actual_database) != entry["database"]:
             errors.append(f"database_name_mismatch:{process_name}")
 
+        expected_instance_id = entry.get("bot_instance_id") or entry["pm2_name"]
+        actual_instance_id = env.get("BOT_INSTANCE_ID")
+        if not allow_legacy and not migration_aware:
+            if not actual_instance_id:
+                errors.append(f"missing_process_instance_id:{process_name}")
+            elif actual_instance_id != expected_instance_id:
+                errors.append(f"bot_instance_id_mismatch:{process_name}")
+        elif actual_instance_id and actual_instance_id != expected_instance_id:
+            errors.append(f"bot_instance_id_mismatch:{process_name}")
+
+        if entry["platform"] == "max":
+            companion_token_env = entry.get("companion_token_env")
+            if companion_token_env:
+                canonical_companion_token = environment.get(companion_token_env)
+                actual_companion_token = env.get("COMPANION_TELEGRAM_BOT_TOKEN")
+                if not allow_legacy and not migration_aware:
+                    if not canonical_companion_token:
+                        errors.append(f"missing_runtime_secret:{companion_token_env}")
+                    if not actual_companion_token:
+                        errors.append(f"missing_process_companion_token:{process_name}")
+                if canonical_companion_token and actual_companion_token and canonical_companion_token != actual_companion_token:
+                    errors.append(f"companion_token_mismatch:{process_name}")
+
         identity = "not_requested"
-        if identity_check and actual_token:
-            identity_result = verify_identity(entry, actual_token, environment)
-            identity = identity_result["status"]
-            if identity == "mismatch":
-                errors.append(f"identity_mismatch:{process_name}")
+        if identity_check:
+            if not actual_token:
+                identity = "missing_token"
+                errors.append(f"identity_missing_token:{process_name}")
+            else:
+                identity_result = verify_identity(entry, actual_token, environment)
+                identity = identity_result["status"]
+                if identity == "mismatch":
+                    errors.append(f"identity_mismatch:{process_name}")
+                elif identity == "unavailable":
+                    errors.append(f"identity_unavailable:{process_name}")
+                elif identity != "verified":
+                    errors.append(f"identity_error:{process_name}")
         rows.append(
             {
                 "platform": entry["platform"],
                 "username": entry["username"],
                 "pm2_name": name,
+                "bot_instance_id": actual_instance_id,
                 "database": entry["database"],
                 "token_env": entry["token_env"],
                 "token_fingerprint": fingerprint_token(actual_token),
@@ -670,7 +706,9 @@ def runtime_rows(
 
 
 def print_rows(rows: list[dict[str, Any]]) -> None:
-    print("platform\tusername\tpm2_name\tdatabase\ttoken_env\ttoken_fingerprint\tidentity")
+    print(
+        "platform\tusername\tpm2_name\tinstance_id\tdatabase\ttoken_env\ttoken_fingerprint\tidentity"
+    )
     for row in rows:
         print(
             "\t".join(
@@ -679,6 +717,7 @@ def print_rows(rows: list[dict[str, Any]]) -> None:
                     "platform",
                     "username",
                     "pm2_name",
+                    "bot_instance_id",
                     "database",
                     "token_env",
                     "token_fingerprint",

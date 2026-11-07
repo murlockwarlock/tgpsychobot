@@ -222,23 +222,31 @@ async def require_media_collection_admin(
     return False
 
 
-async def notify_telegram_admins(text: str) -> None:
-    import os
-    bot_token = os.getenv("BOT_TOKEN")
-    if bot_token:
-        from database import get_all_admin_ids, SubscriptionConfig
-        
-        async with async_session_maker() as session:
-            config = await session.get(SubscriptionConfig, 1)
-            if not config or not config.notifications_enabled:
-                return
-
-        async with create_telegram_bot(bot_token) as bot:
-            for admin_id in await get_all_admin_ids():
-                try:
-                    await bot.send_message(admin_id, text, parse_mode="HTML")
-                except Exception:
-                    pass
+async def notify_telegram_admins(
+    text: str,
+    category: Any = "user_event",
+) -> bool:
+    """
+    Deliver administrative notifications strictly using isolated routing.
+    Routes MAX bot events to its companion Telegram bot and verified Telegram admins.
+    Never sends via foreign bots (e.g. Autobus) and never raises unhandled exceptions.
+    """
+    try:
+        from notification_routing import send_admin_notification, EventCategory
+        if isinstance(category, EventCategory):
+            cat = category
+        elif str(category).lower() == "payment":
+            cat = EventCategory.PAYMENT
+        elif str(category).lower() == "ai_error":
+            cat = EventCategory.AI_ERROR
+        elif str(category).lower() == "system_diagnostic":
+            cat = EventCategory.SYSTEM_DIAGNOSTIC
+        else:
+            cat = EventCategory.USER_EVENT
+        return await send_admin_notification(text, category=cat)
+    except Exception as exc:
+        log.error("Failed to route admin notification: %s", exc)
+        return False
 
 
 async def ensure_user(

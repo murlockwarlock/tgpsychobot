@@ -693,32 +693,25 @@ def extract_error_metadata(
 
 
 async def _dispatch_admin_alert_text(bot: Bot | None, text: str) -> bool:
-    """Best-effort alert delivery to all configured administrators."""
+    """Best-effort alert delivery to configured administrators using isolated routing."""
     try:
-        admin_ids = await get_all_admin_ids()
-        if not admin_ids:
-            return False
-
         if bot is not None:
+            admin_ids = await get_all_admin_ids()
+            if not admin_ids:
+                return False
+            delivered = False
             for admin_id in admin_ids:
-                try:
-                    await bot.send_message(admin_id, text, parse_mode="HTML")
-                except Exception as exc:
-                    logging.getLogger(__name__).error("Failed to send admin alert to %s: %s", admin_id, exc)
-            return True
+                if isinstance(admin_id, int) and 0 < admin_id < 100_000_000_000:
+                    try:
+                        await bot.send_message(admin_id, text, parse_mode="HTML")
+                        delivered = True
+                    except Exception as exc:
+                        logging.getLogger(__name__).error("Failed to send admin alert to %s: %s", admin_id, exc)
+            return delivered
 
-        bot_token = os.getenv("BOT_TOKEN")
-        if not bot_token:
-            return False
-
-        from telegram_client import create_telegram_bot
-        async with create_telegram_bot(bot_token) as t_bot:
-            for admin_id in admin_ids:
-                try:
-                    await t_bot.send_message(admin_id, text, parse_mode="HTML")
-                except Exception as exc:
-                    logging.getLogger(__name__).error("Failed to send admin alert to %s: %s", admin_id, exc)
-            return True
+        # Bot is None (e.g. running inside MAX bot process or background worker)
+        from notification_routing import send_admin_notification, EventCategory
+        return await send_admin_notification(text, category=EventCategory.AI_ERROR)
     except Exception as exc:
         logging.getLogger(__name__).error("Admin alert delivery failed: %s", exc)
         return False
@@ -772,7 +765,23 @@ async def send_terminal_ai_failure_alert(
     error_message = error_message or details
 
     platform_norm = "MAX" if platform and platform.lower() == "max" else "Telegram"
-    b_name = bot_name or os.getenv("BOT_NAME") or os.getenv("BOT_USERNAME") or "tgpsychobot"
+    detected_bot_name = None
+    if platform_norm == "MAX":
+        try:
+            from notification_routing import detect_current_instance
+            _inst = detect_current_instance()
+            if _inst and _inst.get("username"):
+                detected_bot_name = _inst["username"]
+        except Exception:
+            pass
+    b_name = (
+        bot_name
+        or os.getenv("MAX_BOT_NAME")
+        or os.getenv("BOT_NAME")
+        or os.getenv("BOT_USERNAME")
+        or detected_bot_name
+        or "tgpsychobot"
+    )
     cls_str = classification or "provider_failure"
     primary_p = primary_provider or "primary"
     fb_p = fallback_provider or "none"
@@ -875,7 +884,23 @@ async def send_output_budget_exhausted_alert(
         platform = getattr(user, "platform", platform) or platform
 
     platform_norm = "MAX" if platform and platform.lower() == "max" else "Telegram"
-    b_name = bot_name or os.getenv("BOT_NAME") or os.getenv("BOT_USERNAME") or "tgpsychobot"
+    detected_bot_name = None
+    if platform_norm == "MAX":
+        try:
+            from notification_routing import detect_current_instance
+            _inst = detect_current_instance()
+            if _inst and _inst.get("username"):
+                detected_bot_name = _inst["username"]
+        except Exception:
+            pass
+    b_name = (
+        bot_name
+        or os.getenv("MAX_BOT_NAME")
+        or os.getenv("BOT_NAME")
+        or os.getenv("BOT_USERNAME")
+        or detected_bot_name
+        or "tgpsychobot"
+    )
 
     if request_type == "vision":
         fingerprint = f"vision:{b_name}:{provider}:{model}:output_budget_exhausted"

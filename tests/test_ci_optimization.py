@@ -102,7 +102,8 @@ def test_verify_collection_coverage_discrepancy_protection():
     shards = get_shards(total_shards=3, tests_dir="tests")
     ok, msg = verify_collection_coverage(shards, tests_dir="tests")
     assert ok is True
-    assert "All 136 test files from pytest collection are partitioned" in msg
+    total_files = sum(len(s) for s in shards)
+    assert f"All {total_files} test files from pytest collection are partitioned" in msg
 
     # Simulate discrepancy: omit one shard
     incomplete_shards = [shards[0], shards[1], []]

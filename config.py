@@ -3,9 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-if not BOT_TOKEN:
-    raise ValueError("Не задана переменная окружения BOT_TOKEN")
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
 if not DATABASE_URL:

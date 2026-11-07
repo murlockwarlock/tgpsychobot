@@ -792,11 +792,20 @@ class RandomMessage(Base):
     category = Column(String, default="default")
 
 
-async def get_all_admin_ids() -> set:
+async def get_all_admin_ids() -> set[int]:
     """OWNER_IDS из env + все is_admin=True из БД."""
-    from config import OWNER_IDS
+    import os
     from sqlalchemy import select
-    all_ids = set(OWNER_IDS)
+    from config import OWNER_IDS
+    raw_env_owners = os.environ.get('OWNER_IDS')
+    if raw_env_owners is not None:
+        try:
+            owners = [int(x.strip()) for x in raw_env_owners.split(',') if x.strip()]
+        except Exception:
+            owners = OWNER_IDS
+    else:
+        owners = OWNER_IDS
+    all_ids = set(owners)
     try:
         async with async_session_maker() as session:
             result = await session.execute(select(User.id).where(User.is_admin == True))
@@ -804,6 +813,12 @@ async def get_all_admin_ids() -> set:
     except Exception:
         pass
     return all_ids
+
+
+async def get_all_telegram_admin_ids() -> set[int]:
+    """Все подтверждённые Telegram admin IDs (0 < id < 100_000_000_000, исключая MAX IDs)."""
+    raw_ids = await get_all_admin_ids()
+    return {uid for uid in raw_ids if isinstance(uid, int) and 0 < uid < 100_000_000_000}
 
 
 def _migrate_deepseek_models(sync_conn) -> None:

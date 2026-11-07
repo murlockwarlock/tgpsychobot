@@ -1,3 +1,32 @@
+const fs = require("fs");
+const path = require("path");
+
+// Safely load canonical runtime secrets if available so PM2 restarts/reloads
+// outside an interactive sourced shell always retain instance tokens.
+const runtimeEnvFile = process.env.PROD_RUNTIME_ENV || "/root/telegram_bots/runtime.env";
+if (fs.existsSync(runtimeEnvFile)) {
+  try {
+    const rawEnv = fs.readFileSync(runtimeEnvFile, "utf-8");
+    for (const rawLine of rawEnv.split("\n")) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const eqIdx = line.indexOf("=");
+      if (eqIdx > 0) {
+        const key = line.slice(0, eqIdx).trim();
+        let val = line.slice(eqIdx + 1).trim();
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.slice(1, -1);
+        }
+        if (!process.env[key]) {
+          process.env[key] = val;
+        }
+      }
+    }
+  } catch (err) {
+    // Ignore read errors
+  }
+}
+
 const PM2_LOG_DIR = `${process.env.PM2_HOME || "/root/.pm2"}/logs`;
 const GEMINI_PROXY = process.env.GEMINI_PROXY || "";
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || "";
@@ -275,7 +304,7 @@ const apps = [
     interpreter: "/root/telegram_bots/venv/bin/python",
     env: {
       "BOT_TOKEN": process.env.TELEGRAM_YOURSELF_WAY_BOT_TOKEN || "",
-      "OWNER_IDS": "979514796,272982544,806750628,1372041348,100263465646,100005511792,100178646155",
+      "OWNER_IDS": "979514796,272982544,806750628,1372041348",
       "DATABASE_URL": process.env.TELEGRAM_YOURSELF_WAY_BOT_DATABASE_URL || "",
       "SERVER_IP": "77.91.112.200",
       "APP_PORT": 8098,
@@ -296,6 +325,7 @@ const apps = [
     env: {
       "MAX_BOT_TOKEN": process.env.MAX_SE13639182_BOT_TOKEN || "",
       "BOT_TOKEN": process.env.TELEGRAM_VERAVEDA777_BOT_TOKEN || "",
+      "COMPANION_TELEGRAM_BOT_TOKEN": process.env.TELEGRAM_VERAVEDA777_BOT_TOKEN || "",
       "DATABASE_URL": process.env.MAX_SE13639182_BOT_DATABASE_URL || "",
       "OWNER_IDS": "100263465646,100005511792,100178646155",
       "MAX_USE_POLLING": "1",
@@ -315,6 +345,7 @@ const apps = [
     env: {
       "MAX_BOT_TOKEN": process.env.MAX_ID519010411655_BOT_TOKEN || "",
       "BOT_TOKEN": process.env.TELEGRAM_YOURSELF_WAY_BOT_TOKEN || "",
+      "COMPANION_TELEGRAM_BOT_TOKEN": process.env.TELEGRAM_YOURSELF_WAY_BOT_TOKEN || "",
       "DATABASE_URL": process.env.MAX_ID519010411655_BOT_DATABASE_URL || "",
       "OWNER_IDS": "100263465646,100005511792,100178646155",
       "MAX_USE_POLLING": "1",
@@ -326,6 +357,10 @@ const apps = [
 ];
 
 apps.forEach(app => {
+  app.env = app.env || {};
+  if (app.name) {
+    app.env.BOT_INSTANCE_ID = app.name;
+  }
   if (GEMINI_PROXY) {
     app.env.GEMINI_PROXY = GEMINI_PROXY;
   }

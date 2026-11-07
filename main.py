@@ -166,6 +166,15 @@ def setup_scheduler(
 
 async def on_startup(bot: Bot, dispatcher: Dispatcher):
     logging.info("Configuring startup...")
+    try:
+        from notification_routing import validate_process_notification_configuration_async
+        is_test_env = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        skip_requested = os.environ.get("SKIP_LIVE_BOT_VERIFICATION") == "1"
+        verify_live = not (skip_requested and is_test_env)
+        await validate_process_notification_configuration_async(fail_closed=True, verify_live=verify_live)
+    except Exception as exc:
+        logging.critical("Live notification configuration check failed: %s", exc)
+        raise
     await init_db()
     try:
         await refresh_translation_cache(async_session_maker)
@@ -410,6 +419,13 @@ def main():
     if not os.environ.get('SERVER_IP'):
         logging.critical("SERVER_IP не задан. Остановка.")
         return
+
+    try:
+        from notification_routing import validate_process_notification_configuration
+        validate_process_notification_configuration(fail_closed=True)
+    except Exception as _exc:
+        logging.critical("Notification configuration check failed: %s", _exc)
+        raise
 
     bot = create_telegram_bot(
         BOT_TOKEN,

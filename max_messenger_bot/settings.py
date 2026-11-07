@@ -15,19 +15,11 @@ LEGACY_CONFIG_PATH = PROJECT_ROOT / "config.ini"
 
 def apply_legacy_env_defaults() -> None:
     """
-    The legacy project keeps runtime configuration in env vars.
-    For the isolated MAX app we transparently backfill them from config.ini
-    so database.py can be imported without changing the old code.
+    Legacy helper maintained for backward compatibility.
+    Strictly does NOT backfill BOT_TOKEN, DATABASE_URL, or OWNER_IDS from legacy config.ini
+    to prevent accidental cross-bot, cross-database, or cross-admin contamination.
     """
-    parser = configparser.ConfigParser()
-    parser.read(LEGACY_CONFIG_PATH, encoding="utf-8")
-
-    if "BOT_TOKEN" not in os.environ:
-        os.environ["BOT_TOKEN"] = parser.get("bot", "token", fallback="")
-    if "DATABASE_URL" not in os.environ:
-        os.environ["DATABASE_URL"] = parser.get("database", "url", fallback="")
-    if "OWNER_IDS" not in os.environ:
-        os.environ["OWNER_IDS"] = parser.get("bot", "owner_ids", fallback="")
+    pass
 
 
 @dataclass(frozen=True)
@@ -78,15 +70,9 @@ def validate_webhook_runtime_settings(settings: Settings) -> None:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    parser = configparser.ConfigParser()
-    parser.read(LEGACY_CONFIG_PATH, encoding="utf-8")
-    max_section = "max"
-
-    token = (
-        os.getenv("MAX_BOT_TOKEN")
-        or os.getenv("MAX_TOKEN")
-        or parser.get(max_section, "token", fallback="")
-    ).strip()
+    # Strictly do NOT read tokens, secrets, or bot names from config.ini
+    # All credentials and identity must be provided via explicit environment variables.
+    token = os.getenv("MAX_BOT_TOKEN", "").strip()
 
     webhook_path = os.getenv("MAX_WEBHOOK_PATH", "/max/webhook").strip() or "/max/webhook"
     update_types_raw = os.getenv(
@@ -102,10 +88,7 @@ def get_settings() -> Settings:
         port=int(os.getenv("MAX_APP_PORT", "8090")),
         webhook_path=webhook_path,
         webhook_base_url=os.getenv("MAX_WEBHOOK_BASE_URL", "").rstrip("/"),
-        webhook_secret=os.getenv(
-            "MAX_WEBHOOK_SECRET",
-            parser.get(max_section, "webhook_secret", fallback=""),
-        ).strip(),
+        webhook_secret=os.getenv("MAX_WEBHOOK_SECRET", "").strip(),
         use_polling=os.getenv("MAX_USE_POLLING", "0").lower() in {"1", "true", "yes"},
         polling_timeout=int(os.getenv("MAX_POLL_TIMEOUT", "30")),
         polling_limit=int(os.getenv("MAX_POLL_LIMIT", "50")),
@@ -115,5 +98,5 @@ def get_settings() -> Settings:
         log_dir=os.getenv("MAX_LOG_DIR", str(PROJECT_ROOT / "logs" / "max_messenger_bot")),
         log_max_bytes=max(1024, int(os.getenv("MAX_LOG_MAX_BYTES", str(10 * 1024 * 1024)))),
         log_backup_count=max(1, int(os.getenv("MAX_LOG_BACKUP_COUNT", "5"))),
-        bot_name=os.getenv("MAX_BOT_NAME", parser.get(max_section, "bot_name", fallback="")).strip().lstrip("@"),
+        bot_name=os.getenv("MAX_BOT_NAME", "").strip().lstrip("@"),
     )
