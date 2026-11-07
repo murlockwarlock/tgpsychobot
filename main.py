@@ -166,6 +166,15 @@ def setup_scheduler(
 
 async def on_startup(bot: Bot, dispatcher: Dispatcher):
     logging.info("Configuring startup...")
+    try:
+        from notification_routing import validate_process_notification_configuration_async
+        is_test_env = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        skip_requested = os.environ.get("SKIP_LIVE_BOT_VERIFICATION") == "1"
+        verify_live = not (skip_requested and is_test_env)
+        await validate_process_notification_configuration_async(fail_closed=True, verify_live=verify_live)
+    except Exception as exc:
+        logging.critical("Live notification configuration check failed: %s", exc)
+        raise
     await init_db()
     try:
         await refresh_translation_cache(async_session_maker)

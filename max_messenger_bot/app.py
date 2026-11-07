@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from typing import Any
 
 from aiohttp import web
@@ -3917,25 +3918,71 @@ async def create_web_app() -> web.Application:
     if not settings.max_token:
         raise RuntimeError("MAX_BOT_TOKEN не задан в переменных окружения.")
 
-    # Mandatory fail-closed startup validation: verify routing and companion bot identity
-    from notification_routing import validate_process_notification_configuration_async
-    # In live execution or test suites with mock transport, verify configuration fail-closed
-    verify_live_flag = os.environ.get("SKIP_LIVE_BOT_VERIFICATION") != "1"
+    # Mandatory fail-closed startup validation: verify routing, database and companion bot identity
+    from notification_routing import (
+        detect_current_instance,
+        validate_process_notification_configuration_async,
+        ConfigurationError,
+    )
+    is_test_env = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+    skip_requested = os.environ.get("SKIP_LIVE_BOT_VERIFICATION") == "1"
+    if skip_requested and not is_test_env:
+        log.warning("[Security] SKIP_LIVE_BOT_VERIFICATION is forbidden outside test environments. Enforcing live verification.")
+        verify_live_flag = True
+    else:
+        verify_live_flag = not (skip_requested and is_test_env)
+
     await validate_process_notification_configuration_async(fail_closed=True, verify_live=verify_live_flag)
+
+    current_inst = detect_current_instance()
+    if not current_inst:
+        raise ConfigurationError("Cannot start MAX bot: BOT_INSTANCE_ID is missing or not registered")
 
     await init_db()
     await init_storage()
 
     client = MaxApiClient(settings.max_token, settings.max_api_base)
     await client.__aenter__()
-    if settings.bot_name:
-        client.bot_name = settings.bot_name
+
+    # Live verification of MAX bot identity via client.get_me() with 3 retries
+    if verify_live_flag:
+        max_me = None
+        max_err = None
+        for attempt in range(1, 4):
+            try:
+                max_me = await client.get_me()
+                max_err = None
+                break
+            except Exception as exc:
+                max_err = exc
+                if attempt < 3:
+                    await asyncio.sleep(0.5 * attempt)
+        if max_err is not None or not max_me:
+            raise ConfigurationError(f"Live MAX bot identity verification failed after 3 attempts: {max_err}")
+
+        # Verify platform_id and/or username
+        expected_platform_id = current_inst.get("platform_id")
+        actual_id = max_me.get("user_id") or max_me.get("id")
+        if expected_platform_id and actual_id and int(actual_id) != expected_platform_id:
+            raise ConfigurationError(
+                f"MAX bot ID mismatch: API returned {actual_id}, expected {expected_platform_id} for {current_inst.get('pm2_name')}"
+            )
+        expected_user = current_inst.get("username", "").lstrip("@").lower()
+        actual_user = (max_me.get("username") or max_me.get("name") or "").lstrip("@").lower()
+        if expected_user and actual_user and actual_user != expected_user:
+            raise ConfigurationError(
+                f"MAX bot username mismatch: API returned @{actual_user}, expected @{expected_user} for {current_inst.get('pm2_name')}"
+            )
+        client.bot_name = actual_user or current_inst.get("username")
     else:
-        try:
-            me = await client.get_me()
-            client.bot_name = (me.get("username") or me.get("name") or "").strip().lstrip("@") or None
-        except Exception:
-            max_log.exception("Failed to load MAX bot name for deep links")
+        if settings.bot_name:
+            client.bot_name = settings.bot_name
+        else:
+            try:
+                me = await client.get_me()
+                client.bot_name = (me.get("username") or me.get("name") or "").strip().lstrip("@") or None
+            except Exception:
+                max_log.exception("Failed to load MAX bot name for deep links")
     # Load flags from database
     referral_enabled = False
     topics_enabled = True

@@ -26,6 +26,7 @@ from pathlib import Path
 import re
 from dataclasses import dataclass
 from typing import Any, Sequence
+from urllib.parse import urlparse
 
 logger = logging.getLogger("notification_routing")
 
@@ -33,35 +34,6 @@ ROOT_DIR = Path(__file__).resolve().parent
 REGISTRY_PATH = ROOT_DIR / "config" / "bot_instances.json"
 MAX_USER_ID_THRESHOLD = 100_000_000_000
 TOKEN_PREFIX_RE = re.compile(r"^(\d{6,12}):[A-Za-z0-9_-]{20,}$")
-
-# Canonical Telegram owners per instance (fallback when unpopulated in env)
-DEFAULT_TELEGRAM_OWNER_IDS: dict[str, tuple[int, ...]] = {
-    "tg_autobusbusbot_new": (272982544, 979514796, 806750628),
-    "tg_alena322bot_new": (272982544, 979514796, 806750628),
-    "tg_someonewithyou01_bot_new": (272982544, 979514796, 806750628),
-    "tg_someonewithyou02_bot_new": (272982544, 806750628),
-    "tg_veraveda777_bot_legacy": (979514796, 272982544, 806750628),
-    "tg_someonelikeyouai03_bot_legacy": (272982544, 806750628),
-    "tg_someonelikeyouai04_bot_legacy": (272982544, 806750628),
-    "tg_psy5d_bot_legacy": (272982544, 806750628),
-    "tg_someonelikeyouai_bot_legacy": (272982544, 806750628),
-    "tg_someonelikeyouai02_bot_legacy": (272982544, 806750628),
-    "tg_someonewithyou03_bot_new": (272982544, 979514796, 806750628),
-    "tg_someonelikeyouai05_bot_new": (272982544, 979514796, 806750628),
-    "tg_someonewithyou05_bot_new": (272982544, 979514796, 806750628),
-    "tg_someonewithyou06_bot_new": (272982544, 979514796, 806750628),
-    "tg_someonewithyou04_bot_new": (272982544, 979514796, 806750628),
-    "tg_yourself_way_bot_new": (979514796, 272982544, 806750628, 1372041348),
-    "tg_kontentzavod322bot_fulltest": (272982544, 979514796, 806750628),
-}
-
-# Explicit companion mapping: MAX PM2 / username -> Companion Telegram PM2 name
-MAX_COMPANION_MAPPING: dict[str, str] = {
-    "max_id519010411655_bot_new": "tg_yourself_way_bot_new",
-    "id519010411655_bot": "tg_yourself_way_bot_new",
-    "max_se13639182_bot_legacy": "tg_veraveda777_bot_legacy",
-    "se13639182_bot": "tg_veraveda777_bot_legacy",
-}
 
 SYSTEM_DIAGNOSTIC_BOT_PM2 = "tg_autobusbusbot_new"
 
@@ -185,68 +157,37 @@ def get_instance_by_username(username: str, platform: str | None = None) -> dict
 
 def detect_current_instance() -> dict[str, Any] | None:
     """
-    Detect the active instance context using unambiguous BOT_INSTANCE_ID or PM2 name.
-    Strictly fails closed without guessing if configuration is ambiguous, incomplete, or conflicting.
+    Detect the active instance context strictly from mandatory BOT_INSTANCE_ID.
+    Strictly fails closed without guessing if BOT_INSTANCE_ID is missing or not registered.
     """
-    # 1. Primary contract: BOT_INSTANCE_ID
-    bot_instance_id = os.environ.get("BOT_INSTANCE_ID")
-    if bot_instance_id:
-        inst = get_instance_by_id(bot_instance_id.strip())
-        if inst:
-            return inst
+    bot_instance_id = (os.environ.get("BOT_INSTANCE_ID") or "").strip()
+    if not bot_instance_id:
+        logger.error("[Notification Routing] Mandatory BOT_INSTANCE_ID environment variable is missing or empty")
+        return None
+
+    inst = get_instance_by_id(bot_instance_id)
+    if not inst:
         logger.error("[Notification Routing] Configured BOT_INSTANCE_ID %r not found in registry", bot_instance_id)
         return None
 
-    # 2. PM2 process name contract
-    pm2_name = (
-        os.environ.get("PM2_APP_NAME")
-        or os.environ.get("name")
-        or os.environ.get("APP_NAME")
-    )
-    if pm2_name:
-        inst = get_instance_by_id(pm2_name.strip())
-        if inst:
-            return inst
-        logger.error("[Notification Routing] PM2 process name %r not found in registry", pm2_name)
-        return None
-
-    # 3. Explicit MAX bot name (only for MAX instances)
-    max_bot_name = os.environ.get("MAX_BOT_NAME")
-    if max_bot_name:
-        inst = get_instance_by_username(max_bot_name.strip(), platform="max")
-        if inst:
-            return inst
-
-    # 4. Explicit Telegram bot username (only for Telegram instances)
-    bot_name = os.environ.get("BOT_NAME") or os.environ.get("BOT_USERNAME")
-    if bot_name:
-        inst = get_instance_by_username(bot_name.strip(), platform="telegram")
-        if inst:
-            return inst
-
-    # STRICT: Never guess identity by foreign BOT_TOKEN or DATABASE_URL!
-    return None
+    return inst
 
 
 def resolve_companion_telegram_instance(source_instance: dict[str, Any]) -> dict[str, Any] | None:
     """
-    Resolve the companion Telegram bot instance for a MAX instance.
+    Resolve the companion Telegram bot instance for a MAX instance directly from registry.
     For Telegram instances, returns the instance itself.
-    Strictly fails closed without guessing by shared database, tokens, or usernames.
+    Strictly fails closed without guessing by shared database, tokens, or heuristics.
     """
     platform = source_instance.get("platform")
     if platform == "telegram":
         return source_instance
 
     if platform == "max":
-        comp_id = (
-            source_instance.get("companion_instance")
-            or MAX_COMPANION_MAPPING.get(source_instance.get("pm2_name", ""))
-            or MAX_COMPANION_MAPPING.get(source_instance.get("username", ""))
-        )
+        comp_id = source_instance.get("companion_instance")
         if not comp_id:
             logger.error(
-                "[Notification Routing] MAX instance %s has no explicit companion Telegram bot configured. Refusing to guess.",
+                "[Notification Routing] MAX instance %s has no explicit companion_instance in registry. Refusing to route.",
                 source_instance.get("pm2_name"),
             )
             return None
@@ -340,11 +281,74 @@ def resolve_target_bot_token(
     return None
 
 
+def extract_database_name(db_url: str | None) -> str | None:
+    """Extract database name from a connection URL."""
+    if not db_url or not isinstance(db_url, str):
+        return None
+    cleaned = db_url.strip()
+    if cleaned.startswith("sqlite"):
+        if ":memory:" in cleaned:
+            return ":memory:"
+        parsed = urlparse(cleaned)
+        path = parsed.path
+        if path:
+            return Path(path).stem
+        return "sqlite"
+    parsed = urlparse(cleaned)
+    path = parsed.path.lstrip("/")
+    if path:
+        return path.split("?")[0].split("/")[0]
+    return None
+
+
+def verify_database_identity(
+    instance: dict[str, Any],
+    db_url: str | None = None,
+    *,
+    allow_sqlite_in_tests: bool = True,
+) -> bool:
+    """
+    Verify that the DATABASE_URL matches the configured database for the instance.
+    Refuses mismatched databases to prevent cross-bot data or admin contamination.
+    """
+    expected_db = instance.get("database")
+    if not expected_db:
+        logger.error("[Notification Routing] Instance %s has no configured database", instance.get("pm2_name"))
+        return False
+
+    url = db_url or os.environ.get("DATABASE_URL")
+    if not url:
+        logger.error("[Notification Routing] DATABASE_URL is not set for instance %s", instance.get("pm2_name"))
+        return False
+
+    actual_db = extract_database_name(url)
+    if not actual_db:
+        logger.error("[Notification Routing] Could not parse database name from DATABASE_URL: %s", url)
+        return False
+
+    # In test environments (pytest), allow SQLite in-memory or temporary databases
+    if allow_sqlite_in_tests and (url.startswith("sqlite") or actual_db in {":memory:", "sqlite"}):
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return True
+
+    if actual_db != expected_db:
+        logger.critical(
+            "[Notification Routing] CRITICAL DATABASE MISMATCH: Instance %s expects database %r, but DATABASE_URL points to %r! Refusing access.",
+            instance.get("pm2_name"),
+            expected_db,
+            actual_db,
+        )
+        return False
+
+    return True
+
+
 async def resolve_target_admin_ids(
     target_instance: dict[str, Any],
     *,
     current_instance: dict[str, Any] | None = None,
     session: Any | None = None,
+    db_url: str | None = None,
 ) -> tuple[int, ...]:
     """
     Resolve allowed Telegram admin IDs for the target instance.
@@ -352,19 +356,14 @@ async def resolve_target_admin_ids(
     STRICT GUARANTEES:
     - Filters out all MAX IDs (>= 100_000_000_000).
     - Filters out non-positive IDs.
-    - Resolves strictly from target Telegram instance's configured Telegram owners.
+    - Resolves baseline strictly from target Telegram instance's configured telegram_owner_ids in registry.
     - NEVER includes owner IDs from an unrelated process (e.g. alien IDs in MAX process env).
-    - Supports dynamic database admins (is_admin=True) ONLY if the database matches target instance.
+    - Supports dynamic database admins (is_admin=True) ONLY if the database identity is verified.
     """
     admin_ids: set[int] = set()
     target_pm2 = target_instance.get("pm2_name", "")
 
-    # 1. Authoritative base owners for the target Telegram instance
-    if target_pm2 in DEFAULT_TELEGRAM_OWNER_IDS:
-        for oid in DEFAULT_TELEGRAM_OWNER_IDS[target_pm2]:
-            if is_valid_telegram_user_id(oid):
-                admin_ids.add(oid)
-
+    # 1. Authoritative base owners for the target Telegram instance from registry
     inst_owners = target_instance.get("telegram_owner_ids")
     if isinstance(inst_owners, (list, tuple)):
         for oid in inst_owners:
@@ -388,12 +387,14 @@ async def resolve_target_admin_ids(
                         pass
 
     # 3. Dynamic database admins (User.is_admin == True)
-    # Allowed ONLY if the database is confirmed to match target instance's database
-    target_db = target_instance.get("database")
-    curr_db = current_instance.get("database") if current_instance else None
-    db_matches = bool(target_db and curr_db and target_db == curr_db) or (curr_pm2 == target_pm2)
-
-    if db_matches:
+    # Allowed ONLY if the database identity is verified to match target instance's database
+    db_verified = verify_database_identity(target_instance, db_url=db_url)
+    if not db_verified:
+        logger.warning(
+            "[Notification Routing] Refusing to query dynamic admins from unverified/mismatched database for %s",
+            target_pm2,
+        )
+    else:
         try:
             from sqlalchemy import select
             from database import User, async_session_maker
@@ -443,7 +444,7 @@ def resolve_notification_route(
         if not token:
             return None
         # System admin IDs
-        admins = tuple(sorted(DEFAULT_TELEGRAM_OWNER_IDS.get(SYSTEM_DIAGNOSTIC_BOT_PM2, (272982544, 979514796, 806750628))))
+        admins = tuple(sorted(target_inst.get("telegram_owner_ids", (272982544, 979514796, 806750628))))
         return NotificationRoute(
             category=category,
             source_instance=source_inst.get("pm2_name", "system"),
@@ -524,7 +525,7 @@ def resolve_notification_route(
         target_username=target_inst["username"],
         target_platform_id=target_inst["platform_id"],
         target_bot_token=token,
-        admin_chat_ids=DEFAULT_TELEGRAM_OWNER_IDS.get(target_inst["pm2_name"], ()),
+        admin_chat_ids=tuple(sorted(target_inst.get("telegram_owner_ids", ()))),
     )
 
 
@@ -635,11 +636,13 @@ async def verify_bot_identity_live(
     expected_username: str | None = None,
     expected_id: int | None = None,
     use_cache: bool = True,
+    max_retries: int = 3,
 ) -> dict[str, Any]:
     """
     Safely verify live Telegram bot identity via getMe without exposing token secrets.
 
     Guarantees:
+    - Retries getMe up to 3 times on network / transient failures.
     - Validates bot ID and username against expected values.
     - Caches verified results in-memory by token digest.
     - Raises RoutingError if identity does not match.
@@ -669,7 +672,24 @@ async def verify_bot_identity_live(
         bot_ctx = bot_or_token
 
     async def _inspect(bot: Any) -> dict[str, Any]:
-        me = await bot.get_me()
+        last_err: Exception | None = None
+        me = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                me = await bot.get_me()
+                last_err = None
+                break
+            except (RoutingError, ValueError):
+                raise
+            except Exception as exc:
+                last_err = exc
+                if attempt < max_retries:
+                    import asyncio
+                    await asyncio.sleep(0.5 * attempt)
+
+        if last_err is not None or me is None:
+            raise RoutingError(f"Telegram getMe network request failed after {max_retries} attempts: {last_err}")
+
         clean_user = (me.username or "").lstrip("@").lower()
         if expected_id is not None and me.id != expected_id:
             raise RoutingError(
@@ -706,11 +726,27 @@ def validate_process_notification_configuration(*, fail_closed: bool = False) ->
     """
     current_inst = detect_current_instance()
     if not current_inst:
-        msg = "Current process instance could not be determined from environment"
+        msg = "Current process instance could not be determined: BOT_INSTANCE_ID is missing or not registered"
         logger.error("[Notification Routing Diagnostic] %s", msg)
         if fail_closed:
             raise ConfigurationError(msg)
         return {"status": "error", "message": msg}
+
+    # Mandatory database identity check
+    if not verify_database_identity(current_inst):
+        url = os.environ.get("DATABASE_URL", "<not set>")
+        actual_db = extract_database_name(url)
+        expected_db = current_inst.get("database")
+        msg = f"DATABASE_URL mismatch for instance {current_inst.get('pm2_name')}: connected to {actual_db!r}, expected {expected_db!r}"
+        logger.critical("[Notification Routing Diagnostic] %s", msg)
+        if fail_closed:
+            raise ConfigurationError(msg)
+        return {
+            "status": "error",
+            "instance": current_inst.get("pm2_name"),
+            "platform": current_inst.get("platform"),
+            "message": msg,
+        }
 
     platform = current_inst.get("platform")
     pm2_name = current_inst.get("pm2_name")
@@ -742,7 +778,7 @@ def validate_process_notification_configuration(*, fail_closed: bool = False) ->
         }
 
     target_id = companion.get("platform_id")
-    admin_count = len(DEFAULT_TELEGRAM_OWNER_IDS.get(companion.get("pm2_name", ""), ()))
+    admin_count = len(companion.get("telegram_owner_ids", []))
 
     if admin_count == 0:
         msg = f"No allowed Telegram admin IDs configured for target {companion.get('pm2_name')}"
@@ -790,6 +826,14 @@ async def validate_process_notification_configuration_async(
     res = validate_process_notification_configuration(fail_closed=fail_closed)
     if res.get("status") != "ok":
         return res
+
+    is_test_env = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+    skip_requested = os.environ.get("SKIP_LIVE_BOT_VERIFICATION") == "1"
+    if skip_requested and not is_test_env:
+        logger.warning("[Security] SKIP_LIVE_BOT_VERIFICATION is forbidden outside test environments. Enforcing live verification.")
+        verify_live = True
+    elif skip_requested and is_test_env:
+        verify_live = False
 
     current_inst = detect_current_instance()
     platform = current_inst.get("platform") if current_inst else None

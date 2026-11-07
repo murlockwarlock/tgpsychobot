@@ -17,7 +17,12 @@
       "profile": "/bot1",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_autobusbusbot_new"
+      "bot_instance_id": "tg_autobusbusbot_new",
+      "telegram_owner_ids": [
+        272982544,
+        979514796,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -35,7 +40,12 @@
       "profile": "/bot2",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_alena322bot_new"
+      "bot_instance_id": "tg_alena322bot_new",
+      "telegram_owner_ids": [
+        272982544,
+        979514796,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -53,7 +63,12 @@
       "profile": "/bot3",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_someonewithyou01_bot_new"
+      "bot_instance_id": "tg_someonewithyou01_bot_new",
+      "telegram_owner_ids": [
+        272982544,
+        979514796,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -71,7 +86,11 @@
       "profile": "/bot4",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_someonewithyou02_bot_new"
+      "bot_instance_id": "tg_someonewithyou02_bot_new",
+      "telegram_owner_ids": [
+        272982544,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -89,7 +108,12 @@
       "profile": "/bot_legacy_1",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_veraveda777_bot_legacy"
+      "bot_instance_id": "tg_veraveda777_bot_legacy",
+      "telegram_owner_ids": [
+        979514796,
+        272982544,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -107,7 +131,11 @@
       "profile": "/bot_legacy_2",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_someonelikeyouai03_bot_legacy"
+      "bot_instance_id": "tg_someonelikeyouai03_bot_legacy",
+      "telegram_owner_ids": [
+        272982544,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -125,7 +153,11 @@
       "profile": "/bot_legacy_3",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_someonelikeyouai04_bot_legacy"
+      "bot_instance_id": "tg_someonelikeyouai04_bot_legacy",
+      "telegram_owner_ids": [
+        272982544,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -143,7 +175,11 @@
       "profile": "/bot_legacy_4",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_psy5d_bot_legacy"
+      "bot_instance_id": "tg_psy5d_bot_legacy",
+      "telegram_owner_ids": [
+        272982544,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -161,7 +197,11 @@
       "profile": "/bot_legacy_5",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_someonelikeyouai_bot_legacy"
+      "bot_instance_id": "tg_someonelikeyouai_bot_legacy",
+      "telegram_owner_ids": [
+        272982544,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -179,7 +219,11 @@
       "profile": "/bot_legacy_6",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_someonelikeyouai02_bot_legacy"
+      "bot_instance_id": "tg_someonelikeyouai02_bot_legacy",
+      "telegram_owner_ids": [
+        272982544,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -197,7 +241,12 @@
       "profile": "/bot5",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_someonewithyou03_bot_new"
+      "bot_instance_id": "tg_someonewithyou03_bot_new",
+      "telegram_owner_ids": [
+        272982544,
+        979514796,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -215,7 +264,12 @@
       "profile": "/bot6",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_someonelikeyouai05_bot_new"
+      "bot_instance_id": "tg_someonelikeyouai05_bot_new",
+      "telegram_owner_ids": [
+        272982544,
+        979514796,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -233,7 +287,12 @@
       "profile": "/bot7",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_someonewithyou05_bot_new"
+      "bot_instance_id": "tg_someonewithyou05_bot_new",
+      "telegram_owner_ids": [
+        272982544,
+        979514796,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -251,7 +310,12 @@
       "profile": "/bot8",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_someonewithyou06_bot_new"
+      "bot_instance_id": "tg_someonewithyou06_bot_new",
+      "telegram_owner_ids": [
+        272982544,
+        979514796,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -269,7 +333,12 @@
       "profile": "/bot9",
       "deploy_managed": true,
       "active": true,
-      "bot_instance_id": "tg_someonewithyou04_bot_new"
+      "bot_instance_id": "tg_someonewithyou04_bot_new",
+      "telegram_owner_ids": [
+        272982544,
+        979514796,
+        806750628
+      ]
     },
     {
       "platform": "telegram",
@@ -364,7 +433,12 @@
       "profile": "/psy5d_fulltest",
       "deploy_managed": false,
       "active": false,
-      "bot_instance_id": "tg_kontentzavod322bot_fulltest"
+      "bot_instance_id": "tg_kontentzavod322bot_fulltest",
+      "telegram_owner_ids": [
+        272982544,
+        979514796,
+        806750628
+      ]
     }
   ],
   "external_pm2_processes": [

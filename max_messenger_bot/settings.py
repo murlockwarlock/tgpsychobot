@@ -72,11 +72,7 @@ def validate_webhook_runtime_settings(settings: Settings) -> None:
 def get_settings() -> Settings:
     # Strictly do NOT read tokens, secrets, or bot names from config.ini
     # All credentials and identity must be provided via explicit environment variables.
-    token = (
-        os.getenv("MAX_BOT_TOKEN")
-        or os.getenv("MAX_TOKEN")
-        or ""
-    ).strip()
+    token = os.getenv("MAX_BOT_TOKEN", "").strip()
 
     webhook_path = os.getenv("MAX_WEBHOOK_PATH", "/max/webhook").strip() or "/max/webhook"
     update_types_raw = os.getenv(
