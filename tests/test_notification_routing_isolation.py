@@ -173,7 +173,7 @@ def test_routing_matrix_max_id519010411655_routes_strictly_to_yourself_way():
     with patch.dict(os.environ, {
         "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
         "PM2_APP_NAME": "max_id519010411655_bot_new",
-        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": dummy_companion_token,
+        "COMPANION_TELEGRAM_BOT_TOKEN": dummy_companion_token,
     }, clear=True):
         route = resolve_notification_route(
             category=EventCategory.USER_EVENT,
@@ -202,7 +202,7 @@ def test_routing_matrix_max_se13639182_routes_strictly_to_veraveda():
     with patch.dict(os.environ, {
         "BOT_INSTANCE_ID": "max_se13639182_bot_legacy",
         "PM2_APP_NAME": "max_se13639182_bot_legacy",
-        "TELEGRAM_VERAVEDA777_BOT_TOKEN": dummy_companion_token,
+        "COMPANION_TELEGRAM_BOT_TOKEN": dummy_companion_token,
     }, clear=True):
         route = resolve_notification_route(
             category=EventCategory.USER_EVENT,
@@ -290,7 +290,7 @@ async def test_successful_payment_notification_routes_to_companion():
     with patch.dict(os.environ, {
         "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
         "PM2_APP_NAME": "max_id519010411655_bot_new",
-        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": dummy_bot_token,
+        "COMPANION_TELEGRAM_BOT_TOKEN": dummy_bot_token,
     }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
 
         delivered = await send_admin_notification(
@@ -314,7 +314,7 @@ async def test_subscription_cancellation_notification_routes_to_companion():
     with patch.dict(os.environ, {
         "BOT_INSTANCE_ID": "max_se13639182_bot_legacy",
         "PM2_APP_NAME": "max_se13639182_bot_legacy",
-        "TELEGRAM_VERAVEDA777_BOT_TOKEN": dummy_bot_token,
+        "COMPANION_TELEGRAM_BOT_TOKEN": dummy_bot_token,
     }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
 
         delivered = await send_admin_notification(
@@ -345,7 +345,7 @@ async def test_terminal_ai_failure_alert_displays_correct_bot_name_and_routes_to
         "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
         "PM2_APP_NAME": "max_id519010411655_bot_new",
         "MAX_BOT_NAME": "id519010411655_bot",
-        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": dummy_bot_token,
+        "COMPANION_TELEGRAM_BOT_TOKEN": dummy_bot_token,
     }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
 
         delivered = await send_terminal_ai_failure_alert(
@@ -478,28 +478,44 @@ async def test_max_owner_ids_are_filtered_out_from_telegram_targets():
 @pytest.mark.asyncio
 async def test_stale_pm2_env_loads_from_runtime_env_file(tmp_path):
     """
-    When PM2 started without env export, routing engine safely reads
-    the canonical token from host runtime.env file.
+    User notifications strictly fail closed when COMPANION_TELEGRAM_BOT_TOKEN is missing
+    (does not scan runtime.env). System diagnostics (Autobus) CAN recover from runtime.env.
     """
     runtime_env_file = tmp_path / "runtime.env"
     dummy_token = "8481853696:AAF_LOADED_FROM_DISK_FILE_TOKEN"
-    runtime_env_file.write_text(f"TELEGRAM_YOURSELF_WAY_BOT_TOKEN={dummy_token}\n", encoding="utf-8")
+    autobus_token = "8346799080:AAF_AUTOBUS_DISK_FILE_TOKEN"
+    runtime_env_file.write_text(
+        f"TELEGRAM_YOURSELF_WAY_BOT_TOKEN={dummy_token}\n"
+        f"TELEGRAM_AUTOBUSBUSBOT_BOT_TOKEN={autobus_token}\n",
+        encoding="utf-8",
+    )
 
     recording_session = RecordingSession()
 
+    # 1. User event from MAX without COMPANION_TELEGRAM_BOT_TOKEN in env must FAIL CLOSED (not scan runtime.env)
     with patch.dict(os.environ, {
         "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
         "PM2_APP_NAME": "max_id519010411655_bot_new",
         "PROD_RUNTIME_ENV": str(runtime_env_file),
     }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
 
-        delivered = await send_admin_notification("Test recovery from runtime.env file")
+        delivered = await send_admin_notification("Test user event does NOT load from runtime.env", category=EventCategory.USER_EVENT)
+        assert delivered is False, "User event must refuse to route when COMPANION_TELEGRAM_BOT_TOKEN is missing from env"
+
+    # 2. System diagnostic monitoring CAN recover from runtime.env
+    with patch.dict(os.environ, {
+        "BOT_INSTANCE_ID": "tg_autobusbusbot_new",
+        "PM2_APP_NAME": "tg_autobusbusbot_new",
+        "PROD_RUNTIME_ENV": str(runtime_env_file),
+    }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
+
+        delivered = await send_admin_notification("System alert from runtime.env", category=EventCategory.SYSTEM_DIAGNOSTIC)
         assert delivered is True
 
     assert len(recording_session.requests) > 0
     token, bot_id, _ = recording_session.requests[0]
-    assert bot_id == 8481853696
-    assert token == dummy_token
+    assert bot_id == 8346799080
+    assert token == autobus_token
 
 
 @pytest.mark.asyncio
@@ -514,7 +530,7 @@ async def test_telegram_api_failure_does_not_raise_exception():
     with patch.dict(os.environ, {
         "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
         "PM2_APP_NAME": "max_id519010411655_bot_new",
-        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": dummy_token,
+        "COMPANION_TELEGRAM_BOT_TOKEN": dummy_token,
     }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
 
         # Must not raise RuntimeError
@@ -531,7 +547,7 @@ async def test_payment_failure_notification_routes_to_companion():
     with patch.dict(os.environ, {
         "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
         "PM2_APP_NAME": "max_id519010411655_bot_new",
-        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": dummy_bot_token,
+        "COMPANION_TELEGRAM_BOT_TOKEN": dummy_bot_token,
     }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
 
         delivered = await send_admin_notification(
@@ -555,7 +571,7 @@ async def test_auto_renewal_success_notification_routes_to_companion():
     with patch.dict(os.environ, {
         "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
         "PM2_APP_NAME": "max_id519010411655_bot_new",
-        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": dummy_bot_token,
+        "COMPANION_TELEGRAM_BOT_TOKEN": dummy_bot_token,
     }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
 
         delivered = await send_admin_notification(
@@ -600,26 +616,26 @@ async def test_process_restart_recovery_from_pm2_env_or_file(tmp_path):
 
     recording_session = RecordingSession()
 
-    # Step 1: Simulated first run
+    # Step 1: Simulated first run with COMPANION_TELEGRAM_BOT_TOKEN
     with patch.dict(os.environ, {
         "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
         "PM2_APP_NAME": "max_id519010411655_bot_new",
-        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": canonical_token,
+        "COMPANION_TELEGRAM_BOT_TOKEN": canonical_token,
     }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
         deliv1 = await send_admin_notification("Run 1 before restart")
         assert deliv1 is True
 
-    # Step 2: Simulated crash and resurrection where process env only had PM2_APP_NAME
-    # but runtime.env exists on host
+    # Step 2: Simulated crash and resurrection where COMPANION_TELEGRAM_BOT_TOKEN is missing
+    # Routing engine strictly fails closed without reading from runtime.env for user notifications
     with patch.dict(os.environ, {
         "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
         "PM2_APP_NAME": "max_id519010411655_bot_new",
         "PROD_RUNTIME_ENV": str(runtime_env_file),
     }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
         deliv2 = await send_admin_notification("Run 2 after PM2 restart")
-        assert deliv2 is True
+        assert deliv2 is False, "User event must fail closed when COMPANION_TELEGRAM_BOT_TOKEN is missing"
 
-    assert len(recording_session.requests) >= 2
+    assert len(recording_session.requests) == 4
     for token, bot_id, _ in recording_session.requests:
         assert bot_id == 8481853696
         assert token == canonical_token
@@ -632,7 +648,7 @@ def test_validate_process_notification_configuration_diagnostic():
         "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
         "PM2_APP_NAME": "max_id519010411655_bot_new",
         "DATABASE_URL": "postgresql://localhost/yourself_way_db",
-        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": dummy_token,
+        "COMPANION_TELEGRAM_BOT_TOKEN": dummy_token,
     }, clear=True):
         report = validate_process_notification_configuration()
         assert report["status"] == "ok"
@@ -832,11 +848,18 @@ def test_resolve_target_bot_token_skips_disk_when_token_in_env():
     target = get_instance_by_pm2_name("tg_yourself_way_bot_new")
     token = "8481853696:AAF_VALID_ENV_TOKEN_FOR_YOURSELF"
 
-    with patch.dict(os.environ, {"TELEGRAM_YOURSELF_WAY_BOT_TOKEN": token}, clear=True), \
+    # Telegram bot using BOT_TOKEN
+    with patch.dict(os.environ, {"BOT_TOKEN": token}, clear=True), \
          patch("notification_routing.read_runtime_env_file") as mock_read:
         resolved = resolve_target_bot_token(target, is_companion=False)
         assert resolved == token
-        # read_runtime_env_file must NOT be called when token is in env!
+        mock_read.assert_not_called()
+
+    # Companion bot using COMPANION_TELEGRAM_BOT_TOKEN
+    with patch.dict(os.environ, {"COMPANION_TELEGRAM_BOT_TOKEN": token}, clear=True), \
+         patch("notification_routing.read_runtime_env_file") as mock_read:
+        resolved = resolve_target_bot_token(target, is_companion=True)
+        assert resolved == token
         mock_read.assert_not_called()
 
 
@@ -1211,7 +1234,7 @@ def test_negative_item3_startup_database_identity_verification():
     with patch.dict(os.environ, {
         "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
         "DATABASE_URL": "postgresql://localhost/psy5d2_db",  # Autobus DB!
-        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": dummy_token,
+        "COMPANION_TELEGRAM_BOT_TOKEN": dummy_token,
     }, clear=True):
         with pytest.raises(ConfigurationError, match="DATABASE_URL mismatch"):
             validate_process_notification_configuration(fail_closed=True)
@@ -1271,7 +1294,7 @@ async def test_negative_item4_no_max_token_fallback_and_live_bot_verification():
     clean_env = {
         "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
         "DATABASE_URL": "postgresql://localhost/yourself_way_db",
-        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": "8481853696:AAF_YOURSELF_WAY_TEST",
+        "COMPANION_TELEGRAM_BOT_TOKEN": "8481853696:AAF_YOURSELF_WAY_TEST",
         "SKIP_LIVE_BOT_VERIFICATION": "1",
     }
     with patch.dict(os.environ, clean_env, clear=True), \
@@ -1284,15 +1307,16 @@ async def test_negative_item4_no_max_token_fallback_and_live_bot_verification():
 
     mock_max_client = AsyncMock()
     mock_max_client.__aenter__.return_value = mock_max_client
-    # Returning alien bot ID 999999999
-    mock_max_client.get_me.return_value = {"user_id": 999999999, "username": "alien_bot"}
 
     max_app_env = {
         "BOT_INSTANCE_ID": "max_id519010411655_bot_new",
         "DATABASE_URL": "postgresql://localhost/yourself_way_db",
-        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": "8481853696:AAF_YOURSELF_WAY_TEST",
+        "COMPANION_TELEGRAM_BOT_TOKEN": "8481853696:AAF_YOURSELF_WAY_TEST",
         "MAX_BOT_TOKEN": "max_token_valid_123",
     }
+
+    # 4a. Mismatched user_id
+    mock_max_client.get_me.return_value = {"user_id": 999999999, "username": "alien_bot", "is_bot": True}
     clear_settings_cache()
     with patch.dict(os.environ, max_app_env, clear=True), \
          patch("max_messenger_bot.app.MaxApiClient", return_value=mock_max_client), \
@@ -1300,3 +1324,50 @@ async def test_negative_item4_no_max_token_fallback_and_live_bot_verification():
         clear_settings_cache()
         with pytest.raises(ConfigurationError, match="MAX bot ID mismatch"):
             await create_web_app()
+
+    # 4b. Negative: missing mandatory user_id
+    mock_max_client.get_me.return_value = {"username": "id519010411655_bot", "is_bot": True}
+    clear_settings_cache()
+    with patch.dict(os.environ, max_app_env, clear=True), \
+         patch("max_messenger_bot.app.MaxApiClient", return_value=mock_max_client), \
+         patch("notification_routing.verify_bot_identity_live", AsyncMock(return_value={"id": 8481853696, "username": "yourself_way_bot", "verified": True})):
+        clear_settings_cache()
+        with pytest.raises(ConfigurationError, match="missing mandatory user_id"):
+            await create_web_app()
+
+    # 4c. Negative: is_bot is False
+    mock_max_client.get_me.return_value = {"user_id": 294069217, "is_bot": False, "username": "id519010411655_bot"}
+    clear_settings_cache()
+    with patch.dict(os.environ, max_app_env, clear=True), \
+         patch("max_messenger_bot.app.MaxApiClient", return_value=mock_max_client), \
+         patch("notification_routing.verify_bot_identity_live", AsyncMock(return_value={"id": 8481853696, "username": "yourself_way_bot", "verified": True})):
+        clear_settings_cache()
+        with pytest.raises(ConfigurationError, match="is_bot is not True"):
+            await create_web_app()
+
+    # 4d. Negative: username mismatch cannot be bypassed by deprecated name field
+    mock_max_client.get_me.return_value = {
+        "user_id": 294069217,
+        "is_bot": True,
+        "name": "id519010411655_bot",  # Deprecated name matching expected
+        "username": "unrelated_other_bot",  # But username mismatched
+    }
+    clear_settings_cache()
+    with patch.dict(os.environ, max_app_env, clear=True), \
+         patch("max_messenger_bot.app.MaxApiClient", return_value=mock_max_client), \
+         patch("notification_routing.verify_bot_identity_live", AsyncMock(return_value={"id": 8481853696, "username": "yourself_way_bot", "verified": True})):
+        clear_settings_cache()
+        with pytest.raises(ConfigurationError, match="MAX bot username mismatch"):
+            await create_web_app()
+
+    # 5. Negative: MAX companion event without COMPANION_TELEGRAM_BOT_TOKEN fails closed (None),
+    # even if other tokens are present in env or runtime.env
+    from notification_routing import resolve_target_bot_token, get_instance_by_id
+    yw_inst = get_instance_by_id("tg_yourself_way_bot_new")
+    with patch.dict(os.environ, {
+        "BOT_TOKEN": "8481853696:AAF_WRONG_VARIABLE_TOKEN",
+        "TELEGRAM_YOURSELF_WAY_BOT_TOKEN": "8481853696:AAF_WRONG_VARIABLE_TOKEN",
+    }, clear=True):
+        # Companion resolution MUST refuse without COMPANION_TELEGRAM_BOT_TOKEN
+        token_res = resolve_target_bot_token(yw_inst, is_companion=True, is_system_diagnostic=False)
+        assert token_res is None, "Companion token resolution MUST NOT search in other environment variables!"

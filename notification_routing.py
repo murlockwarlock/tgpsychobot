@@ -206,11 +206,28 @@ def resolve_companion_telegram_instance(source_instance: dict[str, Any]) -> dict
     return None
 
 
+def sanitize_database_url(url: str | None) -> str:
+    """Mask credentials in a database connection URL for safe logging/diagnostics."""
+    if not url or not isinstance(url, str):
+        return "<not set>"
+    try:
+        parsed = urlparse(url)
+        if parsed.password:
+            netloc = f"{parsed.username or ''}:***@{parsed.hostname or ''}"
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            return url.replace(parsed.netloc, netloc)
+        return url
+    except Exception:
+        return re.sub(r"://([^:@]+):([^@]+)@", r"://\1:***@", url)
+
+
 def resolve_target_bot_token(
     target_instance: dict[str, Any],
     *,
     is_companion: bool = False,
     candidate_token: str | None = None,
+    is_system_diagnostic: bool = False,
 ) -> str | None:
     """
     Resolve and validate the target bot's Telegram token.
@@ -218,67 +235,100 @@ def resolve_target_bot_token(
     STRICT GUARANTEES:
     - The token MUST have a prefix matching target_instance['platform_id'].
     - If a token from Autobus or any other foreign bot is supplied, it is REJECTED.
+    - For user notifications:
+      * MAX companion: ONLY os.environ["COMPANION_TELEGRAM_BOT_TOKEN"].
+      * Telegram bot: ONLY os.environ["BOT_TOKEN"].
+      * Refuses without scanning alternative environment variables or runtime.env.
+    - For system diagnostics (Autobus):
+      * Resolves Autobus token via env or runtime.env fallback.
     - NEVER falls back to legacy config.ini.
-    - Prefers environment variables and only checks runtime.env on disk if not found.
     """
     expected_id = target_instance.get("platform_id")
     if not expected_id or not isinstance(expected_id, int):
         logger.error("Target instance %s has invalid platform_id: %s", target_instance.get("pm2_name"), expected_id)
         return None
 
-    candidates: list[str | None] = []
-
-    # 1. Explicit override passed by caller
+    # 1. Explicit override passed by caller (e.g. in tests)
     if candidate_token:
-        candidates.append(candidate_token)
-
-    # 2. For companion routing: check companion-specific env vars
-    if is_companion:
-        candidates.append(os.environ.get("COMPANION_TELEGRAM_BOT_TOKEN"))
-        target_token_env = target_instance.get("token_env")
-        if target_token_env:
-            candidates.append(os.environ.get(target_token_env))
-        # Note: We check os.environ.get("BOT_TOKEN") as well, BUT ONLY IF it matches expected_id!
-        candidates.append(os.environ.get("BOT_TOKEN"))
-    else:
-        # Direct Telegram bot
-        target_token_env = target_instance.get("token_env")
-        if target_token_env:
-            candidates.append(os.environ.get(target_token_env))
-        candidates.append(os.environ.get("BOT_TOKEN"))
-
-    # Validate candidates from environment first
-    for cand in candidates:
-        if not cand or not isinstance(cand, str):
-            continue
-        cleaned = cand.strip()
+        cleaned = candidate_token.strip()
         cand_bot_id = extract_telegram_bot_id(cleaned)
         if cand_bot_id == expected_id:
             return cleaned
-        elif cand_bot_id is not None:
-            logger.warning(
-                "[Notification Routing] Discarding token with mismatched bot ID %s (expected %s for %s)",
-                cand_bot_id,
+        logger.warning(
+            "[Notification Routing] Discarding token with mismatched bot ID %s (expected %s for %s)",
+            cand_bot_id,
+            expected_id,
+            target_instance.get("pm2_name"),
+        )
+        return None
+
+    # 2. System Diagnostic (Centralized Autobus monitoring)
+    if is_system_diagnostic:
+        candidates = [
+            os.environ.get("AUTOBUS_TELEGRAM_BOT_TOKEN"),
+            os.environ.get(target_instance.get("token_env", "")),
+            os.environ.get("BOT_TOKEN"),
+        ]
+        for cand in candidates:
+            if cand and isinstance(cand, str):
+                cleaned = cand.strip()
+                if extract_telegram_bot_id(cleaned) == expected_id:
+                    return cleaned
+
+        host_env = read_runtime_env_file()
+        for key in (target_instance.get("token_env"), "TELEGRAM_AUTOBUSBUSBOT_BOT_TOKEN"):
+            if key and host_env.get(key):
+                cleaned = str(host_env[key]).strip()
+                if extract_telegram_bot_id(cleaned) == expected_id:
+                    return cleaned
+
+        logger.error(
+            "[Notification Routing] System diagnostic token not found matching platform_id %s for %s",
+            expected_id,
+            target_instance.get("pm2_name"),
+        )
+        return None
+
+    # 3. User / Financial / AI Error Events: STRICT FAIL-CLOSED, NO ALTERNATIVE SCAN, NO RUNTIME.ENV
+    if is_companion:
+        raw_token = os.environ.get("COMPANION_TELEGRAM_BOT_TOKEN")
+        if not raw_token or not raw_token.strip():
+            logger.error(
+                "[Notification Routing] Missing mandatory COMPANION_TELEGRAM_BOT_TOKEN for companion %s (%s). Refusing to route.",
+                target_instance.get("username"),
+                target_instance.get("pm2_name"),
+            )
+            return None
+        cleaned = raw_token.strip()
+        token_bot_id = extract_telegram_bot_id(cleaned)
+        if token_bot_id != expected_id:
+            logger.error(
+                "[Notification Routing] COMPANION_TELEGRAM_BOT_TOKEN bot ID mismatch: token ID %s != expected ID %s for %s. Refusing to route.",
+                token_bot_id,
                 expected_id,
                 target_instance.get("pm2_name"),
             )
-
-    # 3. Only check runtime.env from disk if no valid env candidate was found
-    target_token_env = target_instance.get("token_env")
-    if target_token_env:
-        host_env = read_runtime_env_file()
-        file_cand = host_env.get(target_token_env)
-        if file_cand and isinstance(file_cand, str):
-            cleaned = file_cand.strip()
-            if extract_telegram_bot_id(cleaned) == expected_id:
-                return cleaned
-
-    logger.error(
-        "[Notification Routing] No valid token found matching platform_id %s for instance %s",
-        expected_id,
-        target_instance.get("pm2_name"),
-    )
-    return None
+            return None
+        return cleaned
+    else:
+        raw_token = os.environ.get("BOT_TOKEN")
+        if not raw_token or not raw_token.strip():
+            logger.error(
+                "[Notification Routing] Missing mandatory BOT_TOKEN for Telegram instance %s. Refusing to route.",
+                target_instance.get("pm2_name"),
+            )
+            return None
+        cleaned = raw_token.strip()
+        token_bot_id = extract_telegram_bot_id(cleaned)
+        if token_bot_id != expected_id:
+            logger.error(
+                "[Notification Routing] BOT_TOKEN bot ID mismatch: token ID %s != expected ID %s for %s. Refusing to route.",
+                token_bot_id,
+                expected_id,
+                target_instance.get("pm2_name"),
+            )
+            return None
+        return cleaned
 
 
 def extract_database_name(db_url: str | None) -> str | None:
@@ -323,7 +373,11 @@ def verify_database_identity(
 
     actual_db = extract_database_name(url)
     if not actual_db:
-        logger.error("[Notification Routing] Could not parse database name from DATABASE_URL: %s", url)
+        logger.error(
+            "[Notification Routing] Could not parse database name from DATABASE_URL (%s) for instance %s",
+            sanitize_database_url(url),
+            instance.get("pm2_name"),
+        )
         return False
 
     # In test environments (pytest), allow SQLite in-memory or temporary databases
@@ -440,6 +494,7 @@ def resolve_notification_route(
             target_inst,
             is_companion=False,
             candidate_token=bot_token_override,
+            is_system_diagnostic=True,
         )
         if not token:
             return None
@@ -498,6 +553,7 @@ def resolve_notification_route(
         target_inst,
         is_companion=is_companion,
         candidate_token=bot_token_override,
+        is_system_diagnostic=False,
     )
     if not token:
         logger.error(
@@ -764,7 +820,11 @@ def validate_process_notification_configuration(*, fail_closed: bool = False) ->
             "message": msg,
         }
 
-    target_token = resolve_target_bot_token(companion, is_companion=(platform == "max"))
+    target_token = resolve_target_bot_token(
+        companion,
+        is_companion=(platform == "max"),
+        is_system_diagnostic=False,
+    )
     if not target_token:
         msg = f"No valid Telegram bot token found for target {companion.get('pm2_name')}"
         logger.error("[Notification Routing Diagnostic] %s", msg)
@@ -840,7 +900,11 @@ async def validate_process_notification_configuration_async(
     companion = resolve_companion_telegram_instance(current_inst) if platform == "max" else current_inst
 
     if verify_live and companion:
-        target_token = resolve_target_bot_token(companion, is_companion=(platform == "max"))
+        target_token = resolve_target_bot_token(
+        companion,
+        is_companion=(platform == "max"),
+        is_system_diagnostic=False,
+    )
         if target_token:
             try:
                 verified = await verify_bot_identity_live(

@@ -3960,15 +3960,34 @@ async def create_web_app() -> web.Application:
         if max_err is not None or not max_me:
             raise ConfigurationError(f"Live MAX bot identity verification failed after 3 attempts: {max_err}")
 
-        # Verify platform_id and/or username
-        expected_platform_id = current_inst.get("platform_id")
-        actual_id = max_me.get("user_id") or max_me.get("id")
-        if expected_platform_id and actual_id and int(actual_id) != expected_platform_id:
+        # Mandatory user_id check
+        raw_user_id = max_me.get("user_id")
+        if raw_user_id is None:
             raise ConfigurationError(
-                f"MAX bot ID mismatch: API returned {actual_id}, expected {expected_platform_id} for {current_inst.get('pm2_name')}"
+                f"Live MAX bot identity verification failed: missing mandatory user_id in get_me response for {current_inst.get('pm2_name')}"
             )
+        try:
+            actual_id = int(raw_user_id)
+        except (ValueError, TypeError):
+            raise ConfigurationError(
+                f"Live MAX bot identity verification failed: invalid user_id {raw_user_id!r} in get_me response for {current_inst.get('pm2_name')}"
+            )
+
+        expected_platform_id = current_inst.get("platform_id")
+        if not expected_platform_id or actual_id != expected_platform_id:
+            raise ConfigurationError(
+                f"MAX bot ID mismatch: API returned user_id {actual_id}, expected {expected_platform_id} for {current_inst.get('pm2_name')}"
+            )
+
+        # Mandatory is_bot check
+        if not max_me.get("is_bot"):
+            raise ConfigurationError(
+                f"MAX identity verification failed: is_bot is not True in get_me response for {current_inst.get('pm2_name')}"
+            )
+
+        # Verify username when present (do NOT use deprecated 'name' field for identity confirmation)
         expected_user = current_inst.get("username", "").lstrip("@").lower()
-        actual_user = (max_me.get("username") or max_me.get("name") or "").lstrip("@").lower()
+        actual_user = (max_me.get("username") or "").lstrip("@").lower()
         if expected_user and actual_user and actual_user != expected_user:
             raise ConfigurationError(
                 f"MAX bot username mismatch: API returned @{actual_user}, expected @{expected_user} for {current_inst.get('pm2_name')}"
@@ -3980,7 +3999,7 @@ async def create_web_app() -> web.Application:
         else:
             try:
                 me = await client.get_me()
-                client.bot_name = (me.get("username") or me.get("name") or "").strip().lstrip("@") or None
+                client.bot_name = (me.get("username") or "").strip().lstrip("@") or None
             except Exception:
                 max_log.exception("Failed to load MAX bot name for deep links")
     # Load flags from database
