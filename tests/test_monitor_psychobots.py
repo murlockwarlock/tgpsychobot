@@ -2453,6 +2453,395 @@ async def test_nl_check_default_excludes_decommissioned_ports(monkeypatch):
     assert {port for _, port, _ in checked_ports} == {3128, 4430, 62050}
 
 
+# ==============================================================================
+# Telegram Network Glitch Grouping, Deduplication, and System Diagnostics Routing Tests
+# ==============================================================================
+
+
+def test_system_diagnostic_recipients_strictly_autobus_admins(monkeypatch):
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "tg_autobusbusbot_new")
+    monkeypatch.delenv("PSYCHOBOTS_ALERT_RECIPIENTS", raising=False)
+
+    apps = [
+        {
+            "name": "tg_autobusbusbot_new",
+            "owner_ids": [272982544, 806750628, 979514796],
+        },
+        {
+            "name": "tg_yourself_way_bot_new",
+            "owner_ids": [979514796, 272982544, 806750628, 1372041348],
+        },
+        {
+            "name": "tg_alena322bot_new",
+            "owner_ids": [999999],
+        },
+    ]
+
+    recipients = monitor.get_system_diagnostic_recipients(apps)
+
+    # Must contain ONLY Autobus owners, never arbitrary owner IDs from other bots
+    assert recipients == [272982544, 806750628, 979514796]
+    assert 1372041348 not in recipients
+    assert 999999 not in recipients
+
+
+def test_system_diagnostic_recipients_env_override(monkeypatch):
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_RECIPIENTS", "555, 777")
+    recipients = monitor.get_system_diagnostic_recipients([])
+    assert recipients == [555, 777]
+
+
+@pytest.mark.asyncio
+async def test_send_alert_strictly_delivers_to_autobus_admins(monkeypatch):
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "tg_autobusbusbot_new")
+    monkeypatch.delenv("PSYCHOBOTS_ALERT_RECIPIENTS", raising=False)
+
+    apps = [
+        {
+            "name": "tg_autobusbusbot_new",
+            "token": "tok_autobus",
+            "owner_ids": [272982544, 806750628, 979514796],
+            "telegram_proxy": "http://127.0.0.1:3128",
+        },
+        {
+            "name": "tg_yourself_way_bot_new",
+            "token": "tok_yw",
+            "owner_ids": [1372041348],
+            "telegram_proxy": "http://127.0.0.1:3128",
+        },
+    ]
+
+    delivered_chats = []
+
+    class FakeResponse:
+        status = 200
+        async def json(self, **kwargs):
+            return {"ok": True}
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        def post(self, url, json=None, **kwargs):
+            assert "bottok_autobus" in url
+            delivered_chats.append(json.get("chat_id"))
+            return FakeResponse()
+
+    monkeypatch.setattr(monitor.aiohttp, "ClientSession", FakeSession)
+
+    res = await monitor.send_alert(apps, "Test Alert")
+    assert res is True
+    assert sorted(delivered_chats) == [272982544, 806750628, 979514796]
+    assert 1372041348 not in delivered_chats
+
+
+@pytest.mark.asyncio
+async def test_check_telegram_quick_retry_recovers_from_transient_502(monkeypatch):
+    call_count = 0
+
+    class FakeResponse:
+        def __init__(self, status, data):
+            self.status = status
+            self._data = data
+        async def json(self, **kwargs):
+            return self._data
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    class FakeSession:
+        def get(self, url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if "getMe" in url:
+                if call_count == 1:
+                    return FakeResponse(502, {"ok": False, "description": "Bad Gateway"})
+                return FakeResponse(200, {"ok": True, "result": {"id": 123}})
+            if "getWebhookInfo" in url:
+                return FakeResponse(200, {"ok": True, "result": {"url": ""}})
+            return FakeResponse(200, {"ok": True})
+
+    app = {
+        "token": "tok",
+        "delivery_mode": "polling",
+        "telegram_proxy": "http://127.0.0.1:3128",
+    }
+
+    issues = await monitor.check_telegram(app, FakeSession())
+    assert issues == []
+    assert call_count == 3  # getMe (502) -> retry getMe (200) -> getWebhookInfo
+
+
+@pytest.mark.asyncio
+async def test_shared_network_incident_mass_timeouts_grouped_into_single_alert(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "bot_0")
+
+    # 16 Telegram bots
+    apps = [
+        {
+            "name": f"bot_{i}",
+            "status": "online",
+            "token": f"tok_{i}",
+            "owner_ids": [100],
+            "telegram_proxy": "http://127.0.0.1:3128",
+        }
+        for i in range(16)
+    ]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_db_schema", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+
+    # All 16 bots fail getMe with TimeoutError
+    async def fake_failing_telegram(app, http):
+        return ["Telegram getMe failed: TimeoutError: "]
+    monkeypatch.setattr(monitor, "check_telegram", fake_failing_telegram)
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *args, **kwargs: [])
+
+    sent_alerts = []
+    async def fake_send_alert(a, text):
+        sent_alerts.append(text)
+        return True
+    monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
+
+    # Run 1: Should send EXACTLY ONE grouped alert
+    exit_code = await monitor.run_check(False)
+    assert exit_code == 1
+    assert len(sent_alerts) == 1
+
+    alert = sent_alerts[0]
+    assert "Общий сетевой инцидент Telegram API / Прокси" in alert
+    assert "Затронуто ботов: 16 из 16" in alert
+    assert "Статус прокси: активен" in alert
+    assert "Request timeout error" in alert or "Timeout" in alert
+    # Crucially, it must NOT have 16 separate <b>bot_i</b> sections
+    for i in range(16):
+        assert f"\n<b>bot_{i}</b>" not in alert
+
+    state = monitor.load_state(state_file)
+    assert monitor.INCIDENT_SHARED_NETWORK in state.get("active_incidents", {})
+    assert len(state["active_incidents"][monitor.INCIDENT_SHARED_NETWORK]["affected_bots"]) == 16
+
+
+@pytest.mark.asyncio
+async def test_shared_network_incident_502_bad_gateway_and_deduplication(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "bot_0")
+
+    apps = [
+        {
+            "name": f"bot_{i}",
+            "status": "online",
+            "token": f"tok_{i}",
+            "owner_ids": [100],
+            "telegram_proxy": "http://127.0.0.1:3128",
+        }
+        for i in range(16)
+    ]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_db_schema", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+
+    # Run 1: 16 bots have 502 Bad Gateway
+    async def fake_502_telegram(app, http):
+        return ["Telegram getMe failed: HTTP 502 {'ok': False, 'error_code': 502, 'description': 'Bad Gateway'}"]
+    monkeypatch.setattr(monitor, "check_telegram", fake_502_telegram)
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *args, **kwargs: [])
+
+    sent_alerts = []
+    async def fake_send_alert(a, text):
+        sent_alerts.append(text)
+        return True
+    monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
+
+    exit_code_1 = await monitor.run_check(False)
+    assert exit_code_1 == 1
+    assert len(sent_alerts) == 1
+    assert "Telegram HTTP 502 (Bad Gateway)" in sent_alerts[0]
+
+    # Run 2: Partial recovery (13 bots recover, 3 bots still have polling log errors from tail)
+    monkeypatch.setattr(monitor, "check_telegram", fake_empty_async)
+
+    def mock_log_errors(app, state, include_existing):
+        if app["name"] in ("bot_0", "bot_1", "bot_2"):
+            return ["Logs: polling fetch error: TelegramServerError: Telegram server says - Bad Gateway"]
+        return []
+    monkeypatch.setattr(monitor, "read_new_log_errors", mock_log_errors)
+
+    exit_code_2 = await monitor.run_check(False)
+    assert exit_code_2 == 1
+    # Deduplication check: NO repeat alert should be sent during the cooldown window!
+    assert len(sent_alerts) == 1
+
+    # Run 3: Full recovery! All 16 bots healthy.
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *args, **kwargs: [])
+
+    exit_code_3 = await monitor.run_check(False)
+    assert exit_code_3 == 0  # Clean run
+    # Recovery alert must be sent!
+    assert len(sent_alerts) == 2
+    recovery_alert = sent_alerts[1]
+    assert "Восстановление: Telegram API / Прокси в норме" in recovery_alert
+    assert "Связь с Telegram восстановлена" in recovery_alert
+
+    # Incident must be cleared from state
+    state = monitor.load_state(state_file)
+    assert monitor.INCIDENT_SHARED_NETWORK not in state.get("active_incidents", {})
+
+    # Run 4: Subsequent run remains clean, no extra alerts
+    exit_code_4 = await monitor.run_check(False)
+    assert exit_code_4 == 0
+    assert len(sent_alerts) == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_network_prolonged_outage_repeats_after_cooldown(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_NETWORK_REPEAT_SECONDS", "300")
+
+    apps = [
+        {"name": "bot_a", "status": "online", "token": "tok_a", "owner_ids": [100]},
+        {"name": "bot_b", "status": "online", "token": "tok_b", "owner_ids": [100]},
+    ]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_db_schema", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *args, **kwargs: [])
+
+    async def fake_timeout_telegram(app, http):
+        return ["Telegram getMe failed: TimeoutError: "]
+    monkeypatch.setattr(monitor, "check_telegram", fake_timeout_telegram)
+
+    sent_alerts = []
+    async def fake_send_alert(a, text):
+        sent_alerts.append(text)
+        return True
+    monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
+
+    # Run 1: Initial alert
+    await monitor.run_check(False)
+    assert len(sent_alerts) == 1
+
+    # Simulate 400 seconds passing (> 300 cooldown)
+    state = monitor.load_state(state_file)
+    inc = state["active_incidents"][monitor.INCIDENT_SHARED_NETWORK]
+    inc["last_alerted"] = inc["last_alerted"] - 400
+    monitor.save_state(state, state_file)
+
+    # Run 2: Prolonged outage repeat alert must fire!
+    await monitor.run_check(False)
+    assert len(sent_alerts) == 2
+
+
+@pytest.mark.asyncio
+async def test_transient_single_bot_polling_error_ignored_when_getme_ok(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+
+    apps = [
+        {"name": "bot_1", "status": "online", "token": "tok_1", "owner_ids": [100]},
+        {"name": "bot_2", "status": "online", "token": "tok_2", "owner_ids": [100]},
+    ]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_db_schema", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_telegram", fake_empty_async)  # getMe succeeded!
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+
+    # Only 1 bot had a single transient polling error in log, but getMe is OK
+    def mock_log_errors(app, state, include_existing):
+        if app["name"] == "bot_1":
+            return ["Logs: polling fetch error: Request timeout error"]
+        return []
+    monkeypatch.setattr(monitor, "read_new_log_errors", mock_log_errors)
+
+    sent_alerts = []
+    async def fake_send_alert(a, text):
+        sent_alerts.append(text)
+        return True
+    monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
+
+    exit_code = await monitor.run_check(False)
+    assert exit_code == 0
+    assert len(sent_alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_persistent_failure_single_bot_alerts_as_individual_issue(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+
+    apps = [
+        {"name": "bot_1", "status": "online", "token": "tok_1", "owner_ids": [100]},
+        {"name": "bot_2", "status": "online", "token": "tok_2", "owner_ids": [100]},
+    ]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_db_schema", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_telegram", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+
+    # 1 bot has >= 3 polling fetch errors (persistent)
+    def mock_log_errors(app, state, include_existing):
+        if app["name"] == "bot_1":
+            return ["Logs: 5 polling fetch errors since last check"]
+        return []
+    monkeypatch.setattr(monitor, "read_new_log_errors", mock_log_errors)
+
+    sent_alerts = []
+    async def fake_send_alert(a, text):
+        sent_alerts.append(text)
+        return True
+    monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
+
+    exit_code = await monitor.run_check(False)
+    assert exit_code == 1
+    assert len(sent_alerts) == 1
+    # Alert is for bot_1 individually, NOT shared network
+    assert "<b>bot_1</b>" in sent_alerts[0]
+    assert "Общий сетевой инцидент" not in sent_alerts[0]
+
+
+
 
 
 
