@@ -3704,3 +3704,341 @@ async def test_telegram_scenarios_list_button_preserves_raw_legacy_and_escaped_t
             router._parent_router = original_parents[router]
 
 
+def test_safe_callback_alert_text_boundaries():
+    from event_admin_telegram import (
+        TELEGRAM_CALLBACK_ALERT_MAX_LENGTH,
+        safe_callback_alert_text,
+    )
+
+    assert safe_callback_alert_text("") == ""
+    assert safe_callback_alert_text("   ") == ""
+    assert safe_callback_alert_text(None) == ""
+
+    short_msg = "Короткое сообщение"
+    assert safe_callback_alert_text(short_msg) == short_msg
+
+    exact_200 = "x" * 200
+    res_200 = safe_callback_alert_text(exact_200)
+    assert len(res_200) == 200
+    assert res_200 == exact_200
+
+    over_200 = "a" * 201
+    res_over = safe_callback_alert_text(over_200)
+    assert len(res_over) == 200
+    assert res_over.endswith("…")
+
+    huge = "О" * 500
+    res_huge = safe_callback_alert_text(huge)
+    assert len(res_huge) == 200
+    assert res_huge.endswith("…")
+
+
+def test_format_event_content_validation_alert_rules():
+    from event_admin_telegram import (
+        ALERT_MEDIA_CAPTION_REQUIRES_MEDIA,
+        TELEGRAM_CALLBACK_ALERT_MAX_LENGTH,
+        _format_event_content_validation_alert,
+    )
+    from event_content_validator import (
+        EventContentValidationError,
+        PathValidationResult,
+        ScenarioValidationResult,
+    )
+
+    # 1. Missing media for caption format
+    violation = PathValidationResult(
+        path_id="media_mode_caption_count",
+        platform="all",
+        message_kind="media_validation",
+        rendered_text="",
+        visible_text="",
+        length=0,
+        limit=1,
+        is_valid=False,
+        excess=0,
+        error_message=(
+            "Режим «подпись к медиа» требует ровно 1 медиа-вложение (сейчас: 0). "
+            "Прикрепите одно фото/видео или переключите формат доставки на раздельный."
+        ),
+        recommendation="Выберите «Текст отдельно, медиа выше/ниже» или оставьте ровно 1 медиа.",
+    )
+    res = ScenarioValidationResult(
+        is_valid=False,
+        media_format="caption",
+        media_count=0,
+        violations=[violation],
+        all_checks=[violation],
+        available_description_chars={},
+    )
+    err = EventContentValidationError(violation.error_message, res, actual_length=0, limit_length=1)
+
+    alert_text = _format_event_content_validation_alert(err)
+    assert alert_text == ALERT_MEDIA_CAPTION_REQUIRES_MEDIA
+    assert alert_text == "Для этого формата нужно одно фото или видео. Добавьте медиа либо выберите раздельный формат"
+    assert len(alert_text) <= TELEGRAM_CALLBACK_ALERT_MAX_LENGTH
+
+    # 2. Too many media items for caption format
+    violation_many = PathValidationResult(
+        path_id="media_mode_caption_count",
+        platform="all",
+        message_kind="media_validation",
+        rendered_text="",
+        visible_text="",
+        length=2,
+        limit=1,
+        is_valid=False,
+        excess=1,
+        error_message=(
+            "Режим «подпись к медиа» требует ровно 1 медиа-вложение (сейчас: 2). "
+            "Прикрепите одно фото/видео или переключите формат доставки на раздельный."
+        ),
+        recommendation="Выберите «Текст отдельно, медиа выше/ниже» или оставьте ровно 1 медиа.",
+    )
+    res_many = ScenarioValidationResult(
+        is_valid=False,
+        media_format="caption",
+        media_count=2,
+        violations=[violation_many],
+        all_checks=[violation_many],
+        available_description_chars={},
+    )
+    err_many = EventContentValidationError(violation_many.error_message, res_many, actual_length=2, limit_length=1)
+    alert_many = _format_event_content_validation_alert(err_many)
+    assert len(alert_many) <= TELEGRAM_CALLBACK_ALERT_MAX_LENGTH
+    assert "сейчас: 2" in alert_many
+
+    # 3. Super long message safely capped at 200
+    long_msg = "Превышение лимита описания: " + ("очень длинный текст ошибки " * 15)
+    err_long = EventContentValidationError(long_msg, None, actual_length=1500, limit_length=900)
+    alert_long = _format_event_content_validation_alert(err_long)
+    assert len(alert_long) <= TELEGRAM_CALLBACK_ALERT_MAX_LENGTH
+    assert alert_long.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_telegram_event_format_caption_no_media_alert_and_recovery_journey(
+    db_session_maker, monkeypatch
+):
+    """Real aiogram Dispatcher journey for format change validation alert:
+    1. Open event from list.
+    2. Click format selection button.
+    3. Choose 'Подпись к медиа' without attachments.
+    4. Verify clear, safe warning alert (not exception, len <= 200) without crashing.
+    5. Verify format screen, event_id, FSM and return context preserved.
+    6. Press Back, add media, save, reopen format menu, select caption (succeeds).
+    7. Verify return to scenario card and initial list page.
+    """
+    import handlers
+    from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
+    from aiogram.types import PhotoSize
+    from database import EventScenario
+    from event_admin_service import create_scenario, list_scenario_media
+    from event_admin_telegram import (
+        ALERT_MEDIA_CAPTION_REQUIRES_MEDIA,
+        TELEGRAM_CALLBACK_ALERT_MAX_LENGTH,
+    )
+
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="webinar_fmt_alert",
+        event_type="webinar",
+        title="Вебинар по запуску продукта",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://example.test/webinar-fmt",
+        description="Подробное описание вебинара без медиа.",
+        media_format="separate_media_top",
+    )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    async def feed_callback(data: str):
+        methods = await _feed_callback(dp, bot, data)
+        for method in methods:
+            if hasattr(method, "model_dump"):
+                method.__class__.model_validate(method.model_dump())
+        return methods
+
+    async def feed_message(text: str, **kwargs):
+        methods = await _feed_message(dp, bot, text, **kwargs)
+        for method in methods:
+            if hasattr(method, "model_dump"):
+                method.__class__.model_validate(method.model_dump())
+        return methods
+
+    def find_button(methods, prefix: str):
+        for method in methods:
+            if not isinstance(method, (EditMessageText, SendMessage)) or method.reply_markup is None:
+                continue
+            for row in method.reply_markup.inline_keyboard:
+                for button in row:
+                    if button.callback_data and button.callback_data.startswith(prefix):
+                        return button
+        raise AssertionError(f"Button with prefix '{prefix}' not found in methods: {methods}")
+
+    try:
+        # Step 1: Open event list and navigate into the target event card
+        methods = await feed_callback("admin_events")
+        open_btn = find_button(methods, f"admin_ev_open_{scen.id}")
+        methods = await feed_callback(open_btn.callback_data)
+
+        # Step 2: In scenario card, press Edit to reach edit menu
+        edit_btn = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_btn.callback_data)
+
+        # Step 3: Press real format selection button
+        fmt_menu_btn = find_button(methods, f"admin_ev_format_menu_{scen.id}")
+        methods = await feed_callback(fmt_menu_btn.callback_data)
+
+        # Verify format screen is displayed with all options
+        caption_btn = find_button(methods, f"admin_ev_set_fmt_{scen.id}_caption")
+        back_edit_btn = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        assert caption_btn is not None
+        assert back_edit_btn is not None
+
+        # Step 4: Click "Подпись к медиа" without attachments
+        methods = await feed_callback(caption_btn.callback_data)
+
+        # Assert clean warning alert without exception
+        answer = next((m for m in methods if isinstance(m, AnswerCallbackQuery)), None)
+        assert answer is not None, f"Expected AnswerCallbackQuery in methods: {methods}"
+        assert answer.show_alert is True
+        assert len(answer.text) <= TELEGRAM_CALLBACK_ALERT_MAX_LENGTH
+        assert answer.text == ALERT_MEDIA_CAPTION_REQUIRES_MEDIA
+        assert answer.text == "Для этого формата нужно одно фото или видео. Добавьте медиа либо выберите раздельный формат"
+
+        # Assert no message edit occurred on error: the user remains on the format menu screen
+        edit_calls = [m for m in methods if isinstance(m, EditMessageText)]
+        assert len(edit_calls) == 0, "Current screen must be preserved on error"
+
+        # Verify DB is unchanged
+        async with db_session_maker() as session:
+            s_check = await session.get(EventScenario, scen.id)
+            assert s_check.media_format == "separate_media_top"
+
+        # Step 5: Press Back to return to edit menu
+        methods = await feed_callback(back_edit_btn.callback_data)
+        assert any("Редактирование мероприятия" in (m.text or "") for m in methods if isinstance(m, EditMessageText))
+
+        # Step 6: Go to Media manager and add 1 photo
+        media_btn = find_button(methods, f"admin_ev_edit_media_{scen.id}")
+        methods = await feed_callback(media_btn.callback_data)
+
+        add_media_btn = find_button(methods, f"admin_ev_media_add_{scen.id}")
+        methods = await feed_callback(add_media_btn.callback_data)
+
+        photo = [PhotoSize(file_id="tg_photo_caption_test", file_unique_id="uniq_1", width=300, height=300)]
+        methods = await feed_message("", photo=photo)
+
+        save_media_btn = find_button(methods, f"admin_ev_media_save_{scen.id}")
+        methods = await feed_callback(save_media_btn.callback_data)
+
+        # Verify photo saved in DB
+        db_media = await list_scenario_media(db_session_maker, scen.id)
+        assert len(db_media) == 1
+
+        # Step 7: Now reopen edit menu and format menu again
+        edit_btn = find_button(methods, f"admin_ev_edit_menu_{scen.id}")
+        methods = await feed_callback(edit_btn.callback_data)
+
+        fmt_menu_btn = find_button(methods, f"admin_ev_format_menu_{scen.id}")
+        methods = await feed_callback(fmt_menu_btn.callback_data)
+
+        caption_btn = find_button(methods, f"admin_ev_set_fmt_{scen.id}_caption")
+        # With 1 media attached, choosing media_caption succeeds!
+        methods = await feed_callback(caption_btn.callback_data)
+
+        answer_ok = next((m for m in methods if isinstance(m, AnswerCallbackQuery)), None)
+        assert answer_ok is not None
+        assert answer_ok.show_alert is False or answer_ok.show_alert is None
+        assert "Фото/видео с текстом (подпись)" in answer_ok.text
+
+        edit_ok = next((m for m in methods if isinstance(m, EditMessageText)), None)
+        assert edit_ok is not None
+        assert "Формат доставки успешно обновлён" in edit_ok.text
+
+        # Verify DB was atomically updated to caption format
+        async with db_session_maker() as session:
+            s_updated = await session.get(EventScenario, scen.id)
+            assert s_updated.media_format == "caption"
+
+        # Step 8: Return to scenario card and back to initial events list
+        card_btn = find_button(methods, f"admin_ev_open_{scen.id}")
+        methods = await feed_callback(card_btn.callback_data)
+        assert any("Фото/видео с текстом (подпись)" in (m.text or "") for m in methods if isinstance(m, EditMessageText))
+
+        list_btn = find_button(methods, "admin_ev_page_")
+        methods = await feed_callback(list_btn.callback_data)
+        assert any("Сценарии мероприятий" in (m.text or "") for m in methods if isinstance(m, EditMessageText))
+
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+@pytest.mark.asyncio
+async def test_telegram_event_callback_alert_long_error_safe(db_session_maker, monkeypatch):
+    """Verify that any excessively long error message (300+ chars) passed to callback.answer
+    is safely bounded to <= 200 chars and does not trigger MESSAGE_TOO_LONG."""
+    import handlers
+    from aiogram.methods import AnswerCallbackQuery
+    from event_admin_service import create_scenario
+    from event_admin_telegram import TELEGRAM_CALLBACK_ALERT_MAX_LENGTH
+
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="webinar_long_err",
+        event_type="webinar",
+        title="Тест длинных ошибок",
+        starts_at_utc=datetime.utcnow() + timedelta(days=1),
+        link="https://example.test/long-err",
+        description="Описание",
+        media_format="separate_media_top",
+    )
+
+    routers = (event_admin_router, handlers.router)
+    original_parents = {r: r._parent_router for r in routers}
+    dp = Dispatcher(storage=MemoryStorage())
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+    for router in routers:
+        router._parent_router = None
+        dp.include_router(router)
+
+    # Monkeypatch update_scenario_fields to throw a huge 400-char exception
+    huge_msg = "Критическая ошибка хранилища базы данных: " + ("детали ошибки сценария " * 12)
+    assert len(huge_msg) > 250
+
+    async def mock_update_scenario_fields(*args, **kwargs):
+        raise RuntimeError(huge_msg)
+
+    monkeypatch.setattr(event_admin_telegram, "update_scenario_fields", mock_update_scenario_fields)
+
+    try:
+        methods = await _feed_callback(dp, bot, f"admin_ev_set_fmt_{scen.id}_separate_text_top")
+        for m in methods:
+            m.__class__.model_validate(m.model_dump())
+
+        answer = next((m for m in methods if isinstance(m, AnswerCallbackQuery)), None)
+        assert answer is not None
+        assert answer.show_alert is True
+        assert len(answer.text) <= TELEGRAM_CALLBACK_ALERT_MAX_LENGTH
+        assert answer.text.endswith("…")
+    finally:
+        for router in routers:
+            router._parent_router = original_parents[router]
+
+
+

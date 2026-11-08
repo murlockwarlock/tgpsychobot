@@ -17,6 +17,7 @@ import html
 import logging
 import re
 from datetime import datetime
+from functools import wraps
 from typing import Any
 
 from aiogram import BaseMiddleware, Bot, F, Router
@@ -129,6 +130,55 @@ class DatabaseAdminFilter(Filter):
             return False
         admin_ids = await get_all_admin_ids()
         return user.id in admin_ids
+
+
+TELEGRAM_CALLBACK_ALERT_MAX_LENGTH = 200
+
+ALERT_MEDIA_CAPTION_REQUIRES_MEDIA = (
+    "Для этого формата нужно одно фото или видео. Добавьте медиа либо выберите раздельный формат"
+)
+
+
+def safe_callback_alert_text(text: str, max_length: int = TELEGRAM_CALLBACK_ALERT_MAX_LENGTH) -> str:
+    """Ensures callback alert text never exceeds Telegram Bot API length limits (200 chars)."""
+    cleaned = (text or "").strip()
+    if len(cleaned) <= max_length:
+        return cleaned
+    return cleaned[: max_length - 1].rstrip() + "…"
+
+
+def _is_missing_caption_media_error(err: EventContentValidationError) -> bool:
+    """Returns True if validation failed due to missing media attachments in caption format."""
+    if err.result and err.result.violations:
+        for v in err.result.violations:
+            if v.path_id == "media_mode_caption_count" and getattr(v, "length", None) == 0:
+                return True
+    if getattr(err, "actual_length", None) == 0 and (
+        "подпись" in err.message.lower() or "caption" in err.message.lower()
+    ):
+        return True
+    if "сейчас: 0" in err.message and (
+        "подпись" in err.message.lower() or "медиа" in err.message.lower()
+    ):
+        return True
+    return False
+
+
+def _format_event_content_validation_alert(err: EventContentValidationError) -> str:
+    """Formats EventContentValidationError into a safe, clear callback alert <= 200 chars."""
+    if _is_missing_caption_media_error(err):
+        return ALERT_MEDIA_CAPTION_REQUIRES_MEDIA
+
+    rec = f" ({err.recommendation})" if err.recommendation else ""
+    candidate = f"❌ Нельзя выбрать формат: {err.message}{rec}"
+    if len(candidate) <= TELEGRAM_CALLBACK_ALERT_MAX_LENGTH:
+        return candidate
+
+    without_rec = f"❌ Нельзя выбрать формат: {err.message}"
+    if len(without_rec) <= TELEGRAM_CALLBACK_ALERT_MAX_LENGTH:
+        return without_rec
+
+    return safe_callback_alert_text(without_rec, TELEGRAM_CALLBACK_ALERT_MAX_LENGTH)
 
 
 class EnsureCallbackAnsweredMiddleware(BaseMiddleware):
@@ -676,7 +726,7 @@ async def toggle_active_handler(callback: CallbackQuery, state: FSMContext | Non
         msg_text = "Регистрация включена!" if new_active else "Регистрация приостановлена."
         await callback.answer(msg_text)
     except Exception as exc:
-        await callback.answer(f"Ошибка: {exc}", show_alert=True)
+        await callback.answer(safe_callback_alert_text(f"Ошибка: {exc}"), show_alert=True)
         return
 
     scen = await get_scenario_summary(async_session_maker, event_id)
@@ -720,7 +770,7 @@ async def archive_yes_handler(callback: CallbackQuery, state: FSMContext | None 
         await archive_scenario(async_session_maker, event_id)
         await callback.answer("Мероприятие архивировано.")
     except Exception as exc:
-        await callback.answer(f"Ошибка: {exc}", show_alert=True)
+        await callback.answer(safe_callback_alert_text(f"Ошибка: {exc}"), show_alert=True)
         return
 
     scen = await get_scenario_summary(async_session_maker, event_id)
@@ -1098,10 +1148,10 @@ async def set_format_handler(callback: CallbackQuery, state: FSMContext) -> None
             reply_markup=_scenario_edit_keyboard(scen, list_back=list_back),
         )
     except EventContentValidationError as err:
-        rec = f"\n\n💡 Рекомендация: {err.recommendation}" if err.recommendation else ""
-        await callback.answer(f"❌ Нельзя выбрать формат: {err.message}{rec}", show_alert=True)
+        alert_text = _format_event_content_validation_alert(err)
+        await callback.answer(alert_text, show_alert=True)
     except Exception as exc:
-        await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
+        await callback.answer(safe_callback_alert_text(f"❌ Ошибка: {exc}"), show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin_ev_cancel_draft_"))
@@ -1666,7 +1716,7 @@ async def save_description(callback: CallbackQuery, state: FSMContext) -> None:
         kb.adjust(1)
         await callback.message.edit_text(error_msg, parse_mode="HTML", reply_markup=kb.as_markup())
     except Exception as exc:
-        await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
+        await callback.answer(safe_callback_alert_text(f"❌ Ошибка: {exc}"), show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin_ev_description_delete_"))
@@ -1876,7 +1926,7 @@ async def save_media(callback: CallbackQuery, state: FSMContext) -> None:
         kb.adjust(1)
         await callback.message.edit_text(error_msg, parse_mode="HTML", reply_markup=kb.as_markup())
     except Exception as exc:
-        await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
+        await callback.answer(safe_callback_alert_text(f"❌ Ошибка: {exc}"), show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin_ev_toggle_media_order_"))
@@ -1891,15 +1941,21 @@ async def toggle_media_order(callback: CallbackQuery, state: FSMContext | None =
     if not scen:
         await callback.answer("Мероприятие не найдено.", show_alert=True)
         return
-    updated = await update_scenario_fields(
-        async_session_maker,
-        event_id,
-        media_order="text_top" if scen.media_order == "media_top" else "media_top",
-    )
-    await callback.message.edit_text(
-        f"✅ Порядок изменён: {'текст → медиа' if updated.media_order == 'text_top' else 'медиа → текст'}",
-        reply_markup=_scenario_edit_keyboard(updated, list_back=list_back),
-    )
+    try:
+        updated = await update_scenario_fields(
+            async_session_maker,
+            event_id,
+            media_order="text_top" if scen.media_order == "media_top" else "media_top",
+        )
+        await callback.message.edit_text(
+            f"✅ Порядок изменён: {'текст → медиа' if updated.media_order == 'text_top' else 'медиа → текст'}",
+            reply_markup=_scenario_edit_keyboard(updated, list_back=list_back),
+        )
+    except EventContentValidationError as err:
+        alert_text = _format_event_content_validation_alert(err)
+        await callback.answer(alert_text, show_alert=True)
+    except Exception as exc:
+        await callback.answer(safe_callback_alert_text(f"❌ Ошибка: {exc}"), show_alert=True)
 
 
 # ==============================================================================
@@ -2273,7 +2329,7 @@ async def toggle_step_event_details(callback: CallbackQuery, state: FSMContext |
         await set_step_event_details(async_session_maker, step_id, not step.include_event_details)
         await _render_step_card_view(callback, step_id, back=list_back)
     except Exception as exc:
-        await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
+        await callback.answer(safe_callback_alert_text(f"❌ Ошибка: {exc}"), show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin_ev_step_edit_text_"))
@@ -2393,7 +2449,7 @@ async def process_edit_offset_preset(callback: CallbackQuery, state: FSMContext)
             ),
         )
     except Exception as exc:
-        await callback.answer(f"❌ Ошибка: {exc}", show_alert=True)
+        await callback.answer(safe_callback_alert_text(f"❌ Ошибка: {exc}"), show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin_ev_step_edit_custom_"))
