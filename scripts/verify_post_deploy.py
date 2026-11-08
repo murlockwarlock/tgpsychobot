@@ -64,6 +64,13 @@ async def run_single_instance_worker(
     """
     is_production = production or (os.environ.get("PRODUCTION") == "1")
 
+    # Enforce strict production mode whenever live_send is requested
+    if live_send and not is_production:
+        raise RuntimeError(
+            f"LIVE SEND FORBIDDEN for {instance_name}: live_send strictly requires production mode "
+            "(production=True). Live sending without strict production checks (PM2, real tokens, verified env) is forbidden."
+        )
+
     # 1. Enforce BOT_INSTANCE_ID
     bot_instance_id = os.environ.get("BOT_INSTANCE_ID")
     if not bot_instance_id or bot_instance_id != instance_name:
@@ -171,12 +178,17 @@ async def run_single_instance_worker(
                 "Blind broadcast to all production admins is forbidden."
             )
 
-        target_chat_ids = [cid for cid in recipient_chat_ids if cid in admin_ids]
-        if not target_chat_ids:
+        # Enforce that ALL specified recipients must be authorized admins for this instance.
+        # Do not silently filter out foreign IDs.
+        unauthorized = [cid for cid in recipient_chat_ids if cid not in admin_ids]
+        if unauthorized:
             raise RuntimeError(
-                f"LIVE SEND ERROR for {instance_name}: None of the specified recipients "
-                f"{recipient_chat_ids} are authorized admins (resolved admins: {admin_ids})"
+                f"LIVE SEND REJECTED for {instance_name}: recipient chat IDs {unauthorized} "
+                f"are not authorized administrators for this instance (allowed admins: {list(admin_ids)}). "
+                "All specified recipients must be authorized; partial or unverified recipient lists are forbidden."
             )
+
+        target_chat_ids = list(dict.fromkeys(recipient_chat_ids))
 
         # Step 5a: Confirm real bot identity via getMe
         identity = await notification_routing.verify_bot_identity_live(
@@ -349,6 +361,12 @@ async def verify_post_deploy(
     Spawns isolated child processes for each instance check.
     """
     is_production = production or (os.environ.get("PRODUCTION") == "1")
+
+    if live_send and not is_production:
+        raise ValueError(
+            "verify_post_deploy(live_send=True) requires production=True. "
+            "Live sending without strict production checks (PM2, real tokens, verified env) is forbidden."
+        )
 
     if live_send and not recipient_chat_ids:
         raise ValueError(
@@ -630,6 +648,12 @@ def main():
             recipient_ids = [int(x.strip()) for x in args.recipient_chat_ids.split(",") if x.strip()]
         except ValueError:
             parser.error(f"Invalid --recipient-chat-ids: {args.recipient_chat_ids!r}. Expected comma-separated integers.")
+
+    if args.live_send and not args.production:
+        parser.error(
+            "--live-send requires explicit --production mode. "
+            "Live sending without strict production checks (PM2, real tokens, verified env) is forbidden."
+        )
 
     if args.live_send and not recipient_ids:
         parser.error(

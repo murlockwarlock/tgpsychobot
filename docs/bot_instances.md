@@ -87,9 +87,11 @@ For verifying notification routing, process isolation, and environment integrity
 - **Live Send Restriction (`--live-send`):**
   - `--live-send` is strictly forbidden in automated deployments and routine production checks.
   - `--live-send` is permitted **only** during specially coordinated verifications of real Telegram delivery.
-  - When `--live-send` is authorized, explicit recipient chat IDs must be supplied via `--recipient-chat-ids`:
+  - `--live-send` **strictly requires `--production`** (live send without strict production checks on PM2, tokens, and verified environment is rejected).
+  - Explicit recipient chat IDs must be supplied via `--recipient-chat-ids`:
     ```bash
     python3 scripts/verify_post_deploy.py --production --live-send --recipient-chat-ids 272982544
     ```
-  - Running `--live-send` without `--recipient-chat-ids` is rejected to prevent accidental broadcast to production admins or clients.
+  - Running `--live-send` without `--recipient-chat-ids` is rejected.
+  - The entire list of `--recipient-chat-ids` is validated against authorized administrators of the instance before sending. If even one ID is unauthorized or foreign, the entire run is rejected fail-closed without sending any messages.
 

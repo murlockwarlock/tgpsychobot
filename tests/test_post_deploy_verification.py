@@ -310,6 +310,7 @@ async def test_negative_partial_delivery_fails_criterion(monkeypatch):
             await run_single_instance_worker(
                 "max_id519010411655_bot_new",
                 live_send=True,
+                production=True,
                 recipient_chat_ids=[272982544, 806750628],
             )
 
@@ -355,6 +356,7 @@ async def test_negative_telegram_api_failure_handled(monkeypatch):
             await run_single_instance_worker(
                 "tg_autobusbusbot_new",
                 live_send=True,
+                production=True,
                 recipient_chat_ids=[272982544],
             )
 
@@ -407,7 +409,7 @@ def test_database_engine_process_isolation():
 async def test_live_send_without_recipients_raises_in_orchestrator():
     """Verify that orchestrator rejects live_send=True without explicit recipient_chat_ids."""
     with pytest.raises(ValueError, match="requires explicit recipient_chat_ids"):
-        await verify_post_deploy(live_send=True)
+        await verify_post_deploy(live_send=True, production=True)
 
 
 @pytest.mark.asyncio
@@ -452,6 +454,7 @@ async def test_live_send_filters_to_specified_recipient_chat_ids(monkeypatch):
         report = await run_single_instance_worker(
             "tg_autobusbusbot_new",
             live_send=True,
+            production=True,
             recipient_chat_ids=[272982544],
         )
 
@@ -474,36 +477,112 @@ async def test_live_send_unauthorized_recipient_chat_id_rejected(monkeypatch):
     monkeypatch.setenv("BOT_TOKEN", "8346799080:AAValidTokenPrefix12345")
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/psy5d2_db")
 
-    with pytest.raises(RuntimeError, match="None of the specified recipients .* are authorized admins"):
+    with pytest.raises(RuntimeError, match="not authorized administrators"):
         await run_single_instance_worker(
             "tg_autobusbusbot_new",
             live_send=True,
+            production=True,
             recipient_chat_ids=[99999999999],
         )
 
 
-def test_cli_live_send_requires_recipient_chat_ids():
-    """Verify CLI error when --live-send is invoked without --recipient-chat-ids."""
+def test_cli_live_send_requires_production_and_recipient_chat_ids():
+    """Verify CLI error when --live-send is invoked without --production or without --recipient-chat-ids."""
     script_path = REPO_ROOT / "scripts" / "verify_post_deploy.py"
-    res = subprocess.run(
-        [sys.executable, str(script_path), "--live-send"],
+
+    # 1. Without --production
+    res1 = subprocess.run(
+        [sys.executable, str(script_path), "--live-send", "--recipient-chat-ids", "272982544"],
         capture_output=True,
         text=True,
     )
-    assert res.returncode == 2
-    assert "Blind broadcast to all production admins is forbidden" in res.stderr
+    assert res1.returncode == 2
+    assert "--live-send requires explicit --production mode" in res1.stderr
 
-
-def test_cli_worker_live_send_requires_recipient_chat_ids():
-    """Verify worker CLI error when --check-instance is run with --live-send but without recipients."""
-    script_path = REPO_ROOT / "scripts" / "verify_post_deploy.py"
-    res = subprocess.run(
-        [sys.executable, str(script_path), "--check-instance", "tg_autobusbusbot_new", "--live-send"],
+    # 2. With --production but without --recipient-chat-ids
+    res2 = subprocess.run(
+        [sys.executable, str(script_path), "--live-send", "--production"],
         capture_output=True,
         text=True,
     )
-    assert res.returncode == 2
-    assert "Blind broadcast to all production admins is forbidden" in res.stderr
+    assert res2.returncode == 2
+    assert "Blind broadcast to all production admins is forbidden" in res2.stderr
+
+
+def test_cli_worker_live_send_requires_production_and_recipient_chat_ids():
+    """Verify worker CLI error when --check-instance is run with --live-send without --production or recipients."""
+    script_path = REPO_ROOT / "scripts" / "verify_post_deploy.py"
+
+    # 1. Without --production
+    res1 = subprocess.run(
+        [sys.executable, str(script_path), "--check-instance", "tg_autobusbusbot_new", "--live-send", "--recipient-chat-ids", "272982544"],
+        capture_output=True,
+        text=True,
+    )
+    assert res1.returncode == 2
+    assert "--live-send requires explicit --production mode" in res1.stderr
+
+    # 2. With --production but without --recipient-chat-ids
+    res2 = subprocess.run(
+        [sys.executable, str(script_path), "--check-instance", "tg_autobusbusbot_new", "--live-send", "--production"],
+        capture_output=True,
+        text=True,
+    )
+    assert res2.returncode == 2
+    assert "Blind broadcast to all production admins is forbidden" in res2.stderr
+
+
+@pytest.mark.asyncio
+async def test_live_send_without_production_raises_in_orchestrator():
+    """Verify orchestrator rejects live_send=True when production=False."""
+    with pytest.raises(ValueError, match="requires production=True"):
+        await verify_post_deploy(live_send=True, production=False, recipient_chat_ids=[272982544])
+
+
+@pytest.mark.asyncio
+async def test_live_send_without_production_raises_in_worker(monkeypatch):
+    """Verify worker rejects live_send=True when production=False."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_autobusbusbot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8346799080:AAValidTokenPrefix12345")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/psy5d2_db")
+
+    with pytest.raises(RuntimeError, match="live_send strictly requires production mode"):
+        await run_single_instance_worker(
+            "tg_autobusbusbot_new",
+            live_send=True,
+            production=False,
+            recipient_chat_ids=[272982544],
+        )
+
+
+@pytest.mark.asyncio
+async def test_live_send_mixed_recipients_with_foreign_id_rejected_entirely(monkeypatch):
+    """
+    Verify that if even one recipient in recipient_chat_ids is unauthorized,
+    the entire live-send is rejected BEFORE any message is sent (no silent filtering).
+    """
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_autobusbusbot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8346799080:AAValidTokenPrefix12345")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/psy5d2_db")
+
+    mock_create_bot = MagicMock()
+    with patch("telegram_client.create_telegram_bot", mock_create_bot), \
+         patch("notification_routing.verify_bot_identity_live", AsyncMock(return_value={"verified": True, "id": 8346799080, "username": "autobusbusbot"})):
+        # 272982544 is valid admin, 99999999999 is foreign/unauthorized
+        with pytest.raises(RuntimeError) as exc_info:
+            await run_single_instance_worker(
+                "tg_autobusbusbot_new",
+                live_send=True,
+                production=True,
+                recipient_chat_ids=[272982544, 99999999999],
+            )
+
+        err_msg = str(exc_info.value)
+        assert "LIVE SEND REJECTED" in err_msg
+        assert "99999999999" in err_msg
+        assert "not authorized administrators" in err_msg
+        # Critical guarantee: zero messages dispatched, create_telegram_bot never invoked
+        mock_create_bot.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -514,7 +593,7 @@ async def test_direct_worker_without_recipients_forbidden_unconditionally(monkey
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/psy5d2_db")
 
     with pytest.raises(RuntimeError, match="LIVE SEND FORBIDDEN"):
-        await run_single_instance_worker("tg_autobusbusbot_new", live_send=True)
+        await run_single_instance_worker("tg_autobusbusbot_new", live_send=True, production=True)
 
 
 @pytest.mark.asyncio
