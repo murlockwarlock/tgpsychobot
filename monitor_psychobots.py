@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import html
+import inspect
 import json
 import os
 import re
@@ -648,6 +649,7 @@ def load_state(path: str | Path | None = None) -> dict:
     state.setdefault("stuck_dialogues", {})
     state.setdefault("active_incidents", {})
     state.setdefault("polling_failure_counts", {})
+    state.setdefault("pending_notifications", {})
     return state
 
 
@@ -1024,8 +1026,16 @@ def should_alert(issues: list[str], state: dict) -> bool:
     last = alerts.get(signature, 0)
     if now - int(last) < REPEAT_ALERT_SECONDS:
         return False
-    alerts[signature] = now
     return True
+
+
+def record_alert_delivered(issues: list[str], state: dict) -> None:
+    if not issues:
+        return
+    now = int(time.time())
+    signature = hashlib.sha256("\n".join(sorted(issues)).encode("utf-8")).hexdigest()
+    alerts = state.setdefault("alerts", {})
+    alerts[signature] = now
 
 
 NON_NETWORK_AUTH_PATTERNS = (
@@ -1237,12 +1247,24 @@ def get_candidate_alert_tokens(apps: list[dict]) -> list[str]:
     return tokens
 
 
-async def send_alert(apps: list[dict], text: str) -> bool:
-    recipients = get_system_diagnostic_recipients(apps)
+async def send_alert(
+    apps: list[dict],
+    text: str,
+    recipients: list[int] | None = None,
+    delivered_recipients: set[int] | list[int] | None = None,
+) -> bool:
+    target_recipients = recipients if recipients is not None else get_system_diagnostic_recipients(apps)
     tokens = get_candidate_alert_tokens(apps)
-    if not recipients or not tokens:
+    if not target_recipients or not tokens:
         print("No notification recipients or bot tokens found")
         return False
+
+    already_delivered: set[int] = (
+        set(delivered_recipients) if delivered_recipients is not None else set()
+    )
+    to_send = [r for r in target_recipients if r not in already_delivered]
+    if not to_send:
+        return True
 
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as http:
@@ -1254,9 +1276,10 @@ async def send_alert(apps: list[dict], text: str) -> bool:
             proxy_kwargs = proxy_request_kwargs(proxy_url)
         except ValueError:
             proxy_kwargs = {}
-        for token in tokens:
-            delivered = False
-            for chat_id in recipients:
+
+        for chat_id in to_send:
+            chat_delivered = False
+            for token in tokens:
                 try:
                     payload = {
                         "chat_id": chat_id,
@@ -1271,7 +1294,8 @@ async def send_alert(apps: list[dict], text: str) -> bool:
                     ) as resp:
                         data = await resp.json(content_type=None)
                         if resp.status == 200 and data.get("ok"):
-                            delivered = True
+                            chat_delivered = True
+                            break
                         elif resp.status == 400:
                             # Retry without parse_mode in case log text contained unsupported markup
                             payload.pop("parse_mode", None)
@@ -1282,13 +1306,57 @@ async def send_alert(apps: list[dict], text: str) -> bool:
                             ) as retry_resp:
                                 retry_data = await retry_resp.json(content_type=None)
                                 if retry_resp.status == 200 and retry_data.get("ok"):
-                                    delivered = True
+                                    chat_delivered = True
+                                    break
                 except Exception:
                     continue
-            if delivered:
-                return True
-    print("Failed to deliver Telegram alert")
-    return False
+            if chat_delivered:
+                already_delivered.add(chat_id)
+                if delivered_recipients is not None:
+                    if isinstance(delivered_recipients, set):
+                        delivered_recipients.add(chat_id)
+                    elif isinstance(delivered_recipients, list) and chat_id not in delivered_recipients:
+                        delivered_recipients.append(chat_id)
+
+    all_delivered = set(target_recipients).issubset(already_delivered)
+    if not all_delivered:
+        print("Failed to deliver Telegram alert to all recipients")
+        return False
+    return True
+
+
+async def _deliver_notification(
+    apps: list[dict],
+    notif: dict,
+    state: dict,
+) -> bool:
+    text = notif.get("text", "")
+    if not text:
+        return True
+
+    target_recipients = get_system_diagnostic_recipients(apps)
+    delivered_recipients = set(notif.setdefault("delivered_recipients", []))
+
+    sig = inspect.signature(send_alert)
+    accepts_advanced = "recipients" in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+
+    if accepts_advanced:
+        success = await send_alert(
+            apps,
+            text,
+            recipients=target_recipients,
+            delivered_recipients=delivered_recipients,
+        )
+        notif["delivered_recipients"] = sorted(delivered_recipients)
+        return success
+    else:
+        success = await send_alert(apps, text)
+        if success:
+            notif["delivered_recipients"] = list(target_recipients)
+            return True
+        return False
 
 
 async def run_check(
@@ -1383,6 +1451,7 @@ async def run_check(
             or (INCIDENT_SHARED_NETWORK in active_incidents and len(affected_net_bots) >= 1)
         )
 
+        pending_notifications = state.setdefault("pending_notifications", {})
         should_alert_shared_network = False
         summary = ""
         proxy_status = ""
@@ -1397,8 +1466,8 @@ async def run_check(
                 active_incidents[INCIDENT_SHARED_NETWORK] = {
                     "first_seen": now,
                     "last_seen": now,
-                    "last_alerted": now,
-                    "alert_count": 1,
+                    "last_alerted": 0,
+                    "alert_count": 0,
                     "affected_bots": sorted(affected_net_bots),
                     "summary": summary,
                 }
@@ -1408,20 +1477,39 @@ async def run_check(
                 inc["last_seen"] = now
                 inc["affected_bots"] = sorted(affected_net_bots)
                 inc["summary"] = summary
-                if now - int(inc.get("last_alerted", 0)) >= get_network_repeat_seconds():
-                    inc["last_alerted"] = now
-                    inc["alert_count"] = inc.get("alert_count", 1) + 1
+                last_alerted = int(inc.get("last_alerted", 0))
+                if last_alerted == 0 or (now - last_alerted >= get_network_repeat_seconds()):
                     should_alert_shared_network = True
                 else:
                     should_alert_shared_network = False
+
+            pending_notifications.pop("recovery", None)
         else:
-            if INCIDENT_SHARED_NETWORK in active_incidents:
-                inc = active_incidents.pop(INCIDENT_SHARED_NETWORK)
-                duration_sec = max(0, now - int(inc.get("first_seen", now)))
-                duration_str = format_age(duration_sec)
-                bot_count = len(inc.get("affected_bots", [])) or len(telegram_apps)
-                recovery_text = format_recovery_alert(bot_count, duration_str)
-                await send_alert(apps, recovery_text)
+            if INCIDENT_SHARED_NETWORK in active_incidents or "recovery" in pending_notifications:
+                # Flush pending issue notification if any before sending recovery
+                if "issue" in pending_notifications:
+                    pending_issue = pending_notifications["issue"]
+                    issue_delivered = await _deliver_notification(apps, pending_issue, state)
+                    if issue_delivered:
+                        pending_notifications.pop("issue", None)
+
+                if "recovery" not in pending_notifications:
+                    inc = active_incidents.get(INCIDENT_SHARED_NETWORK, {})
+                    duration_sec = max(0, now - int(inc.get("first_seen", now)))
+                    duration_str = format_age(duration_sec)
+                    bot_count = len(inc.get("affected_bots", [])) or len(telegram_apps)
+                    recovery_text = format_recovery_alert(bot_count, duration_str)
+                    pending_notifications["recovery"] = {
+                        "text": recovery_text,
+                        "created_at": now,
+                        "delivered_recipients": [],
+                    }
+
+                rec_notif = pending_notifications["recovery"]
+                rec_delivered = await _deliver_notification(apps, rec_notif, state)
+                if rec_delivered:
+                    pending_notifications.pop("recovery", None)
+                    active_incidents.pop(INCIDENT_SHARED_NETWORK, None)
 
         remaining_issues = []
         for name, issues in all_issues:
@@ -1434,17 +1522,34 @@ async def run_check(
         flat_remaining = [f"{name}: {issue}" for name, issues in remaining_issues for issue in issues]
         should_alert_other = should_alert(flat_remaining, state) if flat_remaining else False
 
-        if should_alert_shared_network or should_alert_other:
+        has_undelivered_pending_issue = "issue" in pending_notifications
+
+        if should_alert_shared_network or should_alert_other or has_undelivered_pending_issue:
             alert_text = format_issues_alert(
                 all_issues=all_issues,
                 is_shared_network_active=is_shared_network,
-                include_network_summary=should_alert_shared_network,
+                include_network_summary=should_alert_shared_network or (is_shared_network and has_undelivered_pending_issue),
                 shared_network_summary=summary,
                 affected_net_bots=affected_net_bots,
                 total_tg_bots=len(telegram_apps),
                 proxy_status=proxy_status,
             )
-            await send_alert(apps, alert_text)
+            pending_issue = pending_notifications.setdefault("issue", {
+                "text": alert_text,
+                "created_at": now,
+                "delivered_recipients": [],
+            })
+            pending_issue["text"] = alert_text
+
+            delivered = await _deliver_notification(apps, pending_issue, state)
+            if delivered:
+                inc = active_incidents.get(INCIDENT_SHARED_NETWORK)
+                if inc and (should_alert_shared_network or int(inc.get("last_alerted", 0)) == 0):
+                    inc["last_alerted"] = now
+                    inc["alert_count"] = inc.get("alert_count", 0) + 1
+                if should_alert_other:
+                    record_alert_delivered(flat_remaining, state)
+                pending_notifications.pop("issue", None)
 
         save_state(state)
         if all_issues:

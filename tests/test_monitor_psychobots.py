@@ -3019,6 +3019,212 @@ async def test_active_network_incident_new_db_error_does_not_unfurl_16_bots(monk
         assert f"<b>bot_{i}</b>" not in alert
 
 
+@pytest.mark.asyncio
+async def test_alert_delivery_failure_retries_and_defers_cooldown(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "bot_0")
+
+    apps = [
+        {"name": f"bot_{i}", "status": "online", "token": f"tok_{i}", "owner_ids": [100]}
+        for i in range(16)
+    ]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_db_schema", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *args, **kwargs: [])
+
+    async def fake_failing_telegram(app, http):
+        return ["Telegram getMe failed: TimeoutError: "]
+    monkeypatch.setattr(monitor, "check_telegram", fake_failing_telegram)
+
+    send_calls = []
+    send_result = False
+
+    async def mock_send(a, text, **kwargs):
+        send_calls.append(text)
+        return send_result
+
+    monkeypatch.setattr(monitor, "send_alert", mock_send)
+
+    # Run 1: send_alert returns False (delivery failure)
+    send_result = False
+    exit_code_1 = await monitor.run_check(False)
+    assert exit_code_1 == 1
+    assert len(send_calls) == 1
+
+    state = monitor.load_state(state_file)
+    assert monitor.INCIDENT_SHARED_NETWORK in state["active_incidents"]
+    inc = state["active_incidents"][monitor.INCIDENT_SHARED_NETWORK]
+    # Cooldown has NOT started because delivery failed!
+    assert inc.get("last_alerted", 0) == 0
+    # Notification is saved as pending
+    assert "issue" in state.get("pending_notifications", {})
+
+    # Run 2: send_alert now succeeds
+    send_calls.clear()
+    send_result = True
+    exit_code_2 = await monitor.run_check(False)
+    assert exit_code_2 == 1
+    assert len(send_calls) == 1
+
+    state = monitor.load_state(state_file)
+    inc = state["active_incidents"][monitor.INCIDENT_SHARED_NETWORK]
+    # Delivery confirmed: last_alerted set to now, cooldown starts!
+    assert inc.get("last_alerted", 0) > 0
+    # Pending notification cleared
+    assert "issue" not in state.get("pending_notifications", {})
+
+    # Run 3: Issue still ongoing, but cooldown is active -> send_alert NOT called!
+    send_calls.clear()
+    exit_code_3 = await monitor.run_check(False)
+    assert exit_code_3 == 1
+    assert len(send_calls) == 0  # Suppressed by cooldown!
+
+
+@pytest.mark.asyncio
+async def test_recovery_delivery_failure_retries_and_does_not_drop_incident(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "bot_0")
+
+    apps = [
+        {"name": f"bot_{i}", "status": "online", "token": f"tok_{i}", "owner_ids": [100]}
+        for i in range(16)
+    ]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_db_schema", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_telegram", fake_empty_async)
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *args, **kwargs: [])
+
+    # Pre-populate active incident in state
+    state = monitor.load_state(state_file)
+    now = int(monitor.time.time())
+    state["active_incidents"][monitor.INCIDENT_SHARED_NETWORK] = {
+        "first_seen": now - 300,
+        "last_seen": now - 60,
+        "last_alerted": now - 300,
+        "alert_count": 1,
+        "affected_bots": [f"bot_{i}" for i in range(16)],
+        "summary": "HTTP 502",
+    }
+    monitor.save_state(state, state_file)
+
+    send_calls = []
+    send_result = False
+
+    async def mock_send(a, text, **kwargs):
+        send_calls.append(text)
+        return send_result
+
+    monkeypatch.setattr(monitor, "send_alert", mock_send)
+
+    # Run 1: Network recovered, but send_alert for recovery returns False!
+    send_result = False
+    exit_code_1 = await monitor.run_check(False)
+    assert exit_code_1 == 0
+    assert len(send_calls) == 1
+    assert "Связь с Telegram восстановлена" in send_calls[0]
+
+    state = monitor.load_state(state_file)
+    # Incident MUST NOT be dropped until recovery is confirmed!
+    assert monitor.INCIDENT_SHARED_NETWORK in state.get("active_incidents", {})
+    assert "recovery" in state.get("pending_notifications", {})
+
+    # Run 2: send_alert now succeeds
+    send_calls.clear()
+    send_result = True
+    exit_code_2 = await monitor.run_check(False)
+    assert exit_code_2 == 0
+    assert len(send_calls) == 1
+    assert "Связь с Telegram восстановлена" in send_calls[0]
+
+    state = monitor.load_state(state_file)
+    # Now incident and recovery pending are cleanly removed
+    assert monitor.INCIDENT_SHARED_NETWORK not in state.get("active_incidents", {})
+    assert "recovery" not in state.get("pending_notifications", {})
+
+    # Run 3: Clean state, no more recovery alerts
+    send_calls.clear()
+    exit_code_3 = await monitor.run_check(False)
+    assert exit_code_3 == 0
+    assert len(send_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_partial_recipient_failure_does_not_hide_undelivered_and_prevents_duplicate(monkeypatch):
+    monkeypatch.delenv("PSYCHOBOTS_ALERT_RECIPIENTS", raising=False)
+    apps = [
+        {
+            "name": "tg_autobusbusbot_new",
+            "token": "tok_autobus",
+            "owner_ids": [272982544, 806750628],
+        }
+    ]
+
+    attempt = 1
+    requested_chat_ids = []
+
+    class FakeResponse:
+        def __init__(self, status, ok):
+            self.status = status
+            self._ok = ok
+        async def json(self, **kwargs):
+            return {"ok": self._ok}
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+
+    class FakeSession:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        def post(self, url, json=None, **kwargs):
+            chat_id = json.get("chat_id")
+            requested_chat_ids.append(chat_id)
+            if attempt == 1:
+                # First admin succeeds, second admin fails with 500
+                if chat_id == 272982544:
+                    return FakeResponse(200, True)
+                return FakeResponse(500, False)
+            else:
+                # On retry, succeeds
+                return FakeResponse(200, True)
+
+    monkeypatch.setattr(monitor.aiohttp, "ClientSession", FakeSession)
+
+    delivered_recipients = set()
+
+    # Attempt 1: One admin fails
+    attempt = 1
+    res1 = await monitor.send_alert(apps, "Test Alert", delivered_recipients=delivered_recipients)
+    # Failure to admin 2 MUST NOT be hidden!
+    assert res1 is False
+    assert delivered_recipients == {272982544}
+    assert requested_chat_ids == [272982544, 806750628]
+
+    # Attempt 2: Retry with delivered_recipients
+    attempt = 2
+    requested_chat_ids.clear()
+    res2 = await monitor.send_alert(apps, "Test Alert", delivered_recipients=delivered_recipients)
+    # Admin 1 was NOT called again (prevent duplicate!); only admin 2 was called!
+    assert requested_chat_ids == [806750628]
+    assert res2 is True
+    assert delivered_recipients == {272982544, 806750628}
+
+
 
 
 
