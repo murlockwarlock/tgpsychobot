@@ -5,6 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
+import html
 import json
 import os
 import re
@@ -43,6 +44,12 @@ def get_lock_file_path() -> str:
 LOG_READ_LIMIT = int(os.environ.get("PSYCHOBOTS_MONITOR_LOG_READ_LIMIT", str(250_000)))
 ALERT_BOT_PM2_NAME = os.environ.get("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "tg_autobusbusbot_new").strip()
 ALERT_BOT_TOKEN = os.environ.get("PSYCHOBOTS_ALERT_BOT_TOKEN", "").strip()
+FULLTEST_BOT_NAMES = frozenset({"psy5d_fulltest", "tg_kontentzavod322bot_fulltest"})
+INCLUDE_FULLTEST_DEFAULT = os.environ.get("PSYCHOBOTS_MONITOR_INCLUDE_FULLTEST", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 NL_CHECK_ENABLED = os.environ.get("PSYCHOBOTS_CHECK_NL", "1").strip().lower() not in {
     "0",
     "false",
@@ -51,12 +58,12 @@ NL_CHECK_ENABLED = os.environ.get("PSYCHOBOTS_CHECK_NL", "1").strip().lower() no
 }
 NL_HOST = os.environ.get("PSYCHOBOTS_NL_HOST", "185.70.185.209").strip()
 NL_PROXY_PORT = int(os.environ.get("PSYCHOBOTS_NL_PROXY_PORT", "3128"))
-NL_PUBLIC_PORT = int(os.environ.get("PSYCHOBOTS_NL_PUBLIC_PORT", "443"))
+NL_PUBLIC_PORT = int(os.environ.get("PSYCHOBOTS_NL_PUBLIC_PORT", "0"))
 NL_MARZBAN_PORT = int(os.environ.get("PSYCHOBOTS_NL_MARZBAN_PORT", "62050"))
 NL_MTPROTO_PORT = int(os.environ.get("PSYCHOBOTS_NL_MTPROTO_PORT", "4430"))
 NL_XRAY_PORTS = tuple(
     int(port.strip())
-    for port in os.environ.get("PSYCHOBOTS_NL_XRAY_PORTS", "2053,2069").split(",")
+    for port in os.environ.get("PSYCHOBOTS_NL_XRAY_PORTS", "").split(",")
     if port.strip()
 )
 
@@ -591,7 +598,8 @@ CRITICAL_COLUMNS = {
 
 LOG_ERROR_RE = re.compile(
     r"(UndefinedColumn|ProgrammingError|OperationalError|Traceback|Error during initial|"
-    r"Background task .*crashed|Failed to fetch updates|Flood control exceeded)",
+    r"Background task .*crashed|Failed to fetch updates|Flood control exceeded|"
+    r"RuntimeError|Exception|Error:)",
     re.IGNORECASE,
 )
 
@@ -621,7 +629,13 @@ def run_pm2_jlist() -> list[dict]:
     return json.loads(result.stdout)
 
 
-def get_bot_apps() -> list[dict]:
+def get_bot_apps(include_fulltest: bool | None = None) -> list[dict]:
+    if include_fulltest is None:
+        include_fulltest = os.environ.get("PSYCHOBOTS_MONITOR_INCLUDE_FULLTEST", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
     apps = []
     for proc in run_pm2_jlist():
         env = proc.get("pm2_env", {})
@@ -629,14 +643,19 @@ def get_bot_apps() -> list[dict]:
         db_url = env.get("DATABASE_URL")
         if not token or not db_url:
             continue
+        app_name = proc.get("name", "unknown")
+        if not include_fulltest:
+            if app_name in FULLTEST_BOT_NAMES or app_name.endswith("_fulltest"):
+                continue
         apps.append(
             {
-                "name": proc.get("name", "unknown"),
+                "name": app_name,
                 "status": env.get("status"),
                 "restart_time": env.get("restart_time", 0),
                 "pm_uptime": env.get("pm_uptime", 0),
                 "token": token,
                 "db_url": db_url,
+                "cwd": env.get("pm_cwd") or proc.get("pm_cwd"),
                 "telegram_proxy": env.get("TELEGRAM_PROXY") or os.environ.get("TELEGRAM_PROXY"),
                 "owner_ids": parse_owner_ids(env.get("OWNER_IDS", "")),
                 "delivery_mode": str(env.get("TELEGRAM_DELIVERY_MODE", "")).lower(),
@@ -688,13 +707,59 @@ def proxy_request_kwargs(proxy_url: str | None) -> dict:
     return kwargs
 
 
+def check_sqlite_db(app: dict) -> list[str]:
+    import sqlite3
+
+    db_url = str(app.get("db_url") or "")
+    try:
+        parsed = urlsplit(db_url)
+        raw_path = parsed.path
+        if raw_path.startswith(("/./", "/../")):
+            raw_path = raw_path[1:]
+        path = Path(raw_path)
+        if not path.is_absolute() and app.get("cwd"):
+            path = (Path(app["cwd"]) / path).resolve()
+        else:
+            path = path.resolve()
+    except Exception as exc:
+        return [f"DB: invalid SQLite URL: {type(exc).__name__}: {exc}"]
+
+    if not path.exists():
+        return [f"DB: SQLite database file not found: {path}"]
+
+    issues: list[str] = []
+    conn = None
+    try:
+        # Strictly read-only connection via URI
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+        cur = conn.cursor()
+        tables = {row[0] for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if not tables:
+            issues.append(f"DB: SQLite database contains no tables: {path.name}")
+        elif "users" in tables:
+            cur.execute("SELECT count(*) FROM users").fetchone()
+    except Exception as exc:
+        issues.append(f"DB: SQLite check failed: {type(exc).__name__}: {exc}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return issues
+
+
 async def check_db_schema(app: dict) -> list[str]:
+    db_url = str(app.get("db_url") or "")
+    if db_url.startswith(("sqlite:", "sqlite+aiosqlite:", "sqlite+")):
+        return check_sqlite_db(app)
+
     import asyncpg
 
     issues = []
     conn = None
     try:
-        conn = await asyncpg.connect(make_dsn(app["db_url"]), timeout=10)
+        conn = await asyncpg.connect(make_dsn(db_url), timeout=10)
         for table, expected_columns in CRITICAL_COLUMNS.items():
             rows = await conn.fetch(
                 """
@@ -753,7 +818,13 @@ async def check_payment_webhooks(app: dict, http: aiohttp.ClientSession) -> list
     if not base_url or not prefix:
         return []
 
-    url = f"{base_url}/{prefix}/webhooks/robokassa/result"
+    # If base_url already ends with /{prefix}, avoid repeating the path prefix
+    if base_url.endswith(f"/{prefix}"):
+        effective_base = base_url
+    else:
+        effective_base = f"{base_url}/{prefix}"
+
+    url = f"{effective_base}/webhooks/robokassa/result"
     try:
         async with http.get(url, allow_redirects=False) as resp:
             if resp.status != 400:
@@ -776,31 +847,85 @@ async def check_tcp_port(host: str, port: int, label: str) -> str | None:
     return None
 
 
-async def check_nl_infrastructure(http: aiohttp.ClientSession) -> list[str]:
+async def check_nl_infrastructure(http: aiohttp.ClientSession, proxy_url: str | None = None) -> list[str]:
     if not NL_CHECK_ENABLED:
         return []
 
     checks = [
         check_tcp_port(NL_HOST, NL_PROXY_PORT, "Proxy"),
-        check_tcp_port(NL_HOST, NL_PUBLIC_PORT, "VPN entrypoint"),
         check_tcp_port(NL_HOST, NL_MARZBAN_PORT, "Marzban Node"),
         check_tcp_port(NL_HOST, NL_MTPROTO_PORT, "MTProto"),
     ]
-    checks.extend(check_tcp_port(NL_HOST, port, f"Xray {port}") for port in NL_XRAY_PORTS)
+    if NL_PUBLIC_PORT > 0:
+        checks.append(check_tcp_port(NL_HOST, NL_PUBLIC_PORT, "VPN entrypoint"))
+    if NL_XRAY_PORTS:
+        checks.extend(check_tcp_port(NL_HOST, port, f"Xray {port}") for port in NL_XRAY_PORTS)
     issues = [issue for issue in await asyncio.gather(*checks) if issue]
 
-    proxy_url = os.environ.get("TELEGRAM_PROXY")
-    if not proxy_url:
+    active_proxy = proxy_url or os.environ.get("TELEGRAM_PROXY")
+    if not active_proxy:
         issues.append("Proxy: TELEGRAM_PROXY is not configured for the monitor")
         return issues
     try:
-        proxy_kwargs = proxy_request_kwargs(proxy_url)
+        proxy_kwargs = proxy_request_kwargs(active_proxy)
         async with http.get("https://api.telegram.org", **proxy_kwargs) as resp:
             if resp.status >= 500:
                 issues.append(f"Proxy: Telegram check returned HTTP {resp.status}")
     except Exception as exc:
         issues.append(f"Proxy: Telegram request failed ({type(exc).__name__})")
     return issues
+
+
+def extract_log_error_summaries(chunk: str) -> list[str]:
+    lines = chunk.splitlines()
+    summaries: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        raw_line = lines[i]
+        line = raw_line.strip()
+        if not line:
+            i += 1
+            continue
+
+        if "Traceback (most recent call last):" in line:
+            last_file_frame = ""
+            exception_line = ""
+            i += 1
+            while i < n:
+                tb_raw = lines[i]
+                tb_line = tb_raw.strip()
+                if not tb_line:
+                    i += 1
+                    continue
+                if tb_raw.startswith((" ", "\t")) or tb_line.startswith("File "):
+                    if tb_line.startswith("File "):
+                        last_file_frame = tb_line
+                    i += 1
+                else:
+                    exception_line = tb_line
+                    i += 1
+                    break
+
+            frame_info = ""
+            if last_file_frame:
+                m = re.search(r'File "([^"]+)", line (\d+)', last_file_frame)
+                if m:
+                    frame_info = f" ({Path(m.group(1)).name}:{m.group(2)})"
+
+            if exception_line:
+                summaries.append(f"{exception_line}{frame_info}")
+            elif last_file_frame:
+                summaries.append(f"Traceback at{frame_info}")
+            else:
+                summaries.append("Traceback (unparsed exception)")
+            continue
+
+        if LOG_ERROR_RE.search(line):
+            summaries.append(line)
+        i += 1
+
+    return summaries
 
 
 def read_new_log_errors(app: dict, state: dict, include_existing: bool) -> list[str]:
@@ -828,7 +953,7 @@ def read_new_log_errors(app: dict, state: dict, include_existing: bool) -> list[
         chunk = fh.read().decode("utf-8", errors="replace")
     offsets[key] = size
 
-    matches = [line.strip() for line in chunk.splitlines() if LOG_ERROR_RE.search(line)]
+    matches = extract_log_error_summaries(chunk)
     if not matches:
         return []
 
@@ -877,17 +1002,13 @@ def get_candidate_alert_tokens(apps: list[dict]) -> list[str]:
                     tokens.append(token)
                     seen.add(token)
 
-    for app in apps:
-        token = app.get("token")
-        if token and token not in seen:
-            tokens.append(token)
-            seen.add(token)
-
     return tokens
 
 
 async def send_alert(apps: list[dict], text: str) -> bool:
-    recipients = sorted({owner_id for app in apps for owner_id in app["owner_ids"]})
+    recipients = sorted(
+        {owner_id for app in apps for owner_id in app["owner_ids"] if not is_max_user_id(owner_id)}
+    )
     tokens = get_candidate_alert_tokens(apps)
     if not recipients or not tokens:
         print("No notification recipients or bot tokens found")
@@ -907,19 +1028,31 @@ async def send_alert(apps: list[dict], text: str) -> bool:
             delivered = False
             for chat_id in recipients:
                 try:
+                    payload = {
+                        "chat_id": chat_id,
+                        "text": text[:3900],
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    }
                     async with http.post(
                         f"https://api.telegram.org/bot{token}/sendMessage",
-                        json={
-                            "chat_id": chat_id,
-                            "text": text[:3900],
-                            "parse_mode": "HTML",
-                            "disable_web_page_preview": True,
-                        },
+                        json=payload,
                         **proxy_kwargs,
                     ) as resp:
                         data = await resp.json(content_type=None)
                         if resp.status == 200 and data.get("ok"):
                             delivered = True
+                        elif resp.status == 400:
+                            # Retry without parse_mode in case log text contained unsupported markup
+                            payload.pop("parse_mode", None)
+                            async with http.post(
+                                f"https://api.telegram.org/bot{token}/sendMessage",
+                                json=payload,
+                                **proxy_kwargs,
+                            ) as retry_resp:
+                                retry_data = await retry_resp.json(content_type=None)
+                                if retry_resp.status == 200 and retry_data.get("ok"):
+                                    delivered = True
                 except Exception:
                     continue
             if delivered:
@@ -928,14 +1061,18 @@ async def send_alert(apps: list[dict], text: str) -> bool:
     return False
 
 
-async def run_check(include_existing_log_errors: bool, lock_path: str | None = None) -> int:
+async def run_check(
+    include_existing_log_errors: bool,
+    lock_path: str | None = None,
+    include_fulltest: bool | None = None,
+) -> int:
     with SingleInstanceLock(lock_path) as acquired:
         if not acquired:
             print("Psychobots monitor already running; exiting cleanly.")
             return 0
 
         state = load_state()
-        apps = get_bot_apps()
+        apps = get_bot_apps(include_fulltest=include_fulltest) if include_fulltest is not None else get_bot_apps()
         all_issues = []
 
         timeout = aiohttp.ClientTimeout(total=20)
@@ -951,6 +1088,10 @@ async def run_check(include_existing_log_errors: bool, lock_path: str | None = N
                 if issues:
                     all_issues.append((app["name"], issues))
 
+            if not os.environ.get("TELEGRAM_PROXY"):
+                found_proxy = next((app.get("telegram_proxy") for app in apps if app.get("telegram_proxy")), None)
+                if found_proxy:
+                    os.environ["TELEGRAM_PROXY"] = found_proxy
             nl_issues = await check_nl_infrastructure(http)
             if nl_issues:
                 all_issues.append(("nl_infrastructure", nl_issues))
@@ -963,7 +1104,7 @@ async def run_check(include_existing_log_errors: bool, lock_path: str | None = N
             for name, issues in all_issues:
                 lines.append(f"\n<b>{name}</b>")
                 for issue in issues[:8]:
-                    lines.append(f"• {issue}")
+                    lines.append(f"• {html.escape(issue)}")
             await send_alert(apps, "\n".join(lines))
 
         save_state(state)
@@ -984,8 +1125,20 @@ def main() -> None:
         action="store_true",
         help="Read existing PM2 error log tail on first run instead of starting from EOF.",
     )
+    parser.add_argument(
+        "--include-fulltest",
+        action="store_true",
+        help="Include fulltest opt-in bots in monitoring.",
+    )
     args = parser.parse_args()
-    raise SystemExit(asyncio.run(run_check(args.include_existing_log_errors)))
+    raise SystemExit(
+        asyncio.run(
+            run_check(
+                args.include_existing_log_errors,
+                include_fulltest=args.include_fulltest,
+            )
+        )
+    )
 
 
 if __name__ == "__main__":

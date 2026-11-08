@@ -62,6 +62,7 @@ async def test_nl_check_covers_all_required_ports(monkeypatch):
 
     monkeypatch.setattr(monitor, "check_tcp_port", record_port)
     monkeypatch.setattr(monitor, "NL_CHECK_ENABLED", True)
+    monkeypatch.setattr(monitor, "NL_PUBLIC_PORT", 443)
     monkeypatch.setattr(monitor, "NL_XRAY_PORTS", (2053, 2069))
     monkeypatch.setenv("TELEGRAM_PROXY", "http://185.70.185.209:3128")
 
@@ -138,7 +139,7 @@ def test_get_candidate_alert_tokens_prioritizes_preferred_pm2_bot(monkeypatch):
 
     tokens = monitor.get_candidate_alert_tokens(apps)
 
-    assert tokens == ["token_autobus", "token_someone04", "token_veraveda"]
+    assert tokens == ["token_autobus"]
 
 
 def test_get_candidate_alert_tokens_supports_direct_token_override(monkeypatch):
@@ -152,10 +153,10 @@ def test_get_candidate_alert_tokens_supports_direct_token_override(monkeypatch):
 
     tokens = monitor.get_candidate_alert_tokens(apps)
 
-    assert tokens == ["direct_alert_token", "token_autobus", "token_someone04"]
+    assert tokens == ["direct_alert_token", "token_autobus"]
 
 
-def test_get_candidate_alert_tokens_fallback_when_preferred_not_found(monkeypatch):
+def test_get_candidate_alert_tokens_no_arbitrary_fallback_when_preferred_not_found(monkeypatch):
     monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "non_existent_bot")
     monkeypatch.delenv("PSYCHOBOTS_ALERT_BOT_TOKEN", raising=False)
 
@@ -166,7 +167,7 @@ def test_get_candidate_alert_tokens_fallback_when_preferred_not_found(monkeypatc
 
     tokens = monitor.get_candidate_alert_tokens(apps)
 
-    assert tokens == ["token_someone04", "token_veraveda"]
+    assert tokens == []
 
 
 # ==============================================================================
@@ -2276,6 +2277,181 @@ async def test_b1_f2_state_loss_blast_radius_containment(monkeypatch):
     assert len(sent_alerts) == 1
     assert "702" in sent_alerts[0]
     assert "701" not in sent_alerts[0]
+
+
+# ==============================================================================
+# False Alarm Remediation Unit Tests
+# ==============================================================================
+
+
+def test_get_bot_apps_excludes_fulltest_by_default(monkeypatch):
+    fake_procs = [
+        {
+            "name": "tg_autobusbusbot_new",
+            "pm2_env": {"BOT_TOKEN": "token_autobus", "DATABASE_URL": "postgresql://localhost/autobus"},
+        },
+        {
+            "name": "psy5d_fulltest",
+            "pm2_env": {"BOT_TOKEN": "token_fulltest", "DATABASE_URL": "postgresql://localhost/psy5d_fulltest"},
+        },
+        {
+            "name": "tg_kontentzavod322bot_fulltest",
+            "pm2_env": {"BOT_TOKEN": "token_kz", "DATABASE_URL": "postgresql://localhost/kz"},
+        },
+    ]
+    monkeypatch.setattr(monitor, "run_pm2_jlist", lambda: fake_procs)
+    monkeypatch.delenv("PSYCHOBOTS_MONITOR_INCLUDE_FULLTEST", raising=False)
+
+    apps = monitor.get_bot_apps()
+    names = [a["name"] for a in apps]
+    assert names == ["tg_autobusbusbot_new"]
+
+
+def test_get_bot_apps_includes_fulltest_when_requested(monkeypatch):
+    fake_procs = [
+        {
+            "name": "tg_autobusbusbot_new",
+            "pm2_env": {"BOT_TOKEN": "token_autobus", "DATABASE_URL": "postgresql://localhost/autobus"},
+        },
+        {
+            "name": "psy5d_fulltest",
+            "pm2_env": {"BOT_TOKEN": "token_fulltest", "DATABASE_URL": "postgresql://localhost/psy5d_fulltest"},
+        },
+    ]
+    monkeypatch.setattr(monitor, "run_pm2_jlist", lambda: fake_procs)
+
+    # Opt-in via flag
+    apps_flag = monitor.get_bot_apps(include_fulltest=True)
+    assert len(apps_flag) == 2
+
+    # Opt-in via env
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_INCLUDE_FULLTEST", "1")
+    apps_env = monitor.get_bot_apps()
+    assert len(apps_env) == 2
+
+
+@pytest.mark.asyncio
+async def test_check_sqlite_db_valid(tmp_path):
+    import sqlite3
+
+    db_file = tmp_path / "darimiru_bot.db"
+    conn = sqlite3.connect(db_file)
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT)")
+    conn.execute("INSERT INTO users VALUES (1, 123456)")
+    conn.commit()
+    conn.close()
+
+    app = {
+        "name": "darimiru_bot",
+        "db_url": f"sqlite+aiosqlite:///{db_file}",
+        "cwd": str(tmp_path),
+    }
+
+    issues = await monitor.check_db_schema(app)
+    assert issues == []
+
+
+@pytest.mark.asyncio
+async def test_check_sqlite_db_missing_file(tmp_path):
+    missing_file = tmp_path / "non_existent.db"
+    app = {
+        "name": "darimiru_bot",
+        "db_url": f"sqlite+aiosqlite:///{missing_file}",
+        "cwd": str(tmp_path),
+    }
+
+    issues = await monitor.check_db_schema(app)
+    assert len(issues) == 1
+    assert "SQLite database file not found" in issues[0]
+
+
+@pytest.mark.asyncio
+async def test_payment_webhook_check_no_double_prefix():
+    requested_urls = []
+
+    class MockResponse:
+        status = 400
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class MockSession:
+        def get(self, url, **kwargs):
+            requested_urls.append(url)
+            return MockResponse()
+
+    # Darimiru: base already has /vpnbot
+    app_darimiru = {
+        "webhook_base_url": "https://darimiru.ru/vpnbot",
+        "webhook_path_prefix": "/vpnbot",
+    }
+    issues = await monitor.check_payment_webhooks(app_darimiru, MockSession())
+    assert issues == []
+    assert requested_urls == ["https://darimiru.ru/vpnbot/webhooks/robokassa/result"]
+
+    # Standard bot: base is domain + port
+    requested_urls.clear()
+    app_standard = {
+        "webhook_base_url": "https://bots.psysoldatov.ru:8443",
+        "webhook_path_prefix": "bot1",
+    }
+    issues2 = await monitor.check_payment_webhooks(app_standard, MockSession())
+    assert issues2 == []
+    assert requested_urls == ["https://bots.psysoldatov.ru:8443/bot1/webhooks/robokassa/result"]
+
+
+def test_extract_log_error_summaries_formats_tracebacks():
+    log_sample = """
+2026-11-08 01:45:52,196 | ERROR | automation_events | Automation send_message failed: event=47 handler=1
+Traceback (most recent call last):
+  File "/root/telegram_bots/newbots/automation_events.py", line 392, in process_pending_events
+    await _execute_action(action_session, bot, fresh_event, handler, fresh_action, fresh_user)
+  File "/root/telegram_bots/newbots/automation_events.py", line 213, in _execute_action
+    raise RuntimeError("; ".join(errors))
+RuntimeError: 979514796: Telegram server says - Bad Request: chat not found
+2026-11-08 01:46:00,100 | INFO | app | regular log line
+"""
+    summaries = monitor.extract_log_error_summaries(log_sample)
+    assert len(summaries) >= 1
+    # Traceback should be summarized with exception type & filename/line
+    tb_summary = [s for s in summaries if "RuntimeError" in s][0]
+    assert "RuntimeError: 979514796: Telegram server says - Bad Request: chat not found" in tb_summary
+    assert "automation_events.py:213" in tb_summary
+
+
+@pytest.mark.asyncio
+async def test_nl_check_default_excludes_decommissioned_ports(monkeypatch):
+    checked_ports = []
+
+    async def record_port(host, port, label):
+        checked_ports.append((host, port, label))
+        return None
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Session:
+        def get(self, url, **kwargs):
+            return Response()
+
+    monkeypatch.setattr(monitor, "check_tcp_port", record_port)
+    monkeypatch.setattr(monitor, "NL_CHECK_ENABLED", True)
+    monkeypatch.setenv("TELEGRAM_PROXY", "http://185.70.185.209:3128")
+
+    issues = await monitor.check_nl_infrastructure(Session())
+    assert issues == []
+    # By default, only active ports (Proxy 3128, Marzban 62050, MTProto 4430) are checked
+    assert {port for _, port, _ in checked_ports} == {3128, 4430, 62050}
+
 
 
 
