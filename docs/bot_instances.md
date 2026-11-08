@@ -66,3 +66,30 @@ Normal deploys may omit `PROD_PM2_NAMES` to verify and reload all 18 canonical
 instances, or specify a canonical subset. Set `PROD_ALLOW_PM2_RENAME=1` only for
 a one-instance cutover; that mode requires exactly one canonical PM2 name and
 uses the rollback-safe cutover helper.
+
+## Post-Deploy Verification Runbook
+
+For verifying notification routing, process isolation, and environment integrity post-deploy:
+
+- **Standard Production Verification (Default & Automated):**
+  ```bash
+  python3 scripts/verify_post_deploy.py --production
+  ```
+  Strictly verifies:
+  1. Live PM2 runtime: all 18 managed processes online with validated in-memory environments.
+  2. Database identity and connection pool isolation for MAX and Telegram bots.
+  3. Real token prefixes and companion Telegram bot identity matching registry entries.
+  4. Dynamic admin resolution (registry owners + DB admins; filtering out non-Telegram and MAX user IDs).
+  5. 54 negative routing isolation constraints (zero user, payment, or AI error leaks to Autobus).
+  
+  **Safety Guarantee:** In standard `--production` mode, **NO test messages are sent to real administrators**. Delivery is simulated fail-closed without dispatching messages.
+
+- **Live Send Restriction (`--live-send`):**
+  - `--live-send` is strictly forbidden in automated deployments and routine production checks.
+  - `--live-send` is permitted **only** during specially coordinated verifications of real Telegram delivery.
+  - When `--live-send` is authorized, explicit recipient chat IDs must be supplied via `--recipient-chat-ids`:
+    ```bash
+    python3 scripts/verify_post_deploy.py --production --live-send --recipient-chat-ids 272982544
+    ```
+  - Running `--live-send` without `--recipient-chat-ids` is rejected to prevent accidental broadcast to production admins or clients.
+

@@ -307,7 +307,11 @@ async def test_negative_partial_delivery_fails_criterion(monkeypatch):
     with patch("notification_routing.verify_bot_identity_live", mock_get_me), \
          patch("telegram_client.create_telegram_bot", return_value=MockBotContext()):
         with pytest.raises(RuntimeError) as exc_info:
-            await run_single_instance_worker("max_id519010411655_bot_new", live_send=True)
+            await run_single_instance_worker(
+                "max_id519010411655_bot_new",
+                live_send=True,
+                recipient_chat_ids=[272982544, 806750628],
+            )
 
         err_msg = str(exc_info.value)
         assert "DELIVERY CRITERION FAILED" in err_msg
@@ -348,7 +352,11 @@ async def test_negative_telegram_api_failure_handled(monkeypatch):
     with patch("notification_routing.verify_bot_identity_live", mock_get_me), \
          patch("telegram_client.create_telegram_bot", return_value=MockBotContext()):
         with pytest.raises(RuntimeError) as exc_info:
-            await run_single_instance_worker("tg_autobusbusbot_new", live_send=True)
+            await run_single_instance_worker(
+                "tg_autobusbusbot_new",
+                live_send=True,
+                recipient_chat_ids=[272982544],
+            )
 
         assert "DELIVERY CRITERION FAILED" in str(exc_info.value)
         rep = getattr(exc_info.value, "report", None)
@@ -389,3 +397,152 @@ def test_database_engine_process_isolation():
     assert "yourself_way_db" in data1["db_url"]
     assert "veraveda_db" in data2["db_url"]
     assert data1["db_url"] != data2["db_url"]
+
+
+# --------------------------------------------------------------------------
+# Safe Live-Send and Targeted Recipient Verification Tests
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_live_send_without_recipients_raises_in_orchestrator():
+    """Verify that orchestrator rejects live_send=True without explicit recipient_chat_ids."""
+    with pytest.raises(ValueError, match="requires explicit recipient_chat_ids"):
+        await verify_post_deploy(live_send=True)
+
+
+@pytest.mark.asyncio
+async def test_live_send_without_recipients_in_production_worker_raises(monkeypatch):
+    """Verify that production worker forbids live_send=True without explicit recipient_chat_ids."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_autobusbusbot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8346799080:AAValidTokenPrefix12345")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/psy5d2_db")
+
+    with pytest.raises(RuntimeError, match="LIVE SEND FORBIDDEN"):
+        await run_single_instance_worker("tg_autobusbusbot_new", live_send=True, production=True)
+
+
+@pytest.mark.asyncio
+async def test_live_send_filters_to_specified_recipient_chat_ids(monkeypatch):
+    """
+    Verify that when recipient_chat_ids is provided, live_send ONLY dispatches messages
+    to the specified authorized admins and skips other registered admins.
+    """
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_autobusbusbot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8346799080:AAValidTokenPrefix12345")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/psy5d2_db")
+
+    mock_get_me = AsyncMock(return_value={"verified": True, "id": 8346799080, "username": "autobusbusbot"})
+
+    mock_bot = MagicMock()
+    mock_bot.id = 8346799080
+    sent_msg = MagicMock()
+    sent_msg.message_id = 9999
+    mock_bot.send_message = AsyncMock(return_value=sent_msg)
+
+    class MockBotContext:
+        async def __aenter__(self):
+            return mock_bot
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    with patch("notification_routing.verify_bot_identity_live", mock_get_me), \
+         patch("telegram_client.create_telegram_bot", return_value=MockBotContext()):
+        # Autobus has multiple admins (e.g. 272982544, 806750628, 979514796)
+        # We specify ONLY 272982544
+        report = await run_single_instance_worker(
+            "tg_autobusbusbot_new",
+            live_send=True,
+            recipient_chat_ids=[272982544],
+        )
+
+        assert report["delivery_criterion_met"] is True
+        assert report["status"] == "delivered_all"
+        assert len(report["recipient_results"]) == 1
+        assert report["recipient_results"][0]["chat_id"] == 272982544
+        assert report["recipient_results"][0]["success"] is True
+
+        # Ensure bot.send_message was called ONLY for 272982544
+        assert mock_bot.send_message.call_count == 1
+        call_kwargs = mock_bot.send_message.call_args.kwargs
+        assert call_kwargs["chat_id"] == 272982544
+
+
+@pytest.mark.asyncio
+async def test_live_send_unauthorized_recipient_chat_id_rejected(monkeypatch):
+    """Verify that specifying an unauthorized recipient chat ID fails closed."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_autobusbusbot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8346799080:AAValidTokenPrefix12345")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/psy5d2_db")
+
+    with pytest.raises(RuntimeError, match="None of the specified recipients .* are authorized admins"):
+        await run_single_instance_worker(
+            "tg_autobusbusbot_new",
+            live_send=True,
+            recipient_chat_ids=[99999999999],
+        )
+
+
+def test_cli_live_send_requires_recipient_chat_ids():
+    """Verify CLI error when --live-send is invoked without --recipient-chat-ids."""
+    script_path = REPO_ROOT / "scripts" / "verify_post_deploy.py"
+    res = subprocess.run(
+        [sys.executable, str(script_path), "--live-send"],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 2
+    assert "Blind broadcast to all production admins is forbidden" in res.stderr
+
+
+def test_cli_worker_live_send_requires_recipient_chat_ids():
+    """Verify worker CLI error when --check-instance is run with --live-send but without recipients."""
+    script_path = REPO_ROOT / "scripts" / "verify_post_deploy.py"
+    res = subprocess.run(
+        [sys.executable, str(script_path), "--check-instance", "tg_autobusbusbot_new", "--live-send"],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 2
+    assert "Blind broadcast to all production admins is forbidden" in res.stderr
+
+
+@pytest.mark.asyncio
+async def test_direct_worker_without_recipients_forbidden_unconditionally(monkeypatch):
+    """Verify direct invocation of run_single_instance_worker with live_send=True without recipients is rejected."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_autobusbusbot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8346799080:AAValidTokenPrefix12345")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/psy5d2_db")
+
+    with pytest.raises(RuntimeError, match="LIVE SEND FORBIDDEN"):
+        await run_single_instance_worker("tg_autobusbusbot_new", live_send=True)
+
+
+@pytest.mark.asyncio
+async def test_production_mode_without_live_send_never_contacts_telegram(monkeypatch):
+    """
+    Verify that in production mode without live_send, all checks succeed fail-closed,
+    status is 'verified_production_no_send', and telegram_client.create_telegram_bot is NEVER called.
+    """
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_autobusbusbot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8346799080:AAValidTokenPrefix12345")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/psy5d2_db")
+
+    mock_create_bot = MagicMock()
+    with patch("telegram_client.create_telegram_bot", mock_create_bot), \
+         patch("notification_routing.verify_database_identity", return_value=True):
+        report = await run_single_instance_worker("tg_autobusbusbot_new", live_send=False, production=True)
+
+    assert report["delivery_criterion_met"] is True
+    assert report["status"] == "verified_production_no_send"
+    assert all(r["message_id"] == "production_verified_no_send" for r in report["recipient_results"])
+    mock_create_bot.assert_not_called()
+
+
+def test_deploy_prod_script_has_no_live_send_or_post_deploy_trigger():
+    """Verify that deploy_prod.sh does not automatically invoke verify_post_deploy or --live-send."""
+    deploy_script = REPO_ROOT / "deploy_prod.sh"
+    content = deploy_script.read_text(encoding="utf-8")
+    assert "--live-send" not in content
+    assert "verify_post_deploy.py" not in content
+
+
