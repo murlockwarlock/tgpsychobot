@@ -3225,6 +3225,243 @@ async def test_partial_recipient_failure_does_not_hide_undelivered_and_prevents_
     assert delivered_recipients == {272982544, 806750628}
 
 
+@pytest.mark.asyncio
+async def test_partial_delivery_and_subsequent_db_error_does_not_overwrite_and_tracks_both(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "tg_autobusbusbot_new")
+    monkeypatch.delenv("PSYCHOBOTS_ALERT_RECIPIENTS", raising=False)
+
+    apps = [
+        {
+            "name": "tg_autobusbusbot_new",
+            "token": "tok_autobus",
+            "owner_ids": [272982544, 806750628],
+            "status": "online",
+        },
+        {
+            "name": "bot_network_issue",
+            "token": "tok_net",
+            "owner_ids": [100],
+            "status": "online",
+        },
+        {
+            "name": "bot_db",
+            "token": "tok_db",
+            "owner_ids": [100],
+            "status": "online",
+        },
+    ]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *args, **kwargs: [])
+
+    # Network issue on bots
+    async def fake_check_telegram(app, http):
+        if app["name"] in ("tg_autobusbusbot_new", "bot_network_issue"):
+            return ["Telegram getMe failed: HTTP 502 {'ok': False, 'error_code': 502, 'description': 'Bad Gateway'}"]
+        return []
+    monkeypatch.setattr(monitor, "check_telegram", fake_check_telegram)
+
+    db_issues = {}
+    async def fake_check_db(app):
+        return db_issues.get(app["name"], [])
+    monkeypatch.setattr(monitor, "check_db_schema", fake_check_db)
+
+    cycle = 1
+    received_by_chat = {272982544: [], 806750628: []}
+
+    async def tracking_send_alert(a, text, recipients=None, delivered_recipients=None):
+        target = recipients or monitor.get_system_diagnostic_recipients(a)
+        already = set(delivered_recipients) if delivered_recipients is not None else set()
+        to_send = [r for r in target if r not in already]
+
+        all_ok = True
+        for chat_id in to_send:
+            if cycle == 1 and chat_id == 806750628:
+                all_ok = False
+                continue
+            received_by_chat[chat_id].append(text)
+            if delivered_recipients is not None:
+                delivered_recipients.add(chat_id)
+        current = delivered_recipients or set()
+        return all_ok and set(target).issubset(current)
+
+    monkeypatch.setattr(monitor, "send_alert", tracking_send_alert)
+
+    # Run 1: Network alert is sent, but only 272982544 receives it
+    cycle = 1
+    exit_code_1 = await monitor.run_check(False)
+    assert exit_code_1 == 1
+
+    state = monitor.load_state(state_file)
+    assert "issue" in state["pending_notifications"]
+    assert state["pending_notifications"]["issue"]["delivered_recipients"] == [272982544]
+
+    # Run 2: bot_db now develops a new independent DB error!
+    cycle = 2
+    db_issues["bot_db"] = ["DB: connection/query failed: ConnectionRefusedError: Connection refused"]
+
+    exit_code_2 = await monitor.run_check(False)
+    assert exit_code_2 == 1
+
+    # Verify:
+    # 1. Initial alert text in pending_notifications was NOT overwritten while partially delivered!
+    # 2. 806750628 received the initial network alert (which 272982544 already got in cycle 1, no duplicate).
+    # 3. BOTH 272982544 and 806750628 received the new DB error alert!
+    assert len(received_by_chat[272982544]) == 2
+    assert "Общий сетевой инцидент" in received_by_chat[272982544][0]
+    assert "bot_db" in received_by_chat[272982544][1]
+
+    assert len(received_by_chat[806750628]) == 2
+    assert "Общий сетевой инцидент" in received_by_chat[806750628][0]
+    assert "bot_db" in received_by_chat[806750628][1]
+
+    state = monitor.load_state(state_file)
+    assert len(state.get("pending_notifications", {})) == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_never_overtakes_undelivered_incident_alert(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "bot_0")
+
+    apps = [
+        {"name": f"bot_{i}", "status": "online", "token": f"tok_{i}", "owner_ids": [100]}
+        for i in range(16)
+    ]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_db_schema", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *args, **kwargs: [])
+
+    # Run 1: Outage is active, but Telegram fails completely to send the initial alert
+    async def fake_failing_telegram(app, http):
+        return ["Telegram getMe failed: TimeoutError: "]
+    monkeypatch.setattr(monitor, "check_telegram", fake_failing_telegram)
+
+    send_calls = []
+    can_send = False
+
+    async def mock_send(a, text, **kwargs):
+        if can_send:
+            send_calls.append(text)
+            return True
+        return False
+
+    monkeypatch.setattr(monitor, "send_alert", mock_send)
+
+    can_send = False
+    exit_code_1 = await monitor.run_check(False)
+    assert exit_code_1 == 1
+
+    state = monitor.load_state(state_file)
+    assert monitor.INCIDENT_SHARED_NETWORK in state["active_incidents"]
+    assert "issue" in state["pending_notifications"]
+    saved_issue_text = state["pending_notifications"]["issue"]["text"]
+
+    # Run 2: Network recovers (getMe succeeds), BUT Telegram delivery is STILL failing!
+    monkeypatch.setattr(monitor, "check_telegram", fake_empty_async)
+    can_send = False
+
+    exit_code_2 = await monitor.run_check(False)
+    assert exit_code_2 == 0
+
+    state = monitor.load_state(state_file)
+    # Incident MUST NOT be cleared, pending issue alert MUST NOT be lost,
+    # and recovery MUST NOT have been delivered or overtaken the incident alert!
+    assert monitor.INCIDENT_SHARED_NETWORK in state["active_incidents"]
+    assert "issue" in state["pending_notifications"]
+    assert state["pending_notifications"]["issue"]["text"] == saved_issue_text
+    assert len(send_calls) == 0
+
+    # Run 3: Telegram delivery is finally restored!
+    can_send = True
+    exit_code_3 = await monitor.run_check(False)
+    assert exit_code_3 == 0
+
+    # Must have delivered EXACTLY 2 messages in strict order:
+    # 1. Incident alert
+    # 2. Recovery alert
+    assert len(send_calls) == 2
+    assert "Общий сетевой инцидент" in send_calls[0]
+    assert "Восстановление" in send_calls[1] or "Связь с Telegram восстановлена" in send_calls[1]
+
+    state = monitor.load_state(state_file)
+    assert monitor.INCIDENT_SHARED_NETWORK not in state.get("active_incidents", {})
+    assert len(state.get("pending_notifications", {})) == 0
+
+
+@pytest.mark.asyncio
+async def test_invalid_proxy_config_fails_cleanly_without_direct_telegram_connection(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+    # Set invalid proxy scheme
+    monkeypatch.setenv("TELEGRAM_PROXY", "socks5://127.0.0.1:1080")
+
+    apps = [
+        {
+            "name": "bot_1",
+            "token": "tok_1",
+            "status": "online",
+            "owner_ids": [272982544],
+            "telegram_proxy": "socks5://127.0.0.1:1080",
+        }
+    ]
+
+    http_requests_made = []
+
+    class FakeSession:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        def post(self, url, **kwargs):
+            http_requests_made.append(url)
+            raise AssertionError("HTTP request must NOT be attempted when proxy config is invalid!")
+
+    monkeypatch.setattr(monitor.aiohttp, "ClientSession", FakeSession)
+
+    # Calling send_alert directly must return False without attempting direct connection
+    res = await monitor.send_alert(apps, "Test Alert")
+    assert res is False
+    assert len(http_requests_made) == 0
+
+    # Calling run_check must save pending notification and not connect directly
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_db_schema", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *args, **kwargs: [])
+    # 1 bot has issue
+    async def fake_check_telegram(app, http):
+        return ["Telegram getMe failed: TimeoutError: "]
+    monkeypatch.setattr(monitor, "check_telegram", fake_check_telegram)
+
+    exit_code = await monitor.run_check(False)
+    assert exit_code == 1
+    assert len(http_requests_made) == 0
+
+    state = monitor.load_state(state_file)
+    assert "issue" in state["pending_notifications"]
+
+
 
 
 
