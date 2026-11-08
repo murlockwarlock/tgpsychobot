@@ -2479,8 +2479,9 @@ def test_system_diagnostic_recipients_strictly_autobus_admins(monkeypatch):
 
     recipients = monitor.get_system_diagnostic_recipients(apps)
 
-    # Must contain ONLY Autobus owners, never arbitrary owner IDs from other bots
-    assert recipients == [272982544, 806750628, 979514796]
+    # Must contain ONLY Autobus owners, excluding known inaccessible IDs and other bots
+    assert recipients == [272982544, 806750628]
+    assert 979514796 not in recipients
     assert 1372041348 not in recipients
     assert 999999 not in recipients
 
@@ -2538,7 +2539,8 @@ async def test_send_alert_strictly_delivers_to_autobus_admins(monkeypatch):
 
     res = await monitor.send_alert(apps, "Test Alert")
     assert res is True
-    assert sorted(delivered_chats) == [272982544, 806750628, 979514796]
+    assert sorted(delivered_chats) == [272982544, 806750628]
+    assert 979514796 not in delivered_chats
     assert 1372041348 not in delivered_chats
 
 
@@ -2627,7 +2629,7 @@ async def test_shared_network_incident_mass_timeouts_grouped_into_single_alert(m
     alert = sent_alerts[0]
     assert "Общий сетевой инцидент Telegram API / Прокси" in alert
     assert "Затронуто ботов: 16 из 16" in alert
-    assert "Статус прокси: активен" in alert
+    assert "Статус прокси: настроен" in alert
     assert "Request timeout error" in alert or "Timeout" in alert
     # Crucially, it must NOT have 16 separate <b>bot_i</b> sections
     for i in range(16):
@@ -2839,6 +2841,182 @@ async def test_persistent_failure_single_bot_alerts_as_individual_issue(monkeypa
     # Alert is for bot_1 individually, NOT shared network
     assert "<b>bot_1</b>" in sent_alerts[0]
     assert "Общий сетевой инцидент" not in sent_alerts[0]
+
+
+def test_proxy_status_summary_diagnostics(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_PROXY", raising=False)
+    # 1. No proxy configured
+    assert monitor.get_proxy_status_summary([]) == "TELEGRAM_PROXY не настроен"
+
+    # 2. Configured in app, proxy_ok=None (not checked / unknown)
+    apps = [{"name": "bot_1", "telegram_proxy": "http://127.0.0.1:3128"}]
+    assert monitor.get_proxy_status_summary(apps, proxy_ok=None) == "настроен (http://127.0.0.1:3128)"
+
+    # 3. Configured, proxy_ok=True (verified available)
+    monkeypatch.setenv("TELEGRAM_PROXY", "http://proxy.example.com:8080")
+    assert monitor.get_proxy_status_summary([], proxy_ok=True) == "настроен, доступен (http://proxy.example.com:8080)"
+
+    # 4. Configured, proxy_ok=False (connection failure)
+    assert monitor.get_proxy_status_summary([], proxy_ok=False) == "сбой подключения (http://proxy.example.com:8080)"
+
+
+def test_is_telegram_network_issue_distinguishes_auth_errors():
+    # Auth errors must NEVER be classified as network issues
+    assert not monitor.is_telegram_network_issue("Telegram getMe failed: HTTP 401 {'ok': False, 'description': 'Unauthorized'}")
+    assert not monitor.is_telegram_network_issue("Telegram getMe failed: HTTP 403 {'ok': False, 'description': 'Forbidden'}")
+    assert not monitor.is_telegram_network_issue("Telegram getMe failed: Unauthorized")
+    assert not monitor.is_telegram_network_issue("Telegram getMe failed: Forbidden")
+    assert not monitor.is_telegram_network_issue("Telegram getMe failed: invalid token provided")
+
+    # Non-network HTTP errors must not be classified as network issues
+    assert not monitor.is_telegram_network_issue("Telegram getMe failed: HTTP 400 Bad Request")
+    assert not monitor.is_telegram_network_issue("Telegram getMe failed: HTTP 404 Not Found")
+
+    # Real network issues
+    assert monitor.is_telegram_network_issue("Telegram getMe failed: HTTP 502 Bad Gateway")
+    assert monitor.is_telegram_network_issue("Telegram getMe failed: HTTP 500 Internal Server Error")
+    assert monitor.is_telegram_network_issue("Telegram getMe failed: HTTP 503 Service Unavailable")
+    assert monitor.is_telegram_network_issue("Telegram getMe failed: HTTP 429 Flood Control")
+    assert monitor.is_telegram_network_issue("Telegram getMe failed: TimeoutError: ")
+    assert monitor.is_telegram_network_issue("Telegram getMe failed: ClientConnectorError: Cannot connect to host")
+    assert monitor.is_telegram_network_issue("Telegram getMe failed: ServerDisconnectedError")
+    assert monitor.is_telegram_network_issue("Logs: polling fetch error: Request timeout error")
+    assert monitor.is_telegram_network_issue("Proxy: Telegram check returned HTTP 502")
+
+
+@pytest.mark.asyncio
+async def test_single_bot_repeated_polling_errors_across_cycles(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+
+    apps = [
+        {"name": "bot_1", "status": "online", "token": "tok_1", "owner_ids": [100]},
+        {"name": "bot_2", "status": "online", "token": "tok_2", "owner_ids": [100]},
+    ]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_db_schema", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_telegram", fake_empty_async)  # getMe OK
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+
+    bot_1_log_errors = ["Logs: polling fetch error: Request timeout error"]
+
+    def mock_log_errors(app, state, include_existing):
+        if app["name"] == "bot_1":
+            return list(bot_1_log_errors)
+        return []
+    monkeypatch.setattr(monitor, "read_new_log_errors", mock_log_errors)
+
+    sent_alerts = []
+    async def fake_send_alert(a, text):
+        sent_alerts.append(text)
+        return True
+    monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
+
+    # Cycle 1: Single transient polling error, getMe is OK -> suppressed!
+    exit_code_1 = await monitor.run_check(False)
+    assert exit_code_1 == 0
+    assert len(sent_alerts) == 0
+    state = monitor.load_state(state_file)
+    assert state["polling_failure_counts"].get("bot_1") == 1
+
+    # Cycle 2: Repeated polling error on next cycle -> NOT suppressed! Alert sent!
+    exit_code_2 = await monitor.run_check(False)
+    assert exit_code_2 == 1
+    assert len(sent_alerts) == 1
+    assert "<b>bot_1</b>" in sent_alerts[0]
+    assert "Logs: polling fetch error:" in sent_alerts[0]
+    assert "Общий сетевой инцидент" not in sent_alerts[0]
+    state = monitor.load_state(state_file)
+    assert state["polling_failure_counts"].get("bot_1") == 2
+
+    # Cycle 3: Bot recovers (no errors) -> counter reset
+    bot_1_log_errors.clear()
+    exit_code_3 = await monitor.run_check(False)
+    assert exit_code_3 == 0
+    state = monitor.load_state(state_file)
+    assert "bot_1" not in state["polling_failure_counts"]
+
+
+@pytest.mark.asyncio
+async def test_active_network_incident_new_db_error_does_not_unfurl_16_bots(monkeypatch, tmp_path):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "bot_0")
+
+    apps = [
+        {
+            "name": f"bot_{i}",
+            "status": "online",
+            "token": f"tok_{i}",
+            "owner_ids": [100],
+            "telegram_proxy": "http://127.0.0.1:3128",
+        }
+        for i in range(16)
+    ]
+    apps.append({
+        "name": "bot_db",
+        "status": "online",
+        "token": "tok_db",
+        "owner_ids": [100],
+        "telegram_proxy": "http://127.0.0.1:3128",
+    })
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *args, **kwargs: [])
+
+    # 16 bots have 502 Bad Gateway
+    async def fake_check_telegram(app, http):
+        if app["name"] != "bot_db":
+            return ["Telegram getMe failed: HTTP 502 {'ok': False, 'error_code': 502, 'description': 'Bad Gateway'}"]
+        return []
+    monkeypatch.setattr(monitor, "check_telegram", fake_check_telegram)
+
+    db_issues_map = {}
+    async def fake_check_db(app):
+        return db_issues_map.get(app["name"], [])
+    monkeypatch.setattr(monitor, "check_db_schema", fake_check_db)
+
+    sent_alerts = []
+    async def fake_send_alert(a, text):
+        sent_alerts.append(text)
+        return True
+    monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
+
+    # Cycle 1: Network incident fires initial shared alert
+    exit_code_1 = await monitor.run_check(False)
+    assert exit_code_1 == 1
+    assert len(sent_alerts) == 1
+    assert "Общий сетевой инцидент Telegram API / Прокси" in sent_alerts[0]
+    sent_alerts.clear()
+
+    # Cycle 2: Network outage still ongoing (on cooldown), but bot_db now has a DB crash!
+    db_issues_map["bot_db"] = ["DB: connection/query failed: ConnectionRefusedError: Connection refused"]
+
+    exit_code_2 = await monitor.run_check(False)
+    assert exit_code_2 == 1
+    assert len(sent_alerts) == 1
+    alert = sent_alerts[0]
+
+    # Must contain the new DB error
+    assert "<b>bot_db</b>" in alert
+    assert "DB: connection/query failed" in alert
+
+    # Crucially: network summary must NOT repeat (cooldown), and the 16 bots must NOT be unfurled!
+    assert "Общий сетевой инцидент Telegram API / Прокси" not in alert
+    for i in range(16):
+        assert f"<b>bot_{i}</b>" not in alert
 
 
 

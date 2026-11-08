@@ -647,6 +647,7 @@ def load_state(path: str | Path | None = None) -> dict:
     state.setdefault("alerts", {})
     state.setdefault("stuck_dialogues", {})
     state.setdefault("active_incidents", {})
+    state.setdefault("polling_failure_counts", {})
     return state
 
 
@@ -1027,16 +1028,58 @@ def should_alert(issues: list[str], state: dict) -> bool:
     return True
 
 
+NON_NETWORK_AUTH_PATTERNS = (
+    "HTTP 401",
+    "HTTP 403",
+    "Unauthorized",
+    "Forbidden",
+    "invalid token",
+    "token is invalid",
+)
+
+
 def is_telegram_network_issue(issue: str) -> bool:
     if not issue or not isinstance(issue, str):
         return False
-    if issue.startswith(("Proxy: Telegram", "Proxy: Proxy", "Telegram getMe failed:")):
+    # Explicitly exclude authentication / authorization failures
+    if any(auth_pat in issue for auth_pat in NON_NETWORK_AUTH_PATTERNS):
+        return False
+
+    if issue.startswith(("Proxy: Telegram", "Proxy: Proxy")):
         return True
+
+    if issue.startswith("Telegram getMe failed:"):
+        network_getme_indicators = (
+            "HTTP 500",
+            "HTTP 502",
+            "HTTP 503",
+            "HTTP 504",
+            "HTTP 429",
+            "TimeoutError",
+            "ServerTimeoutError",
+            "ClientConnectorError",
+            "ServerDisconnectedError",
+            "ClientHttpProxyError",
+            "ClientOSError",
+            "Cannot connect to host",
+            "ConnectionResetError",
+            "timeout",
+        )
+        return any(ind in issue for ind in network_getme_indicators)
+
     return any(p in issue for p in TELEGRAM_NETWORK_PATTERNS)
 
 
 def is_transient_polling_error(issue: str) -> bool:
     return issue.startswith("Logs: polling fetch error:")
+
+
+def has_polling_fetch_error(issues: list[str]) -> bool:
+    return any(
+        i.startswith("Logs: polling fetch error:")
+        or "polling fetch errors since last check" in i
+        for i in issues
+    )
 
 
 def summarize_network_errors(error_lines: list[str]) -> str:
@@ -1057,7 +1100,7 @@ def summarize_network_errors(error_lines: list[str]) -> str:
     return " / ".join(types)
 
 
-def get_proxy_status_summary(apps: list[dict]) -> str:
+def get_proxy_status_summary(apps: list[dict], proxy_ok: bool | None = None) -> str:
     proxy_url = next(
         (app.get("telegram_proxy") for app in apps if app.get("telegram_proxy")),
         os.environ.get("TELEGRAM_PROXY"),
@@ -1069,14 +1112,24 @@ def get_proxy_status_summary(apps: list[dict]) -> str:
         host = parsed.hostname or "unknown"
         if parsed.port:
             host = f"{host}:{parsed.port}"
-        return f"активен ({parsed.scheme}://{host})"
+        target = f"{parsed.scheme}://{host}"
+        if proxy_ok is True:
+            return f"настроен, доступен ({target})"
+        elif proxy_ok is False:
+            return f"сбой подключения ({target})"
+        return f"настроен ({target})"
     except Exception:
-        return "активен"
+        if proxy_ok is True:
+            return "настроен, доступен"
+        elif proxy_ok is False:
+            return "сбой подключения"
+        return "настроен"
 
 
 def format_issues_alert(
     all_issues: list[tuple[str, list[str]]],
-    is_shared_network: bool,
+    is_shared_network_active: bool,
+    include_network_summary: bool,
     shared_network_summary: str,
     affected_net_bots: list[str],
     total_tg_bots: int,
@@ -1084,7 +1137,7 @@ def format_issues_alert(
 ) -> str:
     lines = ["🚨 <b>Psychobots monitor detected issues</b>"]
 
-    if is_shared_network:
+    if include_network_summary:
         lines.append("\n⚠️ <b>Общий сетевой инцидент Telegram API / Прокси</b>")
         lines.append(f"• Характер ошибки: {html.escape(shared_network_summary)}")
         sample_str = ", ".join(affected_net_bots[:5])
@@ -1094,7 +1147,11 @@ def format_issues_alert(
         lines.append(f"• Статус прокси: {html.escape(proxy_status)}")
 
     for name, issues in all_issues:
-        display_issues = [i for i in issues if not (is_shared_network and is_telegram_network_issue(i))]
+        if is_shared_network_active:
+            display_issues = [i for i in issues if not is_telegram_network_issue(i)]
+        else:
+            display_issues = list(issues)
+
         if display_issues:
             lines.append(f"\n<b>{html.escape(name)}</b>")
             for issue in display_issues[:8]:
@@ -1116,11 +1173,15 @@ def format_recovery_alert(
     return "\n".join(lines)
 
 
+INACCESSIBLE_ADMIN_IDS = frozenset({979514796})
+CANONICAL_SYSTEM_DIAGNOSTIC_ADMIN_IDS = (272982544, 806750628)
+
+
 def get_system_diagnostic_recipients(apps: list[dict]) -> list[int]:
     """
     Returns authorized system diagnostic admin IDs.
     Diagnostics must ONLY be routed to allowed system administrators (Autobus),
-    never to arbitrary owner IDs from other bots.
+    never to arbitrary owner IDs from other bots or known inaccessible IDs.
     """
     env_override = os.environ.get("PSYCHOBOTS_ALERT_RECIPIENTS", "").strip()
     if env_override:
@@ -1131,7 +1192,10 @@ def get_system_diagnostic_recipients(apps: list[dict]) -> list[int]:
     preferred_name = os.environ.get("PSYCHOBOTS_ALERT_BOT_PM2_NAME", ALERT_BOT_PM2_NAME).strip()
     for app in apps:
         if app.get("name") == preferred_name:
-            owners = [oid for oid in app.get("owner_ids", []) if not is_max_user_id(oid)]
+            owners = [
+                oid for oid in app.get("owner_ids", [])
+                if not is_max_user_id(oid) and oid not in INACCESSIBLE_ADMIN_IDS
+            ]
             if owners:
                 return sorted(set(owners))
 
@@ -1139,11 +1203,16 @@ def get_system_diagnostic_recipients(apps: list[dict]) -> list[int]:
         from notification_routing import get_instance_by_pm2_name, SYSTEM_DIAGNOSTIC_BOT_PM2
         inst = get_instance_by_pm2_name(preferred_name or SYSTEM_DIAGNOSTIC_BOT_PM2)
         if inst and inst.get("telegram_owner_ids"):
-            return sorted(set(inst["telegram_owner_ids"]))
+            valid = [
+                oid for oid in inst["telegram_owner_ids"]
+                if not is_max_user_id(oid) and oid not in INACCESSIBLE_ADMIN_IDS
+            ]
+            if valid:
+                return sorted(set(valid))
     except Exception:
         pass
 
-    return [272982544, 806750628, 979514796]
+    return list(CANONICAL_SYSTEM_DIAGNOSTIC_ADMIN_IDS)
 
 
 def get_candidate_alert_tokens(apps: list[dict]) -> list[str]:
@@ -1256,12 +1325,23 @@ async def run_check(
             nl_issues = await check_nl_infrastructure(http)
             if nl_issues:
                 all_issues.append(("nl_infrastructure", nl_issues))
+            proxy_has_issues = any(i.startswith("Proxy:") for i in nl_issues)
+            proxy_ok = False if proxy_has_issues else (True if NL_CHECK_ENABLED else None)
 
         await check_stuck_dialogues(apps, state, all_issues)
 
         telegram_apps = [a for a in apps if a.get("platform") == "telegram" or a.get("token")]
         active_incidents = state.setdefault("active_incidents", {})
+        polling_failures = state.setdefault("polling_failure_counts", {})
         now = int(time.time())
+
+        for app in apps:
+            name = app["name"]
+            app_issues = next((issues for n, issues in all_issues if n == name), [])
+            if has_polling_fetch_error(app_issues):
+                polling_failures[name] = int(polling_failures.get(name, 0)) + 1
+            else:
+                polling_failures.pop(name, None)
 
         affected_net_bots = [
             name
@@ -1276,24 +1356,26 @@ async def run_check(
             if is_telegram_network_issue(i)
         ]
 
-        # Filter out isolated transient polling errors if only 1 bot has 1-2 polling errors and getMe succeeded
+        # Filter out isolated transient polling errors if only 1 bot has polling error and getMe succeeded
         if len(affected_net_bots) == 1 and not nl_net_issues and INCIDENT_SHARED_NETWORK not in active_incidents:
             single_name = affected_net_bots[0]
-            for idx, (name, issues) in enumerate(all_issues):
-                if name == single_name:
-                    get_me_failed = any("Telegram getMe failed:" in i for i in issues)
-                    if not get_me_failed:
-                        filtered = [i for i in issues if not is_transient_polling_error(i)]
-                        if filtered:
-                            all_issues[idx] = (name, filtered)
-                        else:
-                            all_issues.pop(idx)
-                    break
-            affected_net_bots = [
-                name
-                for name, issues in all_issues
-                if any(is_telegram_network_issue(i) for i in issues) and name != "nl_infrastructure"
-            ]
+            consecutive_fails = int(polling_failures.get(single_name, 0))
+            if consecutive_fails < 2:
+                for idx, (name, issues) in enumerate(all_issues):
+                    if name == single_name:
+                        get_me_failed = any("Telegram getMe failed:" in i for i in issues)
+                        if not get_me_failed:
+                            filtered = [i for i in issues if not is_transient_polling_error(i)]
+                            if filtered:
+                                all_issues[idx] = (name, filtered)
+                            else:
+                                all_issues.pop(idx)
+                        break
+                affected_net_bots = [
+                    name
+                    for name, issues in all_issues
+                    if any(is_telegram_network_issue(i) for i in issues) and name != "nl_infrastructure"
+                ]
 
         is_shared_network = (
             len(affected_net_bots) >= 2
@@ -1309,7 +1391,7 @@ async def run_check(
                 i for name, issues in all_issues for i in issues if is_telegram_network_issue(i)
             ]
             summary = summarize_network_errors(all_net_errors)
-            proxy_status = get_proxy_status_summary(apps)
+            proxy_status = get_proxy_status_summary(apps, proxy_ok=proxy_ok)
 
             if INCIDENT_SHARED_NETWORK not in active_incidents:
                 active_incidents[INCIDENT_SHARED_NETWORK] = {
@@ -1355,7 +1437,8 @@ async def run_check(
         if should_alert_shared_network or should_alert_other:
             alert_text = format_issues_alert(
                 all_issues=all_issues,
-                is_shared_network=should_alert_shared_network,
+                is_shared_network_active=is_shared_network,
+                include_network_summary=should_alert_shared_network,
                 shared_network_summary=summary,
                 affected_net_bots=affected_net_bots,
                 total_tg_bots=len(telegram_apps),
