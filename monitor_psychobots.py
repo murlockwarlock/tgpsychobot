@@ -5,6 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
+import html
 import json
 import os
 import re
@@ -1005,7 +1006,9 @@ def get_candidate_alert_tokens(apps: list[dict]) -> list[str]:
 
 
 async def send_alert(apps: list[dict], text: str) -> bool:
-    recipients = sorted({owner_id for app in apps for owner_id in app["owner_ids"]})
+    recipients = sorted(
+        {owner_id for app in apps for owner_id in app["owner_ids"] if not is_max_user_id(owner_id)}
+    )
     tokens = get_candidate_alert_tokens(apps)
     if not recipients or not tokens:
         print("No notification recipients or bot tokens found")
@@ -1025,19 +1028,31 @@ async def send_alert(apps: list[dict], text: str) -> bool:
             delivered = False
             for chat_id in recipients:
                 try:
+                    payload = {
+                        "chat_id": chat_id,
+                        "text": text[:3900],
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    }
                     async with http.post(
                         f"https://api.telegram.org/bot{token}/sendMessage",
-                        json={
-                            "chat_id": chat_id,
-                            "text": text[:3900],
-                            "parse_mode": "HTML",
-                            "disable_web_page_preview": True,
-                        },
+                        json=payload,
                         **proxy_kwargs,
                     ) as resp:
                         data = await resp.json(content_type=None)
                         if resp.status == 200 and data.get("ok"):
                             delivered = True
+                        elif resp.status == 400:
+                            # Retry without parse_mode in case log text contained unsupported markup
+                            payload.pop("parse_mode", None)
+                            async with http.post(
+                                f"https://api.telegram.org/bot{token}/sendMessage",
+                                json=payload,
+                                **proxy_kwargs,
+                            ) as retry_resp:
+                                retry_data = await retry_resp.json(content_type=None)
+                                if retry_resp.status == 200 and retry_data.get("ok"):
+                                    delivered = True
                 except Exception:
                     continue
             if delivered:
@@ -1089,7 +1104,7 @@ async def run_check(
             for name, issues in all_issues:
                 lines.append(f"\n<b>{name}</b>")
                 for issue in issues[:8]:
-                    lines.append(f"• {issue}")
+                    lines.append(f"• {html.escape(issue)}")
             await send_alert(apps, "\n".join(lines))
 
         save_state(state)
