@@ -8,6 +8,7 @@ from typing import Any
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import (
@@ -359,50 +360,84 @@ async def get_or_create_receipt(
     config_id: int | None = None,
     deferred_data_json: str | None = None,
 ) -> tuple[CertificateIssuanceReceipt, bool]:
-    existing = await session.scalar(
-        select(CertificateIssuanceReceipt).where(
-            CertificateIssuanceReceipt.user_id == user_id,
-            CertificateIssuanceReceipt.topic_id == topic_id,
-            CertificateIssuanceReceipt.dialogue_id == dialogue_id,
-            CertificateIssuanceReceipt.issuance_key == issuance_key,
+    from event_service import get_user_tx_lock
+
+    async with get_user_tx_lock(user_id):
+        existing = await session.scalar(
+            select(CertificateIssuanceReceipt).where(
+                CertificateIssuanceReceipt.user_id == user_id,
+                CertificateIssuanceReceipt.topic_id == topic_id,
+                CertificateIssuanceReceipt.dialogue_id == dialogue_id,
+                CertificateIssuanceReceipt.issuance_key == issuance_key,
+            )
         )
-    )
-    if existing is not None:
-        if config_id and not existing.config_id:
-            existing.config_id = config_id
-        if deferred_data_json and not existing.deferred_data_json:
-            existing.deferred_data_json = deferred_data_json
-        # Requirement 3: If previous process crashed while in 'sending_cert',
-        # we cannot assume non-delivery without API proof; mark uncertain to prevent duplicate send.
-        if existing.status == "sending_cert":
-            existing.status = "uncertain"
-            existing.error_details = "Previous process interrupted during sending_cert; automatic repeat prevented."
+        if existing is not None:
+            if config_id and not existing.config_id:
+                existing.config_id = config_id
+            if deferred_data_json and not existing.deferred_data_json:
+                existing.deferred_data_json = deferred_data_json
+            # Requirement 3: If previous process crashed while in 'sending_cert',
+            # we cannot assume non-delivery without API proof; mark uncertain to prevent duplicate send.
+            if existing.status == "sending_cert":
+                existing.status = "uncertain"
+                existing.error_details = "Previous process interrupted during sending_cert; automatic repeat prevented."
+                await session.commit()
+            return existing, False
+
+        receipt = CertificateIssuanceReceipt(
+            user_id=user_id,
+            topic_id=topic_id,
+            dialogue_id=dialogue_id,
+            issuance_key=issuance_key,
+            status="started",
+            config_id=config_id,
+            deferred_data_json=deferred_data_json,
+        )
+        try:
+            session.add(receipt)
             await session.commit()
-        return existing, False
+            return receipt, True
+        except IntegrityError:
+            await session.rollback()
+            existing = await session.scalar(
+                select(CertificateIssuanceReceipt).where(
+                    CertificateIssuanceReceipt.user_id == user_id,
+                    CertificateIssuanceReceipt.topic_id == topic_id,
+                    CertificateIssuanceReceipt.dialogue_id == dialogue_id,
+                    CertificateIssuanceReceipt.issuance_key == issuance_key,
+                )
+            )
+            if existing is not None:
+                return existing, False
+            raise
 
-    receipt = CertificateIssuanceReceipt(
-        user_id=user_id,
-        topic_id=topic_id,
-        dialogue_id=dialogue_id,
-        issuance_key=issuance_key,
-        status="started",
-        config_id=config_id,
-        deferred_data_json=deferred_data_json,
-    )
-    session.add(receipt)
-    await session.flush()
-    return receipt, True
 
-
-async def mark_receipt_sending_cert(session: AsyncSession, receipt_id: int) -> None:
+async def mark_receipt_sending_cert(session: AsyncSession, receipt_id: int) -> bool:
     """
-    Requirement 3: Persists in-flight status before the external API call to eliminate
-    duplicate certificate sending after process crash.
+    Requirement 3 & Defect 2: Atomic compare-and-swap claiming the receipt to deliver the certificate.
+    Atomically updates status 'started' -> 'sending_cert'.
+    Returns True if successfully claimed, False if another concurrent handler claimed it.
     """
-    receipt = await session.get(CertificateIssuanceReceipt, receipt_id)
-    if receipt:
-        receipt.status = "sending_cert"
+    if not isinstance(receipt_id, int):
+        return False
+    try:
+        stmt = (
+            update(CertificateIssuanceReceipt)
+            .where(
+                CertificateIssuanceReceipt.id == receipt_id,
+                CertificateIssuanceReceipt.status == "started",
+            )
+            .values(status="sending_cert")
+        )
+        res = await session.execute(stmt)
         await session.commit()
+        rowcount = getattr(res, "rowcount", None)
+        if isinstance(rowcount, int):
+            return rowcount > 0
+        return False
+    except Exception as exc:
+        log.warning("mark_receipt_sending_cert error: %s", exc)
+        return False
 
 
 async def mark_receipt_cert_sent(
@@ -416,7 +451,7 @@ async def mark_receipt_cert_sent(
     if receipt:
         receipt.status = "cert_sent"
         if message_id:
-            receipt.certificate_message_id = str(message_id)
+            receipt.certificate_message_id = str(message_id)[:64]
         if config_id:
             receipt.config_id = config_id
         if deferred_data_json:
@@ -432,7 +467,7 @@ async def mark_receipt_completed(
         receipt.status = "completed"
         receipt.completed_at = datetime.utcnow()
         if invitation_message_id:
-            receipt.invitation_message_id = str(invitation_message_id)
+            receipt.invitation_message_id = str(invitation_message_id)[:64]
         await session.commit()
 
 
@@ -576,43 +611,44 @@ async def complete_followup_delivery(
     deferred_blocks: list[Any] | None = None,
 ) -> None:
     """
-    Requirement 5: Safely completes followup delivery:
+    Requirement 5 & Defect 1: Safely and atomically completes followup delivery in a single transaction:
     1. Persists deferred service blocks (with admin target_stage priority).
     2. Transitions user stage to admin target_stage.
-    3. Atomically marks receipt completed and clears deferred_data_json.
-    Eliminates window where receipt is completed but DATA is not saved.
+    3. Atomically marks receipt completed, clears deferred_data_json, and saves invitation_message_id.
+    All operations are committed in a single transaction under the per-user transaction lock,
+    guaranteeing that either both DATA and receipt completion commit, or neither commits.
     """
-    raw_blocks_to_apply = list(deferred_blocks) if deferred_blocks else None
-    if not raw_blocks_to_apply:
-        async with session_maker() as session:
-            r = await session.get(CertificateIssuanceReceipt, receipt_id)
-            if r and r.deferred_data_json:
-                raw_blocks_to_apply = deserialize_service_blocks(r.deferred_data_json)
+    from event_service import run_user_transaction
+    from automation_engine import apply_service_data_blocks
 
-    if raw_blocks_to_apply:
-        from automation_engine import apply_service_data_blocks, persist_service_data_blocks
-        if scen_cfg.target_stage:
-            raw_blocks_to_apply = override_service_blocks_target_stage(raw_blocks_to_apply, scen_cfg.target_stage)
-        await persist_service_data_blocks(
-            session_maker,
-            user_id=user_id,
-            dialogue_id=dialogue_id,
-            topic_id=topic_id,
-            blocks=raw_blocks_to_apply,
-            apply_fn=apply_service_data_blocks,
-        )
+    async def _op(session: AsyncSession, user: User) -> None:
+        r = await session.get(CertificateIssuanceReceipt, receipt_id)
+        raw_blocks_to_apply = list(deferred_blocks) if deferred_blocks else None
+        if not raw_blocks_to_apply and r and r.deferred_data_json:
+            raw_blocks_to_apply = deserialize_service_blocks(r.deferred_data_json)
 
-    async with session_maker() as session:
+        if raw_blocks_to_apply:
+            if scen_cfg.target_stage:
+                raw_blocks_to_apply = override_service_blocks_target_stage(raw_blocks_to_apply, scen_cfg.target_stage)
+            await apply_service_data_blocks(
+                session,
+                user=user,
+                dialogue_id=dialogue_id,
+                topic_id=topic_id,
+                blocks=raw_blocks_to_apply,
+            )
+
         if scen_cfg.target_stage:
             await transition_user_to_stage(session, user_id, topic_id, dialogue_id, scen_cfg.target_stage)
-        r = await session.get(CertificateIssuanceReceipt, receipt_id)
+
         if r:
             r.status = "completed"
             r.completed_at = datetime.utcnow()
-            r.deferred_data_json = None  # Cleared upon persistence
+            r.deferred_data_json = None  # Cleared upon atomic persistence
             if invitation_message_id:
-                r.invitation_message_id = str(invitation_message_id)
-        await session.commit()
+                r.invitation_message_id = str(invitation_message_id)[:64]
+
+    await run_user_transaction(session_maker, user_id, _op)
 
 
 async def apply_pending_deferred_data_if_any(
@@ -624,33 +660,32 @@ async def apply_pending_deferred_data_if_any(
     dialogue_id: int,
 ) -> None:
     """
-    Requirement 5: Idempotently persists leftover deferred data from an interrupted
-    completed receipt without repeating messages and without overwriting admin's target stage.
+    Requirement 5 & Defect 1: Idempotently and atomically persists leftover deferred data from an interrupted
+    completed receipt in a single transaction without repeating messages or transitions.
     """
-    async with session_maker() as session:
+    from event_service import run_user_transaction
+    from automation_engine import apply_service_data_blocks
+
+    async def _op(session: AsyncSession, user: User) -> None:
         r = await session.get(CertificateIssuanceReceipt, receipt_id)
         if not r or not r.deferred_data_json:
             return
         blocks = deserialize_service_blocks(r.deferred_data_json)
+        if blocks:
+            if scen_cfg.target_stage:
+                blocks = override_service_blocks_target_stage(blocks, scen_cfg.target_stage)
+            await apply_service_data_blocks(
+                session,
+                user=user,
+                dialogue_id=dialogue_id,
+                topic_id=topic_id,
+                blocks=blocks,
+            )
+            if scen_cfg.target_stage:
+                await transition_user_to_stage(session, user_id, topic_id, dialogue_id, scen_cfg.target_stage)
+        r.deferred_data_json = None
 
-    if blocks:
-        from automation_engine import apply_service_data_blocks, persist_service_data_blocks
-        if scen_cfg.target_stage:
-            blocks = override_service_blocks_target_stage(blocks, scen_cfg.target_stage)
-        await persist_service_data_blocks(
-            session_maker,
-            user_id=user_id,
-            dialogue_id=dialogue_id,
-            topic_id=topic_id,
-            blocks=blocks,
-            apply_fn=apply_service_data_blocks,
-        )
-
-    async with session_maker() as session:
-        r = await session.get(CertificateIssuanceReceipt, receipt_id)
-        if r:
-            r.deferred_data_json = None
-            await session.commit()
+    await run_user_transaction(session_maker, user_id, _op)
 
 
 def override_service_blocks_target_stage(
@@ -847,7 +882,10 @@ async def resume_pending_certificate_followup(
                 text=invite_text,
                 attachments=keyboard,
             )
-            sent_msg_id = str(sent) if sent else None
+            from max_messenger_bot.models import extract_sent_message_id
+            sent_msg_id = extract_sent_message_id(sent) or (
+                str(sent) if sent and not isinstance(sent, (dict, list)) else None
+            )
     except Exception as exc:
         log.error("Failed to deliver resumed invitation user_id=%s chat_id=%s: %s", user_id, effective_chat_id, exc)
         # Requirement 2: Do NOT blind-reset to cert_sent! Mark uncertain so no duplicate invite is sent

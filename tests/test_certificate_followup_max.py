@@ -747,3 +747,188 @@ async def test_max_failure_point3_invite_network_error_marks_uncertain(session_f
         assert r.status == "uncertain"
         assert "Resumption delivery failed/uncertain" in (r.error_details or "")
 
+
+@pytest.mark.asyncio
+async def test_defect2_concurrent_certificate_issuance_max_single_wire_send(session_factory, media_setup, monkeypatch):
+    """
+    Defect 2: Concurrent certificate issuance in MAX.
+    Two simultaneous requests to issue the same certificate.
+    Atomic CAS ensures strictly ONE call to upload_file and send_media_attachment.
+    """
+    source, config = await seed_max_template(session_factory)
+    async with session_factory() as session:
+        scen_cfg = await get_or_create_followup_config(session, 40, topic_id=1)
+        scen_cfg.is_active = True
+        scen_cfg.caption_template = '🎉 Поздравляем, <b>{name}</b>! Ваш сертификат готов.'
+        scen_cfg.invitation_text = 'Хотите записаться на консультацию?'
+        scen_cfg.target_stage = 'OFFER_MEETING'
+        await session.commit()
+
+    client = MaxTransport()
+    monkeypatch.setattr(client, 'download_attachment_url', AsyncMock(return_value=source))
+
+    values = dict(VALUES, recipient="ConcurrentMax")
+    ai_response = f'[RENDER_IMG_MEDIA: panda_certificate | {json.dumps(values, ensure_ascii=False)}]'
+
+    # Run two delivery requests concurrently
+    res1, res2 = await asyncio.gather(
+        common._deliver_media_template(client, chat_id=100, user_id=100000000007, response=ai_response, dialogue_id=1, topic_id=1),
+        common._deliver_media_template(client, chat_id=100, user_id=100000000007, response=ai_response, dialogue_id=1, topic_id=1),
+    )
+
+    # Strictly ONE upload_file call must be made
+    assert len(client.uploads) == 1, f"Expected strictly 1 upload, got {len(client.uploads)}"
+
+    # Check that receipt is completed
+    async with session_factory() as session:
+        receipt = await session.scalar(
+            select(CertificateIssuanceReceipt).where(CertificateIssuanceReceipt.user_id == 100000000007)
+        )
+        assert receipt is not None
+        assert receipt.status == 'completed'
+
+
+@pytest.mark.asyncio
+async def test_defect3_canonical_max_message_ids_extraction_and_postgres_saving(session_factory, media_setup, monkeypatch):
+    """
+    Defect 3: Canonical MAX message IDs.
+    Replaces stringified dict with canonical `mid` string extracted via `extract_sent_message_id`.
+    Tests with a realistic full MAX API response (significantly longer than 64 characters),
+    verifying clean persistence into String(64) columns and subsequent retrieval.
+    """
+    from max_messenger_bot.models import extract_sent_message_id
+
+    source, config = await seed_max_template(session_factory)
+    async with session_factory() as session:
+        scen_cfg = await get_or_create_followup_config(session, 40, topic_id=1)
+        scen_cfg.is_active = True
+        scen_cfg.caption_template = '🎉 Поздравляем, <b>{name}</b>! Ваш сертификат готов.'
+        scen_cfg.invitation_text = 'Хотите записаться на консультацию?'
+        scen_cfg.target_stage = 'OFFER_MEETING'
+        await session.commit()
+
+    CERT_MID = "01931a54-73d2-7c82-99ab-6db52857e0f2"
+    INVITE_MID = "01931a54-73d2-7c82-99ab-8fc93821a113"
+
+    realistic_cert_response = {
+        "success": True,
+        "message": {
+            "body": {
+                "mid": CERT_MID,
+                "text": "🎉 Поздравляем! Ваш сертификат готов.",
+                "attachments": [
+                    {
+                        "type": "file",
+                        "payload": {
+                            "token": "token_abc1234567890_very_long_attachment_payload_exceeding_standard_limits_definitely_longer_than_64_characters",
+                            "url": "https://storage.max.chat/files/cert.png"
+                        }
+                    }
+                ]
+            },
+            "recipient": {"chat_id": 100},
+            "sender": {"user_id": 999999, "name": "Psychobot"}
+        }
+    }
+    realistic_invite_response = {
+        "success": True,
+        "message": {
+            "body": {
+                "mid": INVITE_MID,
+                "text": "Хотите записаться на консультацию?",
+                "attachments": [
+                    {
+                        "type": "inline_keyboard",
+                        "payload": {
+                            "buttons": [
+                                [{"text": "🤝 Хочу встретиться", "callback_data": "cert_meet:accept:1"}],
+                                [{"text": "ℹ️ Узнать подробнее", "callback_data": "cert_meet:details:1"}]
+                            ]
+                        }
+                    }
+                ]
+            }
+        }
+    }
+
+    # Verify that raw stringified dicts are much longer than 64 characters (which would break String(64))
+    assert len(str(realistic_cert_response)) > 150
+    assert len(str(realistic_invite_response)) > 150
+    assert extract_sent_message_id(realistic_cert_response) == CERT_MID
+    assert extract_sent_message_id(realistic_invite_response) == INVITE_MID
+
+    client = MaxTransport()
+    monkeypatch.setattr(client, 'download_attachment_url', AsyncMock(return_value=source))
+
+    # Mock client methods to return realistic full API response dictionaries
+    client.send_media_attachment = AsyncMock(return_value=realistic_cert_response)
+    client.send_message = AsyncMock(return_value=realistic_invite_response)
+
+    ai_response = f'[RENDER_IMG_MEDIA: panda_certificate | {json.dumps(VALUES, ensure_ascii=False)}]'
+
+    # Part A: Two-phase delivery saves canonical mid
+    success = await common._deliver_media_template(
+        client,
+        chat_id=100,
+        user_id=100000000007,
+        response=ai_response,
+        dialogue_id=1,
+        topic_id=1,
+    )
+    assert success is True
+
+    async with session_factory() as session:
+        receipt = await session.scalar(
+            select(CertificateIssuanceReceipt).where(CertificateIssuanceReceipt.user_id == 100000000007)
+        )
+        assert receipt is not None
+        assert receipt.status == 'completed'
+        # Strict validation of canonical ID: exactly CERT_MID and INVITE_MID, no JSON / dict formatting
+        assert receipt.certificate_message_id == CERT_MID
+        assert len(receipt.certificate_message_id) == len(CERT_MID) <= 64
+        assert not receipt.certificate_message_id.startswith("{")
+
+        assert receipt.invitation_message_id == INVITE_MID
+        assert len(receipt.invitation_message_id) == len(INVITE_MID) <= 64
+        assert not receipt.invitation_message_id.startswith("{")
+
+    # Part B: Resumption saves canonical mid
+    RESUME_INVITE_MID = "01931a54-73d2-7c82-99ab-9aa44112c334"
+    realistic_resume_invite_response = {
+        "success": True,
+        "message": {
+            "body": {
+                "mid": RESUME_INVITE_MID,
+                "text": "Хотите продолжить?",
+                "attachments": [{"type": "inline_keyboard", "payload": {"buttons": []}}]
+            }
+        }
+    }
+    client.send_message = AsyncMock(return_value=realistic_resume_invite_response)
+
+    key2 = make_issuance_key(40, 100000000007, "Resumed Recipient", '09.11.2026')
+    async with session_factory() as session:
+        r, _ = await get_or_create_receipt(session, 100000000007, 1, 1, key2, config_id=scen_cfg.id)
+        r.status = "cert_sent"
+        r.certificate_message_id = CERT_MID
+        await session.commit()
+        receipt_id = r.id
+
+    resume_success = await resume_pending_certificate_followup(
+        client,
+        user_id=100000000007,
+        topic_id=1,
+        dialogue_id=1,
+        session_maker=session_factory,
+        platform="max",
+        chat_id=101,
+    )
+    assert resume_success is True
+
+    async with session_factory() as session:
+        resumed_receipt = await session.get(CertificateIssuanceReceipt, receipt_id)
+        assert resumed_receipt.status == "completed"
+        assert resumed_receipt.invitation_message_id == RESUME_INVITE_MID
+        assert len(resumed_receipt.invitation_message_id) == len(RESUME_INVITE_MID) <= 64
+        assert not resumed_receipt.invitation_message_id.startswith("{")
+

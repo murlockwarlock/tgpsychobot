@@ -2270,6 +2270,9 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
                 return MediaEditDelivery('[Шаблон изображения]')
             if receipt_status in ("uncertain", "sending_cert"):
                 log.warning("Certificate issuance receipt is %s for user_id=%s, skipping blind retry.", receipt_status, user_id)
+                if receipt_status == "sending_cert":
+                    async with async_session_maker() as session:
+                        await mark_receipt_uncertain(session, receipt_id, "Previous process interrupted during sending_cert; automatic repeat prevented.")
                 return MediaEditDelivery('[Шаблон изображения]')
 
             async with async_session_maker() as session:
@@ -2333,9 +2336,12 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
                     await mark_receipt_failed(session, receipt_id, str(c_err))
                 raise TemplateRenderError(f"Ошибка подписи сертификата: {c_err}") from c_err
 
-            # Requirement 3: Set persistent in-flight state 'sending_cert' BEFORE external API call
+            # Requirement 3 & Defect 2: Set persistent in-flight state 'sending_cert' via atomic CAS BEFORE external API call
             async with async_session_maker() as session:
-                await mark_receipt_sending_cert(session, receipt_id)
+                claimed = await mark_receipt_sending_cert(session, receipt_id)
+            if not claimed:
+                log.info("Certificate sending already claimed concurrently for receipt %s", receipt_id)
+                return MediaEditDelivery('[Шаблон изображения]')
 
             try:
                 sent_cert = await bot.send_document(

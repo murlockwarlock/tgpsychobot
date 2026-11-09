@@ -885,3 +885,110 @@ async def test_defect5_complete_followup_delivery_and_deferred_data_idempotency(
             select(AutomationConversationState).where(AutomationConversationState.user_id == user_id)
         )
         assert conv_state.current_step == "ADMIN_STAGE_PRIORITY", "Admin target stage must strictly override AI step"
+
+
+@pytest.mark.asyncio
+async def test_defect1_atomicity_data_and_completed_crash_recovery(session_factory, setup_tg_user, monkeypatch):
+    """
+    Defect 1: Atomicity of DATA and completed.
+    Simulates crash right after applying DATA blocks before receipt update commit;
+    verifies transaction rollback prevents partial state, and subsequent recovery
+    results in strictly ONE transition, ONE event, and ONE metadata entry (no duplicates).
+    """
+    from database import AutomationEvent
+    from certificate_followup_service import complete_followup_delivery, serialize_service_blocks
+    import certificate_followup_service
+
+    user_id = setup_tg_user
+
+    async with session_factory() as session:
+        cfg = await get_or_create_followup_config(session, 56)
+        cfg.target_stage = "OFFER_MEETING"
+        cfg.is_active = True
+        await session.commit()
+
+    key = make_issuance_key(56, user_id, "Тест Атомарности Дефект 1", "09.11.2026")
+    deferred_blocks = [
+        ServiceDataBlock(
+            current_state={"current_step": "CERT_OFFER_STEP"},
+            events=["cert_awarded"],
+            metadata={"source": "test_atomicity", "score": 100},
+            save_mode="merge",
+            raw_json="{}",
+        )
+    ]
+    serialized = serialize_service_blocks(deferred_blocks)
+
+    async with session_factory() as session:
+        r, _ = await get_or_create_receipt(session, user_id, 0, 1, key, config_id=cfg.id, deferred_data_json=serialized)
+        r.status = "cert_sent"
+        await session.commit()
+        receipt_id = r.id
+
+    # 1. Simulate server crash right after applying DATA before receipt update commits
+    real_transition = certificate_followup_service.transition_user_to_stage
+    crash_simulated = False
+
+    async def crashing_transition(session, u_id, t_id, d_id, target_step):
+        nonlocal crash_simulated
+        crash_simulated = True
+        raise RuntimeError("Simulated crash right after applying DATA blocks")
+
+    monkeypatch.setattr(certificate_followup_service, "transition_user_to_stage", crashing_transition)
+
+    with pytest.raises(RuntimeError, match="Simulated crash"):
+        await complete_followup_delivery(
+            session_factory,
+            receipt_id=receipt_id,
+            invitation_message_id="msg_fail",
+            scen_cfg=cfg,
+            user_id=user_id,
+            topic_id=0,
+            dialogue_id=1,
+            deferred_blocks=deferred_blocks,
+        )
+
+    assert crash_simulated is True
+
+    # Verify atomic rollback: NO events, NO transitions, User metadata untouched, receipt untouched
+    async with session_factory() as session:
+        events = (await session.scalars(select(AutomationEvent).where(AutomationEvent.user_id == user_id))).all()
+        assert len(events) == 0, "DATA events must have rolled back completely"
+
+        transitions = (await session.scalars(select(AutomationStepTransition).where(AutomationStepTransition.user_id == user_id))).all()
+        assert len(transitions) == 0, "Transitions must have rolled back completely"
+
+        r_after_crash = await session.get(CertificateIssuanceReceipt, receipt_id)
+        assert r_after_crash.status == "cert_sent", "Receipt status must remain cert_sent"
+        assert r_after_crash.deferred_data_json is not None, "deferred_data_json must remain preserved for recovery"
+
+    # 2. Recovery: run complete_followup_delivery with normal execution
+    monkeypatch.setattr(certificate_followup_service, "transition_user_to_stage", real_transition)
+
+    await complete_followup_delivery(
+        session_factory,
+        receipt_id=receipt_id,
+        invitation_message_id="msg_recovered_888",
+        scen_cfg=cfg,
+        user_id=user_id,
+        topic_id=0,
+        dialogue_id=1,
+    )
+
+    # Verify recovery state: strictly ONE event, ONE transition, receipt completed
+    async with session_factory() as session:
+        events = (await session.scalars(select(AutomationEvent).where(AutomationEvent.user_id == user_id))).all()
+        assert len(events) == 1, f"Expected strictly 1 event, got {len(events)}"
+        assert events[0].name == "cert_awarded"
+
+        transitions = (await session.scalars(select(AutomationStepTransition).where(AutomationStepTransition.user_id == user_id))).all()
+        assert len(transitions) == 1, f"Expected strictly 1 transition, got {len(transitions)}"
+        assert transitions[0].current_step == "OFFER_MEETING"
+
+        r_completed = await session.get(CertificateIssuanceReceipt, receipt_id)
+        assert r_completed.status == "completed"
+        assert r_completed.deferred_data_json is None
+        assert r_completed.invitation_message_id == "msg_recovered_888"
+
+        user = await session.get(User, user_id)
+        assert "test_atomicity" in (user.metadata_json or "")

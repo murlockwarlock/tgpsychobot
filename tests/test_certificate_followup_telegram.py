@@ -339,6 +339,10 @@ async def test_telegram_runtime_two_phase_delivery_success(session_factory, medi
     """
     source, config = await seed_template(session_factory)
     async with session_factory() as session:
+        user = await session.get(User, media_setup)
+        if user:
+            user.current_dialogue_id = 1
+            user.current_topic_id = 1
         cfg = await get_or_create_followup_config(session, 3)
         cfg.is_active = True
         cfg.caption_template = "🎉 Поздравляем, <b>{name}</b>! Ваш сертификат готов."
@@ -1709,5 +1713,52 @@ async def test_failure_point4_completed_deferred_data_idempotent_drain(session_f
             select(AutomationConversationState).where(AutomationConversationState.user_id == media_setup)
         )
         assert state2.current_step == scen_cfg.target_stage
+
+
+@pytest.mark.asyncio
+async def test_defect2_concurrent_certificate_issuance_telegram_single_wire_send(session_factory, media_setup, monkeypatch):
+    """
+    Defect 2: Concurrent certificate issuance in Telegram.
+    Two simultaneous requests to issue the same certificate with real validation
+    of Telegram methods. Atomic CAS ensures strictly ONE call to SendDocument.
+    """
+    source, config = await seed_template(session_factory)
+    async with session_factory() as session:
+        user = await session.get(User, media_setup)
+        if user:
+            user.current_dialogue_id = 1
+            user.current_topic_id = 1
+        cfg = await get_or_create_followup_config(session, 3)
+        cfg.is_active = True
+        cfg.caption_template = "🎉 Поздравляем, <b>{name}</b>! Ваш сертификат готов."
+        cfg.invitation_text = "Приглашаю на стратегическую сессию."
+        cfg.target_stage = "OFFER_MEETING"
+        await session.commit()
+
+    transport = ValidatingCertTelegramTransport()
+    async def stream(*args, **kwargs): yield source
+    monkeypatch.setattr(transport, 'stream_content', stream)
+    bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+
+    values = dict(VALUES, recipient="ConcurrentAlice")
+    ai_response = f'[RENDER_IMG_MEDIA: panda_certificate | {json.dumps(values, ensure_ascii=False)}]'
+
+    # Run two delivery requests concurrently
+    res1, res2 = await asyncio.gather(
+        handlers._deliver_media_template(bot, media_setup, ai_response, dialogue_id=1, topic_id=1),
+        handlers._deliver_media_template(bot, media_setup, ai_response, dialogue_id=1, topic_id=1),
+    )
+
+    # Verify that exactly ONE SendDocument method call occurred on the wire
+    documents = [c for c in transport.calls if isinstance(c, SendDocument)]
+    assert len(documents) == 1, f"Expected strictly 1 SendDocument, got {len(documents)}"
+
+    # Check that receipt is completed
+    async with session_factory() as session:
+        receipt = await session.scalar(
+            select(CertificateIssuanceReceipt).where(CertificateIssuanceReceipt.user_id == media_setup)
+        )
+        assert receipt is not None
+        assert receipt.status == 'completed'
 
 
