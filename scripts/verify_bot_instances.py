@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRY = ROOT / "config" / "bot_instances.json"
 PLATFORMS = {"telegram", "max"}
 MODES = {"new", "legacy", "fulltest"}
-EXPECTED_DEPLOY_MANAGED_COUNT = 18
+EXPECTED_DEPLOY_MANAGED_COUNT = 17
 TOKEN_VALUE_RE = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b")
 SECRET_KEY_RE = re.compile(r"(?:password|secret|private|api[_-]?key)", re.IGNORECASE)
 

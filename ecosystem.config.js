@@ -58,23 +58,6 @@ const apps = [
     }
   },
   {
-    name: "tg_alena322bot_new",
-    script: "/root/telegram_bots/newbots/main.py",
-    error_file: `${PM2_LOG_DIR}/veraveda-new-error.log`,
-    out_file: `${PM2_LOG_DIR}/veraveda-new-out.log`,
-    interpreter: "/root/telegram_bots/venv/bin/python",
-    env: {
-      "BOT_TOKEN": process.env.TELEGRAM_ALENA322BOT_TOKEN || "",
-      "OWNER_IDS": "272982544,979514796,806750628",
-      "DATABASE_URL": process.env.TELEGRAM_ALENA322BOT_DATABASE_URL || "",
-      "SERVER_IP": "77.91.112.200",
-      "APP_PORT": 8082,
-      "WEBHOOK_PATH_PREFIX": "/bot2",
-      "BASE_WEBHOOK_URL": "https://bots.psysoldatov.ru:8443",
-      "TELEGRAM_DELIVERY_MODE": "polling"
-    }
-  },
-  {
     name: "tg_someonewithyou01_bot_new",
     script: "/root/telegram_bots/newbots/main.py",
     error_file: `${PM2_LOG_DIR}/someone01-new-error.log`,

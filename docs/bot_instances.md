@@ -26,8 +26,8 @@ as an independent configuration source.
 | max | id519010411655_bot | max_id519010411655_bot_new | yourself_way_db | MAX_ID519010411655_BOT_TOKEN | new |
 | telegram | kontentzavod322bot | tg_kontentzavod322bot_fulltest | psy5d_fulltest | PSY5D_FULLTEST_BOT_TOKEN | fulltest |
 
-The last entry is the stopped, opt-in full-test process and is not part of the
-18-process production deploy. `vitaliy_bot` and `darimiru_bot` are PM2 entries
+The inactive entries (`alena322bot`, `kontentzavod322bot`) are stopped/inactive and are not part of the
+17-process production deploy. `vitaliy_bot` and `darimiru_bot` are PM2 entries
 outside this repository; their credentials and identities were not exposed by
 this application's runtime and they are not renamed here.
 
