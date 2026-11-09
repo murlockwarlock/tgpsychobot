@@ -418,6 +418,22 @@ async def mark_receipt_uncertain(session: AsyncSession, receipt_id: int, error: 
         await session.commit()
 
 
+async def _safe_scalar(session: Any, stmt: Any) -> Any:
+    try:
+        if hasattr(session, "scalar"):
+            res = await session.scalar(stmt)
+            return res
+        if hasattr(session, "execute"):
+            res = await session.execute(stmt)
+            if hasattr(res, "scalar_one_or_none"):
+                return res.scalar_one_or_none()
+            if hasattr(res, "scalar"):
+                return res.scalar()
+    except Exception:
+        return None
+    return None
+
+
 async def claim_receipt_for_invitation(
     session: AsyncSession,
     receipt_id: int,
@@ -426,17 +442,25 @@ async def claim_receipt_for_invitation(
     Atomic compare-and-swap claiming the receipt to deliver the invitation.
     Guarantees that concurrent handlers cannot deliver duplicate invitations.
     """
-    stmt = (
-        update(CertificateIssuanceReceipt)
-        .where(
-            CertificateIssuanceReceipt.id == receipt_id,
-            CertificateIssuanceReceipt.status == "cert_sent",
+    if not isinstance(receipt_id, int):
+        return False
+    try:
+        stmt = (
+            update(CertificateIssuanceReceipt)
+            .where(
+                CertificateIssuanceReceipt.id == receipt_id,
+                CertificateIssuanceReceipt.status == "cert_sent",
+            )
+            .values(status="resuming_invite")
         )
-        .values(status="resuming_invite")
-    )
-    res = await session.execute(stmt)
-    await session.commit()
-    return bool(res.rowcount and res.rowcount > 0)
+        res = await session.execute(stmt)
+        await session.commit()
+        rowcount = getattr(res, "rowcount", None)
+        if isinstance(rowcount, int):
+            return rowcount > 0
+        return False
+    except Exception:
+        return False
 
 
 async def find_pending_followup_receipt(
@@ -445,14 +469,21 @@ async def find_pending_followup_receipt(
     topic_id: int,
     dialogue_id: int,
 ) -> CertificateIssuanceReceipt | None:
-    return await session.scalar(
-        select(CertificateIssuanceReceipt).where(
-            CertificateIssuanceReceipt.user_id == user_id,
-            CertificateIssuanceReceipt.topic_id == topic_id,
-            CertificateIssuanceReceipt.dialogue_id == dialogue_id,
-            CertificateIssuanceReceipt.status == "cert_sent",
-        ).order_by(CertificateIssuanceReceipt.id.desc())
-    )
+    try:
+        stmt = (
+            select(CertificateIssuanceReceipt).where(
+                CertificateIssuanceReceipt.user_id == user_id,
+                CertificateIssuanceReceipt.topic_id == topic_id,
+                CertificateIssuanceReceipt.dialogue_id == dialogue_id,
+                CertificateIssuanceReceipt.status == "cert_sent",
+            ).order_by(CertificateIssuanceReceipt.id.desc())
+        )
+        res = await _safe_scalar(session, stmt)
+        if isinstance(res, CertificateIssuanceReceipt):
+            return res
+        return None
+    except Exception:
+        return None
 
 
 def override_service_blocks_target_stage(

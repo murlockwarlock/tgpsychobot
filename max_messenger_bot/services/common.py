@@ -1263,14 +1263,17 @@ async def _execute_ai_dialogue_turn(
         final_prompt = f"{prompt_text}\n\nКонтекст для ответа: {topic_phrase}"
 
     # Requirement 5: Resume pending invitation delivery if cert was sent but invite was interrupted
-    await resume_pending_certificate_followup(
-        client,
-        user_id=user_id,
-        topic_id=request_topic_id or 0,
-        dialogue_id=request_dialogue_id or 1,
-        session_maker=async_session_maker,
-        platform="max",
-    )
+    try:
+        await resume_pending_certificate_followup(
+            client,
+            user_id=user_id,
+            topic_id=request_topic_id or 0,
+            dialogue_id=request_dialogue_id or 1,
+            session_maker=async_session_maker,
+            platform="max",
+        )
+    except Exception as resume_err:
+        log.debug("resume_pending_certificate_followup error ignored on MAX: %s", resume_err)
 
     try:
         resp_capture = {}

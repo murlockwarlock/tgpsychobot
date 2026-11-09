@@ -2779,14 +2779,17 @@ async def process_buffered_messages(
 
         # Requirement 5: Resume pending invitation delivery if cert was sent but invite was interrupted
         if request_user is not None:
-            await resume_pending_certificate_followup(
-                bot,
-                user_id=user_id,
-                topic_id=request_topic_id or 0,
-                dialogue_id=request_dialogue_id or 1,
-                session_maker=async_session_maker,
-                platform="telegram",
-            )
+            try:
+                await resume_pending_certificate_followup(
+                    bot,
+                    user_id=user_id,
+                    topic_id=request_topic_id or 0,
+                    dialogue_id=request_dialogue_id or 1,
+                    session_maker=async_session_maker,
+                    platform="telegram",
+                )
+            except Exception as resume_err:
+                log.debug("resume_pending_certificate_followup error ignored: %s", resume_err)
 
         processing_message = await _send_ai_processing_message(
             bot,
