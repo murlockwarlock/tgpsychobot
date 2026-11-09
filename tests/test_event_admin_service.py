@@ -1400,3 +1400,88 @@ async def test_event_title_1000_create_edit_persist_and_reject_1001(test_session
     text_parts = [part["text"] for part in plan if part["kind"] == "text"]
     assert updated_title in "\n".join(text_parts)
     assert all(len(part) <= 4000 for part in text_parts)
+
+
+@pytest.mark.asyncio
+async def test_validate_step_input_html_and_version_integrity(test_session_maker):
+    """
+    Validates pre-commit HTML validation of reminder steps:
+    - Rejects invalid, unclosed, and unsupported HTML tags with clear errors.
+    - Preserves existing step text, step version, and scenario content version upon rejection.
+    - Saves valid HTML tags and variables cleanly without double-escaping.
+    """
+    from event_admin_service import validate_step_input, add_step, update_step, get_step_item
+
+    # 1. Direct validation tests
+    # Valid tags and variables
+    valid_text = "<b>Привет</b>, {name}! Напоминаем о <code>{event_title}</code>: <a href=\"{link}\">ссылка</a>"
+    validate_step_input(-60, valid_text)
+
+    # Empty text
+    with pytest.raises(ValueError, match="не может быть пустым"):
+        validate_step_input(-60, "   ")
+
+    # Unclosed tag
+    with pytest.raises(ValueError, match="не закрыты теги"):
+        validate_step_input(-60, "<b>Текст без закрытия")
+
+    # Unsupported tag
+    with pytest.raises(ValueError, match="неподдерживается"):
+        validate_step_input(-60, "<script>alert(1)</script>")
+
+    # Mismatched order
+    with pytest.raises(ValueError, match="нарушен порядок закрытия"):
+        validate_step_input(-60, "<b><i>текст</b></i>")
+
+    # Bare unescaped '<'
+    with pytest.raises(ValueError, match="Неэкранированный символ"):
+        validate_step_input(-60, "За 5 < 10 минут до эфира")
+
+    # 2. Database update integrity test
+    future_utc = datetime.utcnow() + timedelta(days=3)
+    scen = await create_scenario(
+        test_session_maker,
+        code="step_html_integrity_event",
+        event_type="webinar",
+        title="HTML Validation Webinar",
+        starts_at_utc=future_utc,
+        link="https://example.test/webinar",
+        is_active=True,
+    )
+    initial_text = "Напоминаем: <code>{event_title}</code> скоро! Ссылка: {link}"
+    step = await add_step(test_session_maker, scen.id, -1440, initial_text)
+    assert step.step_version == 1
+    assert step.message_text == initial_text
+
+    initial_content_version = (await get_scenario_summary(test_session_maker, scen.id)).content_version
+
+    # Attempt to update with invalid unclosed tag
+    with pytest.raises(ValueError, match="не закрыты теги"):
+        await update_step(test_session_maker, step.id, message_text="<b>Поврежденный текст")
+
+    # Verify step was NOT modified and version was NOT incremented
+    step_check = await get_step_item(test_session_maker, step.id)
+    assert step_check.message_text == initial_text
+    assert step_check.step_version == 1
+    scen_check = await get_scenario_summary(test_session_maker, scen.id)
+    assert scen_check.content_version == initial_content_version
+
+    # Attempt to update with unsupported tag
+    with pytest.raises(ValueError, match="неподдерживается"):
+        await update_step(test_session_maker, step.id, message_text="<div>HTML блок</div>")
+
+    step_check = await get_step_item(test_session_maker, step.id)
+    assert step_check.message_text == initial_text
+    assert step_check.step_version == 1
+
+    # Update with valid HTML containing tags and variables
+    updated_text = "Обновлено: <code>{event_title}</code>! Ссылка: <a href=\"{link}\">подключиться</a>"
+    updated_step = await update_step(test_session_maker, step.id, message_text=updated_text)
+    assert updated_step.step_version == 2
+    assert updated_step.message_text == updated_text
+    assert "&lt;code&gt;" not in updated_step.message_text
+
+    step_final = await get_step_item(test_session_maker, step.id)
+    assert step_final.message_text == updated_text
+    assert step_final.step_version == 2
+

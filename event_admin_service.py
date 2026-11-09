@@ -53,6 +53,7 @@ from event_content_validator import (
     MEDIA_FORMAT_SEPARATE_MEDIA_TOP,
     MEDIA_FORMAT_SEPARATE_TEXT_TOP,
     EventContentValidationError,
+    TelegramHtmlValidator,
     get_media_format,
     resolve_media_mode_and_order,
     validate_scenario_content,
@@ -477,6 +478,10 @@ def validate_step_input(offset_minutes: int, message_text: str) -> None:
     text_clean = (message_text or "").strip()
     if not text_clean:
         raise ValueError("Текст напоминания не может быть пустым.")
+    try:
+        TelegramHtmlValidator.validate(text_clean)
+    except Exception as exc:
+        raise ValueError(f"Некорректная HTML-разметка: {exc}") from exc
 
 
 # ==============================================================================
