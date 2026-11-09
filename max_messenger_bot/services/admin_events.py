@@ -1821,8 +1821,8 @@ async def show_steps(
 
     rows = []
     for idx, st in enumerate(steps):
-        short = (st.message_text[:25] + "...") if len(st.message_text) > 25 else st.message_text
-        label = f"{idx + 1}. {st.offset_display} — {short.replace('\n', ' ')}"
+        short = compact_event_title(st.message_text, limit=25)
+        label = f"{idx + 1}. {st.offset_display} — {short}"
         rows.append([callback_button(label, _event_step_callback(st.id, back))])
 
     if not s.is_archived:
@@ -1838,9 +1838,10 @@ async def show_steps(
     else:
         text_lines.append(f"Всего шагов: {len(steps)}:\n\n")
         for idx, st in enumerate(steps):
+            preview = truncate_html_preview(st.message_text, 100, allowed_tags=ALLOWED_EVENT_HTML_TAGS)
             text_lines.append(
                 f"<b>{idx + 1}. {st.offset_display}</b> (v{st.step_version})\n"
-                f"<blockquote>{html.escape(st.message_text[:80])}</blockquote>\n\n"
+                f"<blockquote>{preview}</blockquote>\n\n"
             )
 
     await client.send_message(
@@ -1899,7 +1900,7 @@ async def show_step(
         f"• Версия: v{st.step_version}\n\n"
         f"• Детали события: {'включены' if st.include_event_details else 'выключены'}\n\n"
         f"<b>Текст сообщения:</b>\n"
-        f"<blockquote>{html.escape(st.message_text)}</blockquote>"
+        f"<blockquote>{truncate_html_preview(st.message_text, 2800, allowed_tags=ALLOWED_EVENT_HTML_TAGS)}</blockquote>"
     )
 
     await client.send_message(
@@ -2050,7 +2051,11 @@ async def receive_step_text(
         await show_steps(client, chat_id, event_id, back=list_back)
     except Exception as exc:
         log.exception("MAX add step error: %s", exc)
-        await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
+        await client.send_message(
+            chat_id=chat_id,
+            text=f"❌ Ошибка: {exc}\n\nПожалуйста, исправьте разметку и отправьте текст снова или нажмите «Назад»:",
+            attachments=inline_keyboard([_back(_event_steps_callback(event_id, list_back))]),
+        )
 
 
 async def start_edit_step_text(
@@ -2075,7 +2080,7 @@ async def start_edit_step_text(
     )
     await client.send_message(
         chat_id=chat_id,
-        text=f"✏️ <b>Редактирование текста</b>\n\nТекущий:\n<blockquote>{html.escape(st.message_text)}</blockquote>\n\nВведите новый текст:",
+        text=f"✏️ <b>Редактирование текста</b>\n\nТекущий:\n<blockquote>{truncate_html_preview(st.message_text, 2800, allowed_tags=ALLOWED_EVENT_HTML_TAGS)}</blockquote>\n\nВведите новый текст:",
         attachments=inline_keyboard([_back(_event_step_callback(step_id, list_back))]),
     )
 
@@ -2097,7 +2102,11 @@ async def receive_edit_step_text(
         await client.send_message(chat_id=chat_id, text=f"✅ Текст обновлен (v{updated.step_version}).")
         await show_step(client, chat_id, step_id, back=list_back)
     except Exception as exc:
-        await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
+        await client.send_message(
+            chat_id=chat_id,
+            text=f"❌ Ошибка: {exc}\n\nПожалуйста, исправьте разметку и отправьте текст снова или нажмите «Назад»:",
+            attachments=inline_keyboard([_back(_event_step_callback(step_id, list_back))]),
+        )
 
 
 async def start_edit_step_offset(
@@ -2542,7 +2551,7 @@ async def show_test_send_menu(
         [callback_button("✉️ Подтверждение регистрации", f"admin_ev_do_test_send_{event_id}_0")],
     ]
     for idx, s in enumerate(steps):
-        short = (s.message_text[:20] + "...") if len(s.message_text) > 20 else s.message_text
+        short = compact_event_title(s.message_text, limit=20)
         rows.append([callback_button(f"✉️ Шаг {idx + 1} ({s.offset_display}): {short}", f"admin_ev_do_test_send_{event_id}_{s.id}")])
 
     rows.append(_back(_event_open_callback(event_id, back)))
