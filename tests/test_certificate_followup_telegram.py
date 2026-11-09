@@ -2,7 +2,7 @@ import asyncio
 import io
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -14,6 +14,7 @@ import pytest_asyncio
 from PIL import Image
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.methods import SendDocument, SendMessage, SendPhoto, AnswerCallbackQuery, GetFile
 from aiogram.types import CallbackQuery, Chat, Message, Update, User as TelegramUser
 from sqlalchemy import select, text
@@ -265,7 +266,7 @@ async def test_telegram_admin_full_scenario_journey_a_to_ya_to_a(session_factory
             assert conv_state.current_step != 'BOOK_CALL'
 
     # 10. Navigate Back to template home
-    await click('mt:home:')
+    await click('mt:scen_back:')
     assert 'panda_certificate' in latest.text
 
 
@@ -1202,7 +1203,8 @@ async def test_cert_followup_list_pagination_in_automations_menu(session_factory
     # Check next page button exists
     next_btn = next((b for b in buttons_p0 if b.callback_data == 'cert_followup_list:1'), None)
     assert next_btn is not None
-    assert 'Вперёд' in next_btn.text
+    assert 'Далее' in next_btn.text
+    assert next_btn.text == 'Далее ➡️'
 
     # 2. Click next page (Page 1)
     await click_data('cert_followup_list:1')
@@ -1227,4 +1229,485 @@ async def test_cert_followup_list_pagination_in_automations_menu(session_factory
     assert back_btn is not None
     await click_data('automation_menu')
     assert 'Автоматизации' in latest.text
+
+
+@pytest.mark.asyncio
+async def test_cert_followup_list_pagination_sizes_0_1_5_6_11_and_extreme_pages(session_factory, media_setup, monkeypatch):
+    """
+    Defect 6 Verification:
+    Tests pagination with 0, 1, 5, 6, 11 objects, and extreme pages (-1, 99).
+    Next page button must strictly be «Далее ➡️».
+    """
+    monkeypatch.setattr(handlers, 'is_admin', AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, 'get_all_admin_ids', AsyncMock(return_value=[media_setup]))
+    transport = ValidatingCertTelegramTransport()
+    bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+    handlers.router._parent_router = None
+    automation_admin.router._parent_router = None
+    dispatcher = Dispatcher()
+    dispatcher.include_router(automation_admin.router)
+    dispatcher.include_router(handlers.router)
+
+    state = dispatcher.fsm.get_context(bot=bot, chat_id=media_setup, user_id=media_setup)
+    await state.update_data(authoring_locale='ru')
+
+    latest = None
+
+    async def click_data(data):
+        nonlocal latest
+        start = len(transport.calls)
+        await dispatcher.feed_update(bot, Update(
+            update_id=76000 + start,
+            callback_query=CallbackQuery(
+                id=str(start),
+                from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Admin'),
+                chat_instance='ci_pagi_sizes',
+                data=data,
+                message=Message(message_id=76000, date=datetime.now(timezone.utc), chat=Chat(id=media_setup, type='private'), text='screen')
+            )
+        ))
+        screens = [c for c in transport.calls[start:] if getattr(c, 'reply_markup', None)]
+        if screens:
+            latest = screens[-1]
+
+    # --- 0 Objects ---
+    await click_data('cert_followup_list')
+    assert latest is not None
+    assert 'В медиатеке пока нет настроенных шаблонов' in latest.text
+    buttons_0 = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    assert len(buttons_0) == 1
+    assert buttons_0[0].callback_data == 'automation_menu'
+
+    # --- 1 Object ---
+    source, config = await seed_template(session_factory)
+    async with session_factory() as session:
+        m40 = await session.get(MediaLibrary, 40)
+        if m40:
+            m40.render_template_enabled = False
+        await session.commit()
+    await click_data('cert_followup_list')
+    assert 'Сценарии после выдачи сертификатов' in latest.text
+    assert '(Стр. 1/1)' in latest.text
+    buttons_1 = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    templates_1 = [b for b in buttons_1 if b.callback_data.startswith('mt:scenario:')]
+    assert len(templates_1) == 1
+    # No pagination buttons
+    assert not any('Далее' in b.text or 'Назад' in b.text for b in buttons_1 if b.callback_data != 'automation_menu')
+
+    # --- 5 Objects ---
+    async with session_factory() as session:
+        for i in range(101, 105):
+            session.add(MediaLibrary(
+                id=i,
+                file_id=f'cert_tpl_{i}',
+                file_name=f'template_{i}',
+                media_type='photo',
+                source_platform='telegram',
+                render_template_enabled=True,
+                render_template_config=config,
+            ))
+        await session.commit()
+
+    await click_data('cert_followup_list')
+    assert '(Стр. 1/1)' in latest.text
+    buttons_5 = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    templates_5 = [b for b in buttons_5 if b.callback_data.startswith('mt:scenario:')]
+    assert len(templates_5) == 5
+    assert not any('Далее' in b.text for b in buttons_5)
+
+    # --- 6 Objects ---
+    async with session_factory() as session:
+        session.add(MediaLibrary(
+            id=105,
+            file_id='cert_tpl_105',
+            file_name='template_105',
+            media_type='photo',
+            source_platform='telegram',
+            render_template_enabled=True,
+            render_template_config=config,
+        ))
+        await session.commit()
+
+    # Page 0 of 6: 5 templates + «Далее ➡️»
+    await click_data('cert_followup_list:0')
+    assert '(Стр. 1/2)' in latest.text
+    buttons_6_p0 = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    templates_6_p0 = [b for b in buttons_6_p0 if b.callback_data.startswith('mt:scenario:')]
+    assert len(templates_6_p0) == 5
+    next_btn_6 = next((b for b in buttons_6_p0 if b.callback_data == 'cert_followup_list:1'), None)
+    assert next_btn_6 is not None
+    assert next_btn_6.text == 'Далее ➡️'
+
+    # Page 1 of 6: 1 template + «⬅️ Назад»
+    await click_data('cert_followup_list:1')
+    assert '(Стр. 2/2)' in latest.text
+    buttons_6_p1 = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    templates_6_p1 = [b for b in buttons_6_p1 if b.callback_data.startswith('mt:scenario:')]
+    assert len(templates_6_p1) == 1
+    prev_btn_6 = next((b for b in buttons_6_p1 if b.callback_data == 'cert_followup_list:0'), None)
+    assert prev_btn_6 is not None
+    assert 'Назад' in prev_btn_6.text
+
+    # --- 11 Objects ---
+    async with session_factory() as session:
+        for i in range(106, 111):
+            session.add(MediaLibrary(
+                id=i,
+                file_id=f'cert_tpl_{i}',
+                file_name=f'template_{i}',
+                media_type='photo',
+                source_platform='telegram',
+                render_template_enabled=True,
+                render_template_config=config,
+            ))
+        await session.commit()
+
+    # Total 11: Page 0 (5), Page 1 (5), Page 2 (1)
+    await click_data('cert_followup_list:0')
+    assert '(Стр. 1/3)' in latest.text
+    await click_data('cert_followup_list:1')
+    assert '(Стр. 2/3)' in latest.text
+    buttons_11_p1 = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    assert any(b.text == 'Далее ➡️' for b in buttons_11_p1)
+    assert any('Назад' in b.text for b in buttons_11_p1 if b.callback_data != 'automation_menu')
+
+    await click_data('cert_followup_list:2')
+    assert '(Стр. 3/3)' in latest.text
+    buttons_11_p2 = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    templates_11_p2 = [b for b in buttons_11_p2 if b.callback_data.startswith('mt:scenario:')]
+    assert len(templates_11_p2) == 1
+    assert not any('Далее' in b.text for b in buttons_11_p2)
+
+    # --- Extreme Pages Clamping ---
+    # Negative page clamps to 0
+    await click_data('cert_followup_list:-1')
+    assert '(Стр. 1/3)' in latest.text
+
+    # Beyond total pages clamps to last page (page 2)
+    await click_data('cert_followup_list:99')
+    assert '(Стр. 3/3)' in latest.text
+
+
+@pytest.mark.asyncio
+async def test_cert_followup_list_edit_and_cancel_preserves_page_n_navigation(session_factory, media_setup, monkeypatch):
+    """
+    Defect 6 Verification:
+    Journey: Automations → Scenarios after certs → page N → card → edit → save/cancel → back
+    Must return to the scenario list on the exact same page N.
+    Entering via Media Library returns to Media Library.
+    """
+    source, config = await seed_template(session_factory)
+    async with session_factory() as session:
+        m40 = await session.get(MediaLibrary, 40)
+        if m40:
+            m40.render_template_enabled = False
+        for i in range(201, 207):  # 1 (id 3) + 6 = 7 templates total -> 2 pages
+            session.add(MediaLibrary(
+                id=i,
+                file_id=f'cert_tpl_{i}',
+                file_name=f'template_{i}',
+                media_type='photo',
+                source_platform='telegram',
+                render_template_enabled=True,
+                render_template_config=config,
+            ))
+        await session.commit()
+
+    monkeypatch.setattr(handlers, 'is_admin', AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, 'get_all_admin_ids', AsyncMock(return_value=[media_setup]))
+    transport = ValidatingCertTelegramTransport()
+    bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+    handlers.router._parent_router = None
+    automation_admin.router._parent_router = None
+    dispatcher = Dispatcher()
+    dispatcher.include_router(automation_admin.router)
+    dispatcher.include_router(handlers.router)
+
+    state = dispatcher.fsm.get_context(bot=bot, chat_id=media_setup, user_id=media_setup)
+    await state.update_data(authoring_locale='ru')
+
+    latest = None
+
+    async def click_data(data):
+        nonlocal latest
+        start = len(transport.calls)
+        await dispatcher.feed_update(bot, Update(
+            update_id=77000 + start,
+            callback_query=CallbackQuery(
+                id=str(start),
+                from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Admin'),
+                chat_instance='ci_edit_nav',
+                data=data,
+                message=Message(message_id=77000, date=datetime.now(timezone.utc), chat=Chat(id=media_setup, type='private'), text='screen')
+            )
+        ))
+        screens = [c for c in transport.calls[start:] if getattr(c, 'reply_markup', None)]
+        if screens:
+            latest = screens[-1]
+        return latest
+
+    async def enter_text(text_val):
+        nonlocal latest
+        start = len(transport.calls)
+        await dispatcher.feed_update(bot, Update(
+            update_id=78000 + start,
+            message=Message(
+                message_id=78000 + start,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=media_setup, type='private'),
+                from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Admin'),
+                text=text_val
+            )
+        ))
+        screens = [c for c in transport.calls[start:] if getattr(c, 'reply_markup', None)]
+        if screens:
+            latest = screens[-1]
+        return latest
+
+    # 1. Open cert_followup_list Page 1
+    await click_data('cert_followup_list:1')
+    assert '(Стр. 2/2)' in latest.text
+    buttons_p1 = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    scenario_btn = next(b for b in buttons_p1 if b.callback_data.startswith('mt:scenario:'))
+    target_cb = scenario_btn.callback_data
+
+    # 2. Case A: Open Scenario -> Edit Caption -> Save -> Back -> returns to Page 1
+    await click_data(target_cb)
+    assert 'Сценарий после выдачи сертификата' in latest.text
+
+    # Click Edit Caption
+    buttons_scen = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    cap_btn = next(b for b in buttons_scen if b.callback_data.startswith('mt:scen_caption:'))
+    await click_data(cap_btn.callback_data)
+    assert 'Подпись к сертификату' in latest.text
+
+    # Enter valid caption
+    await enter_text('Поздравляем, <b>{name}</b>! Вы успешно прошли обучение.')
+    assert 'Сценарий после выдачи сертификата' in latest.text
+
+    # Click Back from scenario screen
+    buttons_scen_back = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    back_btn = next(b for b in buttons_scen_back if b.callback_data.startswith('mt:scen_back:'))
+    await click_data(back_btn.callback_data)
+    # Must return to cert_followup_list on exact same Page 1!
+    assert 'Сценарии после выдачи сертификатов' in latest.text
+    assert '(Стр. 2/2)' in latest.text
+
+    # 3. Case B: Open Scenario -> Edit Invite -> Cancel -> Back -> returns to Page 1
+    await click_data(target_cb)
+    buttons_scen2 = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    inv_btn = next(b for b in buttons_scen2 if b.callback_data.startswith('mt:scen_invite:'))
+    await click_data(inv_btn.callback_data)
+    assert 'Приглашение на встречу' in latest.text
+
+    # Click Cancel
+    cancel_btn = next(b for row in latest.reply_markup.inline_keyboard for b in row if b.callback_data.startswith('mt:scen_cancel:'))
+    await click_data(cancel_btn.callback_data)
+    assert 'Сценарий после выдачи сертификата' in latest.text
+
+    # Click Back
+    back_btn2 = next(b for row in latest.reply_markup.inline_keyboard for b in row if b.callback_data.startswith('mt:scen_back:'))
+    await click_data(back_btn2.callback_data)
+    assert 'Сценарии после выдачи сертификатов' in latest.text
+    assert '(Стр. 2/2)' in latest.text
+
+    # 4. Case C: Open Scenario from Media Library card (origin with cid >= 0) -> Back -> returns to template home
+    # callback: mt:scenario:<id>:0:0:1:-1 (cid=0)
+    target_id = target_cb.split(':')[2]
+    media_card_scenario_cb = f"mt:scenario:{target_id}:0:0:1:-1"
+    await click_data(media_card_scenario_cb)
+    assert 'Сценарий после выдачи сертификата' in latest.text
+
+    back_btn_media = next(b for row in latest.reply_markup.inline_keyboard for b in row if b.callback_data.startswith('mt:scen_back:'))
+    await click_data(back_btn_media.callback_data)
+    # Must return to Media Library template card ('home')
+    assert 'Шаблон изображения' in latest.text
+
+
+@pytest.mark.asyncio
+async def test_defect7_caption_validation_and_instruction_preservation_runtime(session_factory, media_setup, monkeypatch):
+    """
+    Defect 7 Verification:
+    - Caption validation before send.
+    - If caption has invalid HTML or impossible length exceeding 1024 UTF-16 code units:
+      raises CaptionRenderError / TemplateRenderError, marks receipt 'failed',
+      stops delivery, and does NOT send document.
+    """
+    source, config = await seed_template(session_factory)
+    async with session_factory() as session:
+        scen_cfg = await get_or_create_followup_config(session, 3, topic_id=1)
+        scen_cfg.is_active = True
+        # Impossible template: instructions take > 1024 chars
+        scen_cfg.caption_template = "Инструкция: " + ("X" * 1050) + " {name}"
+        await session.commit()
+
+    transport = ValidatingCertTelegramTransport()
+    async def stream(*args, **kwargs): yield source
+    monkeypatch.setattr(transport, 'stream_content', stream)
+    bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+    handlers.router._parent_router = None
+    dispatcher = Dispatcher()
+    dispatcher.include_router(handlers.router)
+
+    ai_response = (
+        'Поздравляем!\n'
+        f'[RENDER_IMG_MEDIA: panda_certificate | {json.dumps(VALUES, ensure_ascii=False)}]\n'
+    )
+    monkeypatch.setattr(ai_integration, '_call_gemini_api', AsyncMock(return_value=ai_response))
+
+    await dispatcher.feed_update(bot, Update(
+        update_id=10001,
+        message=Message(
+            message_id=10001,
+            date=datetime.now(timezone.utc),
+            chat=Chat(id=media_setup, type='private'),
+            from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'),
+            text='Выдайте сертификат'
+        )
+    ))
+    if media_setup in handlers.user_processing_tasks:
+        try:
+            await handlers.user_processing_tasks[media_setup]
+        except Exception:
+            pass
+
+    # Verify no SendDocument was issued
+    doc_calls = [c for c in transport.calls if isinstance(c, SendDocument)]
+    assert len(doc_calls) == 0
+
+    # Verify receipt is marked 'failed'
+    async with session_factory() as session:
+        receipt = await session.scalar(
+            select(CertificateIssuanceReceipt).where(CertificateIssuanceReceipt.user_id == media_setup)
+        )
+        assert receipt is not None
+        assert receipt.status == 'failed'
+        assert 'Шаблон подписи' in (receipt.error_details or '')
+
+
+@pytest.mark.asyncio
+async def test_failure_point2_crash_between_api_send_and_receipt_write(session_factory, media_setup):
+    """
+    Failure Point 2: Crash after API accepted certificate send, before receipt written as cert_sent.
+    In-flight state 'sending_cert' is detected on next attempt, marked 'uncertain',
+    and blocks duplicate certificate send.
+    """
+    from media_templates import current_issue_date
+    today = current_issue_date()
+    key = make_issuance_key(3, media_setup, VALUES['recipient'], today)
+
+    async with session_factory() as session:
+        scen_cfg = await get_or_create_followup_config(session, 3, topic_id=1)
+        scen_cfg.is_active = True
+        r, _ = await get_or_create_receipt(session, media_setup, 0, 1, key, config_id=scen_cfg.id)
+        # Simulate in-flight state right before process crash
+        r.status = "sending_cert"
+        await session.commit()
+
+    # Next attempt detects interrupted sending_cert
+    async with session_factory() as session:
+        receipt, created = await get_or_create_receipt(session, media_setup, 0, 1, key, config_id=scen_cfg.id)
+        assert created is False  # Blocked from creating new receipt
+        assert receipt is not None
+        assert receipt.status == "uncertain"
+        assert "Previous process interrupted" in (receipt.error_details or "")
+
+
+@pytest.mark.asyncio
+async def test_failure_point3_invite_crash_or_timeout_marks_uncertain(session_factory, media_setup):
+    """
+    Failure Point 3: Crash/timeout after invite sent, before API confirm.
+    Resumption does NOT blind-reset to cert_sent; marks uncertain and safely reconciles.
+    """
+    from certificate_followup_service import resume_pending_certificate_followup, reconcile_stuck_followup_receipts
+    from media_templates import current_issue_date
+    today = current_issue_date()
+    key = make_issuance_key(3, media_setup, VALUES['recipient'], today)
+
+    async with session_factory() as session:
+        scen_cfg = await get_or_create_followup_config(session, 3, topic_id=1)
+        scen_cfg.is_active = True
+        r, _ = await get_or_create_receipt(session, media_setup, 0, 1, key, config_id=scen_cfg.id)
+        r.status = "cert_sent"
+        await session.commit()
+        receipt_id = r.id
+
+    failing_bot = AsyncMock()
+    failing_bot.send_message.side_effect = TelegramNetworkError(method=SendMessage(chat_id=media_setup, text="test"), message="Network dropped")
+
+    success = await resume_pending_certificate_followup(
+        failing_bot,
+        user_id=media_setup,
+        topic_id=0,
+        dialogue_id=1,
+        session_maker=session_factory,
+        platform="telegram",
+    )
+    assert success is False
+
+    # Verify status is uncertain, NOT reset to cert_sent
+    async with session_factory() as session:
+        r = await session.get(CertificateIssuanceReceipt, receipt_id)
+        assert r.status == "uncertain"
+        assert "Resumption delivery failed/uncertain" in (r.error_details or "")
+
+    # Stuck reconciliation safely cleans up old stuck receipts
+    async with session_factory() as session:
+        r = await session.get(CertificateIssuanceReceipt, receipt_id)
+        r.status = "resuming_invite"
+        r.created_at = datetime.utcnow() - timedelta(seconds=200)
+        await session.commit()
+
+    async with session_factory() as session:
+        reconciled = await reconcile_stuck_followup_receipts(session, older_than_seconds=60)
+        assert reconciled == 1
+        await session.commit()
+
+        r = await session.get(CertificateIssuanceReceipt, receipt_id)
+        assert r.status == "uncertain"
+
+
+@pytest.mark.asyncio
+async def test_failure_point4_completed_deferred_data_idempotent_drain(session_factory, media_setup):
+    """
+    Failure Point 4: Crash after completed written, before DATA saved.
+    apply_pending_deferred_data_if_any drains deferred data idempotently without duplicate messages.
+    """
+    from certificate_followup_service import apply_pending_deferred_data_if_any
+    from user_metadata import ServiceDataBlock
+    from media_templates import current_issue_date
+    today = current_issue_date()
+    key = make_issuance_key(3, media_setup, VALUES['recipient'], today)
+
+    raw_json = json.dumps({"current_state": {"current_step": "FALLBACK_STEP"}, "events": ["cert_delivered"]})
+    async with session_factory() as session:
+        scen_cfg = await get_or_create_followup_config(session, 3, topic_id=1)
+        scen_cfg.is_active = True
+        scen_cfg.target_stage = "TARGET_STAGE_AFTER_CERT"
+        r, _ = await get_or_create_receipt(session, media_setup, 0, 1, key, config_id=scen_cfg.id)
+        r.status = "completed"
+        r.deferred_data_json = json.dumps([{"raw_json": raw_json, "events": ["cert_delivered"], "current_state": {"current_step": "FALLBACK_STEP"}}])
+        await session.commit()
+        receipt_id = r.id
+
+    # Drain 1
+    await apply_pending_deferred_data_if_any(session_factory, receipt_id=receipt_id, scen_cfg=scen_cfg, user_id=media_setup, topic_id=0, dialogue_id=1)
+
+    async with session_factory() as session:
+        r = await session.get(CertificateIssuanceReceipt, receipt_id)
+        assert r.deferred_data_json is None
+        state = await session.scalar(
+            select(AutomationConversationState).where(AutomationConversationState.user_id == media_setup)
+        )
+        assert state is not None
+        assert state.current_step == scen_cfg.target_stage  # Admin stage preserved
+
+    # Drain 2 (Idempotency) - second call does not throw and leaves state intact
+    await apply_pending_deferred_data_if_any(session_factory, receipt_id=receipt_id, scen_cfg=scen_cfg, user_id=media_setup, topic_id=0, dialogue_id=1)
+    async with session_factory() as session:
+        state2 = await session.scalar(
+            select(AutomationConversationState).where(AutomationConversationState.user_id == media_setup)
+        )
+        assert state2.current_step == scen_cfg.target_stage
+
 

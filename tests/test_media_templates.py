@@ -520,7 +520,7 @@ async def test_admin_actual_navigation_setup_save_cancel_preview(session_factory
         await click('mt:scen_cancel:')
         assert 'Сценарий после выдачи' in latest.text
         await click('mt:scen_test:')
-        await click('mt:home:')
+        await click('mt:scen_back:')
         assert visited == set(BUTTON_CONTRACTS)
     finally:
         dispatcher.sub_routers.clear(); handlers.router._parent_router = None; await bot.session.close()

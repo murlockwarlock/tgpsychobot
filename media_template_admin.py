@@ -62,6 +62,7 @@ BUTTON_CONTRACTS = {
     'scen_btn_edit': 'navigation',
     'scen_test': 'external action',
     'scen_cancel': 'navigation',
+    'scen_back': 'navigation',
 }
 FORM_KEYS = ('key', 'label', 'bbox', 'font_key', 'min_font_size', 'max_font_size', 'color', 'align', 'valign', 'uppercase', 'required', 'max_lines', 'sample_value')
 
@@ -166,7 +167,7 @@ def register_template_admin(router, *, session_factory, require_admin, show_medi
                 ('🎛️ Кнопки', 'scen_buttons', -1),
                 ('🎯 Целевой этап', 'scen_stage', -1),
                 ('🚀 Проверить отправку себе', 'scen_test', -1),
-                ('⬅️ Назад', 'home', -1),
+                ('⬅️ Назад', 'scen_back', -1),
             ]
             await message.answer(text, reply_markup=markup(origin, buttons), parse_mode='HTML')
             return
@@ -274,6 +275,15 @@ def register_template_admin(router, *, session_factory, require_admin, show_medi
             elif action == 'scenario':
                 await state.set_state(None)
                 await screen(callback.message, origin, 'scenario')
+            elif action == 'scen_back':
+                await state.set_state(None)
+                if origin[1] < 0:
+                    # Requirement 6: Return to cert_followup_list on exact same page origin[2]
+                    from automation_admin import show_cert_followup_list_message
+                    await show_cert_followup_list_message(callback.message, page=origin[2])
+                else:
+                    # Return to Media Library template card
+                    await screen(callback.message, origin, 'home')
             elif action == 'scen_toggle':
                 async with session_factory() as session:
                     new_active = await toggle_followup_config(session, media.id)

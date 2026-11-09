@@ -32,13 +32,18 @@ from ..legacy import (
 )
 from automation_engine import apply_service_data_blocks, persist_service_data_blocks
 from certificate_followup_service import (
+    CaptionRenderError,
+    apply_pending_deferred_data_if_any,
     build_followup_max_keyboard,
+    claim_receipt_for_invitation,
+    complete_followup_delivery,
     get_followup_config,
     get_or_create_receipt,
     make_issuance_key,
     mark_receipt_cert_sent,
     mark_receipt_completed,
     mark_receipt_failed,
+    mark_receipt_sending_cert,
     mark_receipt_uncertain,
     override_service_blocks_target_stage,
     render_caption,
@@ -1034,9 +1039,17 @@ async def _deliver_media_template(client, chat_id, user_id, response, dialogue_i
 
             if receipt_status == "completed":
                 log.info("MAX certificate already delivered and completed for user %s, key %s", user_id, issuance_key)
+                await apply_pending_deferred_data_if_any(
+                    async_session_maker,
+                    receipt_id,
+                    scen_cfg,
+                    user_id,
+                    topic_id or 0,
+                    dialogue_id,
+                )
                 return True
-            if receipt_status == "uncertain":
-                log.warning("MAX certificate issuance receipt is uncertain for user_id=%s, skipping blind retry.", user_id)
+            if receipt_status in ("uncertain", "sending_cert"):
+                log.warning("MAX certificate issuance receipt is %s for user_id=%s, skipping blind retry.", receipt_status, user_id)
                 return True
 
             async with async_session_maker() as session:
@@ -1048,34 +1061,48 @@ async def _deliver_media_template(client, chat_id, user_id, response, dialogue_i
             }
 
             if receipt_status == "cert_sent":
-                # Resume Phase 2: Send Message 2
+                # Requirement 4: Atomic CAS claim for invitation delivery
+                async with async_session_maker() as session:
+                    claimed = await claim_receipt_for_invitation(session, receipt_id)
+                if not claimed:
+                    log.info("MAX invitation claimed concurrently for receipt %s", receipt_id)
+                    return True
+
                 invite_text = render_invitation(scen_cfg.invitation_text, user_context)
                 max_kb = build_followup_max_keyboard(scen_cfg, receipt_id=receipt_id)
-                sent_invite = await client.send_message(chat_id=chat_id, text=invite_text, attachments=max_kb)
-                async with async_session_maker() as session:
-                    await mark_receipt_completed(session, receipt_id, invitation_message_id=str(sent_invite) if sent_invite else None)
-                    if scen_cfg.target_stage:
-                        await transition_user_to_stage(session, user_id, topic_id or 0, dialogue_id, scen_cfg.target_stage)
-                    await session.commit()
-                if deferred_service_blocks:
-                    applied_blocks = deferred_service_blocks
-                    if scen_cfg.target_stage:
-                        applied_blocks = override_service_blocks_target_stage(applied_blocks, scen_cfg.target_stage)
-                    await persist_service_data_blocks(
-                        async_session_maker,
-                        user_id=user_id,
-                        dialogue_id=dialogue_id,
-                        topic_id=topic_id,
-                        blocks=applied_blocks,
-                        apply_fn=apply_service_data_blocks,
-                    )
+                try:
+                    sent_invite = await client.send_message(chat_id=chat_id, text=invite_text, attachments=max_kb)
+                except Exception as inv_err:
+                    async with async_session_maker() as session:
+                        await mark_receipt_uncertain(session, receipt_id, str(inv_err))
+                    raise
+
+                await complete_followup_delivery(
+                    async_session_maker,
+                    receipt_id=receipt_id,
+                    invitation_message_id=str(sent_invite) if sent_invite else None,
+                    scen_cfg=scen_cfg,
+                    user_id=user_id,
+                    topic_id=topic_id or 0,
+                    dialogue_id=dialogue_id,
+                    deferred_blocks=deferred_service_blocks,
+                )
                 await save_ai_message(user_id, invite_text, dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)
                 return True
 
             # Phase 1: Upload and deliver certificate (safe caption rendering without silent slicing)
-            caption_text, caption_errors = render_caption_safe(scen_cfg.caption_template, user_context, max_limit=1024)
-            if caption_errors:
-                log.warning("MAX caption had errors: %s, using safe fallback", caption_errors)
+            # Requirement 7: Explicit caption validation before sending; reject if instructions cannot be preserved
+            try:
+                caption_text, _ = render_caption_safe(scen_cfg.caption_template, user_context, max_limit=1024)
+            except CaptionRenderError as c_err:
+                log.error("MAX certificate caption validation failed for user %s: %s", user_id, c_err)
+                async with async_session_maker() as session:
+                    await mark_receipt_failed(session, receipt_id, str(c_err))
+                raise TemplateRenderError(f"Ошибка подписи сертификата: {c_err}") from c_err
+
+            # Requirement 3: Set persistent in-flight state 'sending_cert' BEFORE external API call
+            async with async_session_maker() as session:
+                await mark_receipt_sending_cert(session, receipt_id)
 
             try:
                 with tempfile.NamedTemporaryFile(suffix='.png') as temporary:
@@ -1108,33 +1135,36 @@ async def _deliver_media_template(client, chat_id, user_id, response, dialogue_i
                 )
 
             # Phase 2: Deliver Message 2 (Invitation + MAX buttons)
+            # Requirement 4: Atomic CAS claim for Phase 2 invitation
+            async with async_session_maker() as session:
+                claimed = await claim_receipt_for_invitation(session, receipt_id)
+            if not claimed:
+                log.info("MAX Phase 2 invitation claimed concurrently for receipt %s", receipt_id)
+                await save_ai_message(user_id, caption_text, dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)
+                return True
+
             invite_text = render_invitation(scen_cfg.invitation_text, user_context)
             max_kb = build_followup_max_keyboard(scen_cfg, receipt_id=receipt_id)
             try:
                 sent_invite = await client.send_message(chat_id=chat_id, text=invite_text, attachments=max_kb)
             except Exception as inv_err:
                 log.error("MAX certificate delivered, but invitation failed user_id=%s: %s", user_id, inv_err)
+                async with async_session_maker() as session:
+                    await mark_receipt_uncertain(session, receipt_id, str(inv_err))
                 await save_ai_message(user_id, caption_text, dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)
                 return True
 
-            async with async_session_maker() as session:
-                await mark_receipt_completed(session, receipt_id, invitation_message_id=str(sent_invite) if sent_invite else None)
-                if scen_cfg.target_stage:
-                    await transition_user_to_stage(session, user_id, topic_id or 0, dialogue_id, scen_cfg.target_stage)
-                await session.commit()
-
-            if deferred_service_blocks:
-                applied_blocks = deferred_service_blocks
-                if scen_cfg.target_stage:
-                    applied_blocks = override_service_blocks_target_stage(applied_blocks, scen_cfg.target_stage)
-                await persist_service_data_blocks(
-                    async_session_maker,
-                    user_id=user_id,
-                    dialogue_id=dialogue_id,
-                    topic_id=topic_id,
-                    blocks=applied_blocks,
-                    apply_fn=apply_service_data_blocks,
-                )
+            # Requirement 5: Complete delivery and persist DATA without window
+            await complete_followup_delivery(
+                async_session_maker,
+                receipt_id=receipt_id,
+                invitation_message_id=str(sent_invite) if sent_invite else None,
+                scen_cfg=scen_cfg,
+                user_id=user_id,
+                topic_id=topic_id or 0,
+                dialogue_id=dialogue_id,
+                deferred_blocks=deferred_service_blocks,
+            )
 
             await save_ai_message(user_id, f"{caption_text}\n\n{invite_text}", dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)
             return True
@@ -1262,7 +1292,7 @@ async def _execute_ai_dialogue_turn(
     if topic_phrase:
         final_prompt = f"{prompt_text}\n\nКонтекст для ответа: {topic_phrase}"
 
-    # Requirement 5: Resume pending invitation delivery if cert was sent but invite was interrupted
+    # Requirement 1: Pass actual chat_id from incoming message
     try:
         await resume_pending_certificate_followup(
             client,
@@ -1271,6 +1301,7 @@ async def _execute_ai_dialogue_turn(
             dialogue_id=request_dialogue_id or 1,
             session_maker=async_session_maker,
             platform="max",
+            chat_id=chat_id,
         )
     except Exception as resume_err:
         log.debug("resume_pending_certificate_followup error ignored on MAX: %s", resume_err)

@@ -275,7 +275,11 @@ from provider_models import (
 from user_metadata import append_metadata_records, extract_data_blocks, extract_service_data, load_metadata_records
 from automation_engine import apply_service_data_blocks, build_runtime_automation_context, get_automation_summary, persist_service_data_blocks
 from certificate_followup_service import (
+    CaptionRenderError,
+    apply_pending_deferred_data_if_any,
     build_followup_telegram_keyboard,
+    claim_receipt_for_invitation,
+    complete_followup_delivery,
     get_followup_config,
     get_or_create_receipt,
     handle_cert_meet_click,
@@ -283,6 +287,7 @@ from certificate_followup_service import (
     mark_receipt_cert_sent,
     mark_receipt_completed,
     mark_receipt_failed,
+    mark_receipt_sending_cert,
     mark_receipt_uncertain,
     override_service_blocks_target_stage,
     render_caption,
@@ -2254,9 +2259,17 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
 
             if receipt_status == "completed":
                 log.info("Certificate already delivered and completed for user %s, key %s", user_id, issuance_key)
+                await apply_pending_deferred_data_if_any(
+                    async_session_maker,
+                    receipt_id,
+                    scen_cfg,
+                    user_id,
+                    topic_id or 0,
+                    dialogue_id,
+                )
                 return MediaEditDelivery('[Шаблон изображения]')
-            if receipt_status == "uncertain":
-                log.warning("Certificate issuance receipt is uncertain for user_id=%s, skipping blind retry.", user_id)
+            if receipt_status in ("uncertain", "sending_cert"):
+                log.warning("Certificate issuance receipt is %s for user_id=%s, skipping blind retry.", receipt_status, user_id)
                 return MediaEditDelivery('[Шаблон изображения]')
 
             async with async_session_maker() as session:
@@ -2268,35 +2281,40 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
             }
 
             if receipt_status == "cert_sent":
-                # Resume Phase 2 without duplicate certificate (Requirement 5)
+                # Requirement 4: Atomic CAS claim for invitation delivery
+                async with async_session_maker() as session:
+                    claimed = await claim_receipt_for_invitation(session, receipt_id)
+                if not claimed:
+                    log.info("Invitation delivery already claimed concurrently for receipt %s", receipt_id)
+                    return MediaEditDelivery('[Шаблон изображения]')
+
                 invite_text = render_invitation(scen_cfg.invitation_text, user_context)
                 keyboard = build_followup_telegram_keyboard(scen_cfg, receipt_id=receipt_id)
-                sent_invite = await _safe_send_html(
-                    lambda text, pm: bot.send_message(
-                        chat_id=user_id,
-                        text=text,
-                        parse_mode=pm,
-                        reply_markup=keyboard,
-                    ),
-                    invite_text,
-                )
-                async with async_session_maker() as session:
-                    await mark_receipt_completed(session, receipt_id, invitation_message_id=getattr(sent_invite, "message_id", None))
-                    if scen_cfg.target_stage:
-                        await transition_user_to_stage(session, user_id, topic_id or 0, dialogue_id, scen_cfg.target_stage)
-                    await session.commit()
-                if deferred_service_blocks:
-                    applied_blocks = deferred_service_blocks
-                    if scen_cfg.target_stage:
-                        applied_blocks = override_service_blocks_target_stage(applied_blocks, scen_cfg.target_stage)
-                    await persist_service_data_blocks(
-                        async_session_maker,
-                        user_id=user_id,
-                        dialogue_id=dialogue_id,
-                        topic_id=topic_id,
-                        blocks=applied_blocks,
-                        apply_fn=apply_service_data_blocks,
+                try:
+                    sent_invite = await _safe_send_html(
+                        lambda text, pm: bot.send_message(
+                            chat_id=user_id,
+                            text=text,
+                            parse_mode=pm,
+                            reply_markup=keyboard,
+                        ),
+                        invite_text,
                     )
+                except Exception as inv_err:
+                    async with async_session_maker() as session:
+                        await mark_receipt_uncertain(session, receipt_id, str(inv_err))
+                    raise
+
+                await complete_followup_delivery(
+                    async_session_maker,
+                    receipt_id=receipt_id,
+                    invitation_message_id=getattr(sent_invite, "message_id", None),
+                    scen_cfg=scen_cfg,
+                    user_id=user_id,
+                    topic_id=topic_id or 0,
+                    dialogue_id=dialogue_id,
+                    deferred_blocks=deferred_service_blocks,
+                )
                 if bot is not None:
                     from automation_events import process_pending_events
                     try:
@@ -2306,9 +2324,18 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
                 return MediaEditDelivery(invite_text)
 
             # Phase 1: Deliver Message 1 (Certificate with admin caption)
-            caption_text, caption_errors = render_caption_safe(scen_cfg.caption_template, user_context, max_limit=1024)
-            if caption_errors:
-                log.warning("Certificate caption had errors for user %s: %s; using safe fallback", user_id, caption_errors)
+            # Requirement 7: Explicit caption validation before sending; reject if instructions cannot be preserved
+            try:
+                caption_text, _ = render_caption_safe(scen_cfg.caption_template, user_context, max_limit=1024)
+            except CaptionRenderError as c_err:
+                log.error("Certificate caption invalid or exceeds limit for user %s: %s", user_id, c_err)
+                async with async_session_maker() as session:
+                    await mark_receipt_failed(session, receipt_id, str(c_err))
+                raise TemplateRenderError(f"Ошибка подписи сертификата: {c_err}") from c_err
+
+            # Requirement 3: Set persistent in-flight state 'sending_cert' BEFORE external API call
+            async with async_session_maker() as session:
+                await mark_receipt_sending_cert(session, receipt_id)
 
             try:
                 sent_cert = await bot.send_document(
@@ -2354,6 +2381,13 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
                 )
 
             # Phase 2: Deliver Message 2 (Invitation with buttons)
+            # Requirement 4: Atomic CAS claim for Phase 2 invitation
+            async with async_session_maker() as session:
+                claimed = await claim_receipt_for_invitation(session, receipt_id)
+            if not claimed:
+                log.info("Phase 2 invitation claimed concurrently for receipt %s", receipt_id)
+                return MediaEditDelivery(caption_text)
+
             invite_text = render_invitation(scen_cfg.invitation_text, user_context)
             keyboard = build_followup_telegram_keyboard(scen_cfg, receipt_id=receipt_id)
             try:
@@ -2368,26 +2402,21 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
                 )
             except Exception as inv_err:
                 log.error("Certificate delivered, but invitation failed user_id=%s: %s", user_id, inv_err)
+                async with async_session_maker() as session:
+                    await mark_receipt_uncertain(session, receipt_id, str(inv_err))
                 return MediaEditDelivery(caption_text)
 
-            async with async_session_maker() as session:
-                await mark_receipt_completed(session, receipt_id, invitation_message_id=getattr(sent_invite, "message_id", None))
-                if scen_cfg.target_stage:
-                    await transition_user_to_stage(session, user_id, topic_id or 0, dialogue_id, scen_cfg.target_stage)
-                await session.commit()
-
-            if deferred_service_blocks:
-                applied_blocks = deferred_service_blocks
-                if scen_cfg.target_stage:
-                    applied_blocks = override_service_blocks_target_stage(applied_blocks, scen_cfg.target_stage)
-                await persist_service_data_blocks(
-                    async_session_maker,
-                    user_id=user_id,
-                    dialogue_id=dialogue_id,
-                    topic_id=topic_id,
-                    blocks=applied_blocks,
-                    apply_fn=apply_service_data_blocks,
-                )
+            # Requirement 5: Complete delivery and persist DATA without window
+            await complete_followup_delivery(
+                async_session_maker,
+                receipt_id=receipt_id,
+                invitation_message_id=getattr(sent_invite, "message_id", None),
+                scen_cfg=scen_cfg,
+                user_id=user_id,
+                topic_id=topic_id or 0,
+                dialogue_id=dialogue_id,
+                deferred_blocks=deferred_service_blocks,
+            )
 
             if bot is not None:
                 from automation_events import process_pending_events

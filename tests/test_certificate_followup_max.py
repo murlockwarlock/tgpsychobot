@@ -29,6 +29,9 @@ from certificate_followup_service import (
     handle_cert_callback_max,
     make_issuance_key,
     get_or_create_receipt,
+    mark_receipt_sending_cert,
+    mark_receipt_uncertain,
+    resume_pending_certificate_followup,
 )
 import database
 import handlers
@@ -554,3 +557,193 @@ async def test_max_runtime_disabled_preserves_legacy_behavior(session_factory, m
             select(CertificateIssuanceReceipt).where(CertificateIssuanceReceipt.user_id == 100000000007)
         )
         assert receipt is None
+
+
+@pytest.mark.asyncio
+async def test_max_resume_different_user_id_and_chat_id(session_factory, media_setup, monkeypatch):
+    """
+    Defect 1 Verification on MAX:
+    Internal MAX DB user ID (e.g. 100000000007) and real chat_id (e.g. 888777666) differ.
+    resume_pending_certificate_followup must pass the actual recipient chat_id from the incoming message,
+    and outgoing MaxApiClient call to /messages must target chat_id=888777666, NOT user_id=100000000007.
+    """
+    source, config = await seed_max_template(session_factory)
+    from media_templates import current_issue_date
+    today = current_issue_date()
+    key = make_issuance_key(40, 100000000007, VALUES['recipient'], today)
+
+    different_chat_id = 888777666
+
+    async with session_factory() as session:
+        scen_cfg = await get_or_create_followup_config(session, 40, topic_id=1)
+        scen_cfg.is_active = True
+        scen_cfg.invitation_text = "Приглашаем на персональную сессию."
+        receipt, _ = await get_or_create_receipt(session, 100000000007, 1, 1, key, config_id=scen_cfg.id)
+        receipt.status = 'cert_sent'
+        receipt.config_id = scen_cfg.id
+        receipt.certificate_message_id = 'max-cert-msg-1'
+        await session.commit()
+        receipt_id = receipt.id
+
+    client = MaxTransport()
+
+    # Part A: Direct call to resume_pending_certificate_followup
+    success = await resume_pending_certificate_followup(
+        client,
+        user_id=100000000007,
+        topic_id=1,
+        dialogue_id=1,
+        session_maker=session_factory,
+        platform="max",
+        chat_id=different_chat_id,
+    )
+    assert success is True
+
+    # Verify outgoing /messages call targeted different_chat_id, NOT user_id
+    post_messages = [
+        kwargs for method, path, kwargs in client.wire
+        if path == '/messages' and method == 'POST'
+    ]
+    assert len(post_messages) >= 1
+    last_call = post_messages[-1]
+    params = last_call.get('params', {})
+    assert params.get('chat_id') == different_chat_id
+    assert params.get('chat_id') != 100000000007
+    assert params.get('user_id') is None
+
+    # Part B: End-to-end update flow where incoming message recipient has chat_id
+    async with session_factory() as session:
+        r = await session.get(CertificateIssuanceReceipt, receipt_id)
+        r.status = 'cert_sent'
+        r.invitation_message_id = None
+        await session.commit()
+
+    wire_len_before = len(client.wire)
+    monkeypatch.setattr(client, 'download_attachment_url', AsyncMock(return_value=source))
+    ai_response = f'[RENDER_IMG_MEDIA: panda_certificate | {json.dumps(VALUES, ensure_ascii=False)}]'
+    monkeypatch.setattr(max_ai, '_dispatch_provider', AsyncMock(return_value=ai_response))
+
+    application = max_app.MaxBotApplication(client)
+    await application.handle_update({
+        'update_type': 'message_created',
+        'update_id': 'max_resume_diff_chat_update',
+        'message': {
+            'sender': {'user_id': 7, 'name': 'MaxUser'},
+            'recipient': {'chat_id': 999111222},
+            'body': {'mid': 'm-diff-2', 'text': 'Продолжить'}
+        }
+    })
+    if application.background_tasks:
+        await asyncio.gather(*list(application.background_tasks))
+
+    e2e_messages = [
+        kwargs for method, path, kwargs in client.wire[wire_len_before:]
+        if path == '/messages' and method == 'POST' and kwargs.get('json_data', {}).get('text') != '🤖 Думаю...'
+    ]
+    assert len(e2e_messages) >= 1
+    invite_call = e2e_messages[-1]
+    e2e_params = invite_call.get('params', {})
+    assert e2e_params.get('chat_id') == 999111222
+    assert e2e_params.get('chat_id') != 100000000007
+
+
+@pytest.mark.asyncio
+async def test_max_failure_point2_sending_cert_prevents_duplicate_attachment(session_factory, media_setup, monkeypatch):
+    """
+    Failure Point 2 on MAX:
+    Process crash between sending certificate attachment and saving cert_sent.
+    In-flight 'sending_cert' is detected on next attempt, marked 'uncertain',
+    and does NOT upload or send a duplicate file.
+    """
+    source, config = await seed_max_template(session_factory)
+    from media_templates import current_issue_date
+    today = current_issue_date()
+    key = make_issuance_key(40, 100000000007, VALUES['recipient'], today)
+
+    async with session_factory() as session:
+        scen_cfg = await get_or_create_followup_config(session, 40, topic_id=1)
+        scen_cfg.is_active = True
+        r, _ = await get_or_create_receipt(session, 100000000007, 1, 1, key, config_id=scen_cfg.id)
+        # Simulate in-flight crash right after attachment was accepted by MAX
+        r.status = "sending_cert"
+        await session.commit()
+        receipt_id = r.id
+
+    client = MaxTransport()
+    monkeypatch.setattr(client, 'download_attachment_url', AsyncMock(return_value=source))
+
+    ai_response = f'[RENDER_IMG_MEDIA: panda_certificate | {json.dumps(VALUES, ensure_ascii=False)}]'
+    monkeypatch.setattr(max_ai, '_dispatch_provider', AsyncMock(return_value=ai_response))
+
+    application = max_app.MaxBotApplication(client)
+    await application.handle_update({
+        'update_type': 'message_created',
+        'update_id': 'max_crash_sending_cert',
+        'message': {
+            'sender': {'user_id': 7, 'name': 'MaxUser'},
+            'recipient': {'chat_id': 100},
+            'body': {'mid': 'm-crash-1', 'text': 'Повторите сертификат'}
+        }
+    })
+    if application.background_tasks:
+        await asyncio.gather(*list(application.background_tasks))
+
+    # Verify NO file was uploaded again
+    assert len(client.uploads) == 0
+
+    # Verify NO duplicate certificate attachment was sent
+    message_calls = [
+        kwargs for method, path, kwargs in client.wire
+        if path == '/messages' and method == 'POST' and kwargs.get('json_data', {}).get('text') != '🤖 Думаю...'
+    ]
+    assert len(message_calls) == 0
+
+    # Verify receipt was marked 'uncertain'
+    async with session_factory() as session:
+        r = await session.get(CertificateIssuanceReceipt, receipt_id)
+        assert r.status == "uncertain"
+        assert "Previous process interrupted" in (r.error_details or "")
+
+
+@pytest.mark.asyncio
+async def test_max_failure_point3_invite_network_error_marks_uncertain(session_factory, media_setup):
+    """
+    Failure Point 3 on MAX:
+    Network error during resumed invitation sending does NOT blind-reset to cert_sent;
+    it is marked 'uncertain' to prevent duplicate messages.
+    """
+    from media_templates import current_issue_date
+    today = current_issue_date()
+    key = make_issuance_key(40, 100000000007, VALUES['recipient'], today)
+
+    async with session_factory() as session:
+        scen_cfg = await get_or_create_followup_config(session, 40, topic_id=1)
+        scen_cfg.is_active = True
+        r, _ = await get_or_create_receipt(session, 100000000007, 1, 1, key, config_id=scen_cfg.id)
+        r.status = "cert_sent"
+        await session.commit()
+        receipt_id = r.id
+
+    client = MaxTransport()
+    # Mock send_message to fail with network error
+    async def failing_send(*args, **kwargs):
+        raise RuntimeError("MAX gateway connection dropped")
+    client.send_message = failing_send
+
+    success = await resume_pending_certificate_followup(
+        client,
+        user_id=100000000007,
+        topic_id=1,
+        dialogue_id=1,
+        session_maker=session_factory,
+        platform="max",
+        chat_id=100,
+    )
+    assert success is False
+
+    # Verify status is uncertain, NOT reset to cert_sent
+    async with session_factory() as session:
+        r = await session.get(CertificateIssuanceReceipt, receipt_id)
+        assert r.status == "uncertain"
+        assert "Resumption delivery failed/uncertain" in (r.error_details or "")
+

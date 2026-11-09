@@ -2973,7 +2973,7 @@ class CertificateIssuanceReceipt(Base):
     topic_id = Column(Integer, nullable=False, default=0)
     dialogue_id = Column(Integer, nullable=False)
     issuance_key = Column(String(128), nullable=False)
-    status = Column(String(32), default='started', nullable=False)  # 'started', 'cert_sent', 'resuming_invite', 'completed', 'failed', 'uncertain'
+    status = Column(String(32), default='started', nullable=False)  # 'started', 'sending_cert', 'cert_sent', 'resuming_invite', 'completed', 'failed', 'uncertain'
     config_id = Column(Integer, ForeignKey('certificate_followup_configs.id', ondelete='SET NULL'), nullable=True)
     certificate_message_id = Column(String(64), nullable=True)
     invitation_message_id = Column(String(64), nullable=True)

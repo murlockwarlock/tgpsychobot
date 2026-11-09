@@ -3,7 +3,7 @@ import html
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -21,6 +21,11 @@ from database import (
 from event_content_validator import TelegramHtmlValidator, utf16_code_units_len
 
 log = logging.getLogger(__name__)
+
+
+class CaptionRenderError(ValueError):
+    """Raised when certificate caption cannot be safely rendered preserving required instructions."""
+    pass
 
 DEFAULT_CAPTION_TEMPLATE = (
     "Поздравляем с успешным завершением! Ваш сертификат готов 🎓\n\n"
@@ -67,43 +72,54 @@ def render_caption_safe(
     """
     Renders certificate caption safely:
     - Escapes all user inputs (name, fio, recipient, date) so raw characters do not break HTML.
+    - If user dynamic fields cause overflow, adaptively bounds user name budget to preserve full admin template instructions.
     - Validates resulting HTML structure with TelegramHtmlValidator.
-    - Strictly checks UTF-16 code units length against max_limit (no silent truncation!).
-    - If length exceeds limit or HTML is invalid, returns safe fallback and list of errors.
+    - Strictly checks UTF-16 code units length against max_limit (no silent truncation of instructions!).
+    - If template cannot preserve required instructions or HTML is invalid, raises CaptionRenderError.
     """
     raw_template = (template or DEFAULT_CAPTION_TEMPLATE).strip()
     raw_name = str(context.get("name") or "").strip()
     raw_fio = str(context.get("fio") or context.get("recipient") or raw_name).strip()
     raw_date = str(context.get("date") or "").strip()
 
-    # Safely HTML-escape user parameters
-    escaped_values = {
-        "name": html.escape(raw_name or raw_fio, quote=False),
-        "fio": html.escape(raw_fio or raw_name, quote=False),
-        "recipient": html.escape(raw_fio or raw_name, quote=False),
-        "date": html.escape(raw_date, quote=False),
-    }
+    def _render_with(name_val: str, fio_val: str, date_val: str) -> str:
+        esc = {
+            "name": html.escape(name_val, quote=False),
+            "fio": html.escape(fio_val, quote=False),
+            "recipient": html.escape(fio_val, quote=False),
+            "date": html.escape(date_val, quote=False),
+        }
+        res = raw_template
+        for k, v in esc.items():
+            res = res.replace(f"{{{k}}}", v)
+        return res
 
-    result = raw_template
-    for key, val in escaped_values.items():
-        result = result.replace(f"{{{key}}}", val)
+    result = _render_with(raw_name or raw_fio, raw_fio or raw_name, raw_date)
+    actual_length = utf16_code_units_len(result)
 
-    errors: list[str] = []
+    if actual_length > max_limit:
+        # Check if the template structure itself fits without user values
+        base_result = _render_with("", "", raw_date)
+        base_len = utf16_code_units_len(base_result)
+        if base_len >= max_limit:
+            raise CaptionRenderError(
+                f"Шаблон подписи к сертификату ({base_len} UTF-16) превышает лимит {max_limit} и не позволяет сохранить инструкцию."
+            )
+        # Adaptively allocate available budget to dynamic user values to preserve full template instructions
+        budget = max(0, max_limit - base_len - 1)
+        safe_name = (raw_name or raw_fio)[:budget]
+        safe_fio = (raw_fio or raw_name)[:budget]
+        result = _render_with(safe_name, safe_fio, raw_date)
+        actual_length = utf16_code_units_len(result)
+        if actual_length > max_limit:
+            raise CaptionRenderError(
+                f"Подпись к сертификату ({actual_length} UTF-16) превышает лимит {max_limit} и не позволяет сохранить обязательную инструкцию."
+            )
+
     try:
         TelegramHtmlValidator.validate(result)
     except Exception as exc:
-        errors.append(f"Ошибка валидации HTML в подписи: {exc}")
-
-    actual_length = utf16_code_units_len(result)
-    if actual_length > max_limit:
-        errors.append(
-            f"Длина подписи ({actual_length} UTF-16 символов) превышает лимит {max_limit} символов."
-        )
-
-    if errors:
-        safe_name = html.escape((raw_name or raw_fio)[:40], quote=False)
-        fallback = f"🎓 Поздравляем, <b>{safe_name}</b>! Ваш сертификат готов." if safe_name else "🎓 Ваш сертификат готов."
-        return fallback, errors
+        raise CaptionRenderError(f"Ошибка валидации HTML в подписи: {exc}") from exc
 
     return result, []
 
@@ -126,9 +142,10 @@ def validate_caption_template(template: str, max_limit: int = 1024) -> None:
         "recipient": "Иванов Иван Иванович",
         "date": "09.11.2026",
     }
-    rendered, errors = render_caption_safe(clean, sample_context, max_limit=max_limit)
-    if errors:
-        raise ValueError("; ".join(errors))
+    try:
+        render_caption_safe(clean, sample_context, max_limit=max_limit)
+    except CaptionRenderError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def validate_invitation_text(text: str, max_limit: int = 4096) -> None:
@@ -355,6 +372,12 @@ async def get_or_create_receipt(
             existing.config_id = config_id
         if deferred_data_json and not existing.deferred_data_json:
             existing.deferred_data_json = deferred_data_json
+        # Requirement 3: If previous process crashed while in 'sending_cert',
+        # we cannot assume non-delivery without API proof; mark uncertain to prevent duplicate send.
+        if existing.status == "sending_cert":
+            existing.status = "uncertain"
+            existing.error_details = "Previous process interrupted during sending_cert; automatic repeat prevented."
+            await session.commit()
         return existing, False
 
     receipt = CertificateIssuanceReceipt(
@@ -369,6 +392,17 @@ async def get_or_create_receipt(
     session.add(receipt)
     await session.flush()
     return receipt, True
+
+
+async def mark_receipt_sending_cert(session: AsyncSession, receipt_id: int) -> None:
+    """
+    Requirement 3: Persists in-flight status before the external API call to eliminate
+    duplicate certificate sending after process crash.
+    """
+    receipt = await session.get(CertificateIssuanceReceipt, receipt_id)
+    if receipt:
+        receipt.status = "sending_cert"
+        await session.commit()
 
 
 async def mark_receipt_cert_sent(
@@ -470,6 +504,21 @@ async def find_pending_followup_receipt(
     dialogue_id: int,
 ) -> CertificateIssuanceReceipt | None:
     try:
+        # Requirement 2: Reconcile any stuck resuming_invite from an interrupted process
+        stuck_stmt = (
+            select(CertificateIssuanceReceipt).where(
+                CertificateIssuanceReceipt.user_id == user_id,
+                CertificateIssuanceReceipt.topic_id == topic_id,
+                CertificateIssuanceReceipt.dialogue_id == dialogue_id,
+                CertificateIssuanceReceipt.status == "resuming_invite",
+            )
+        )
+        stuck = await _safe_scalar(session, stuck_stmt)
+        if isinstance(stuck, CertificateIssuanceReceipt):
+            stuck.status = "uncertain"
+            stuck.error_details = "Process crashed or timed out during resuming_invite; marked uncertain."
+            await session.commit()
+
         stmt = (
             select(CertificateIssuanceReceipt).where(
                 CertificateIssuanceReceipt.user_id == user_id,
@@ -484,6 +533,124 @@ async def find_pending_followup_receipt(
         return None
     except Exception:
         return None
+
+
+async def reconcile_stuck_followup_receipts(
+    session: AsyncSession,
+    older_than_seconds: int = 120,
+) -> int:
+    """
+    Reconciles receipts stuck in 'resuming_invite' or 'sending_cert' due to process crashes.
+    Marks them 'uncertain' so duplicate deliveries never occur.
+    """
+    try:
+        cutoff = datetime.utcnow() - timedelta(seconds=older_than_seconds)
+        stmt = (
+            update(CertificateIssuanceReceipt)
+            .where(
+                CertificateIssuanceReceipt.status.in_(("resuming_invite", "sending_cert")),
+                CertificateIssuanceReceipt.created_at <= cutoff,
+            )
+            .values(
+                status="uncertain",
+                error_details="Reconciled from stuck in-flight state after process crash or timeout.",
+            )
+        )
+        res = await session.execute(stmt)
+        await session.commit()
+        rowcount = getattr(res, "rowcount", None)
+        return rowcount if isinstance(rowcount, int) else 0
+    except Exception as exc:
+        log.warning("reconcile_stuck_followup_receipts error: %s", exc)
+        return 0
+
+
+async def complete_followup_delivery(
+    session_maker: Any,
+    receipt_id: int,
+    invitation_message_id: str | None,
+    scen_cfg: CertificateFollowupConfig,
+    user_id: int,
+    topic_id: int,
+    dialogue_id: int,
+    deferred_blocks: list[Any] | None = None,
+) -> None:
+    """
+    Requirement 5: Safely completes followup delivery:
+    1. Persists deferred service blocks (with admin target_stage priority).
+    2. Transitions user stage to admin target_stage.
+    3. Atomically marks receipt completed and clears deferred_data_json.
+    Eliminates window where receipt is completed but DATA is not saved.
+    """
+    raw_blocks_to_apply = list(deferred_blocks) if deferred_blocks else None
+    if not raw_blocks_to_apply:
+        async with session_maker() as session:
+            r = await session.get(CertificateIssuanceReceipt, receipt_id)
+            if r and r.deferred_data_json:
+                raw_blocks_to_apply = deserialize_service_blocks(r.deferred_data_json)
+
+    if raw_blocks_to_apply:
+        from automation_engine import apply_service_data_blocks, persist_service_data_blocks
+        if scen_cfg.target_stage:
+            raw_blocks_to_apply = override_service_blocks_target_stage(raw_blocks_to_apply, scen_cfg.target_stage)
+        await persist_service_data_blocks(
+            session_maker,
+            user_id=user_id,
+            dialogue_id=dialogue_id,
+            topic_id=topic_id,
+            blocks=raw_blocks_to_apply,
+            apply_fn=apply_service_data_blocks,
+        )
+
+    async with session_maker() as session:
+        if scen_cfg.target_stage:
+            await transition_user_to_stage(session, user_id, topic_id, dialogue_id, scen_cfg.target_stage)
+        r = await session.get(CertificateIssuanceReceipt, receipt_id)
+        if r:
+            r.status = "completed"
+            r.completed_at = datetime.utcnow()
+            r.deferred_data_json = None  # Cleared upon persistence
+            if invitation_message_id:
+                r.invitation_message_id = str(invitation_message_id)
+        await session.commit()
+
+
+async def apply_pending_deferred_data_if_any(
+    session_maker: Any,
+    receipt_id: int,
+    scen_cfg: CertificateFollowupConfig,
+    user_id: int,
+    topic_id: int,
+    dialogue_id: int,
+) -> None:
+    """
+    Requirement 5: Idempotently persists leftover deferred data from an interrupted
+    completed receipt without repeating messages and without overwriting admin's target stage.
+    """
+    async with session_maker() as session:
+        r = await session.get(CertificateIssuanceReceipt, receipt_id)
+        if not r or not r.deferred_data_json:
+            return
+        blocks = deserialize_service_blocks(r.deferred_data_json)
+
+    if blocks:
+        from automation_engine import apply_service_data_blocks, persist_service_data_blocks
+        if scen_cfg.target_stage:
+            blocks = override_service_blocks_target_stage(blocks, scen_cfg.target_stage)
+        await persist_service_data_blocks(
+            session_maker,
+            user_id=user_id,
+            dialogue_id=dialogue_id,
+            topic_id=topic_id,
+            blocks=blocks,
+            apply_fn=apply_service_data_blocks,
+        )
+
+    async with session_maker() as session:
+        r = await session.get(CertificateIssuanceReceipt, receipt_id)
+        if r:
+            r.deferred_data_json = None
+            await session.commit()
 
 
 def override_service_blocks_target_stage(
@@ -616,6 +783,7 @@ async def resume_pending_certificate_followup(
     session_maker: Any,
     *,
     platform: str = "telegram",
+    chat_id: int | None = None,
 ) -> bool:
     """
     Resumes delivery of Message 2 (invitation) if Message 1 (certificate) was already delivered
@@ -623,7 +791,8 @@ async def resume_pending_certificate_followup(
     - Does NOT re-send certificate (zero duplication).
     - Does NOT require AI to issue RENDER_IMG_MEDIA again.
     - Protected against concurrent execution via atomic status claim ('resuming_invite').
-    - Applies deferred data blocks with admin target_stage priority.
+    - Applies deferred data blocks with admin target_stage priority without window.
+    - Sends to actual recipient (chat_id if provided, else user_id).
     """
     receipt_id = None
     config_id = None
@@ -659,12 +828,13 @@ async def resume_pending_certificate_followup(
 
     invite_text = render_invitation(scen_cfg.invitation_text, user_context)
 
+    effective_chat_id = chat_id if chat_id is not None else user_id
     sent_msg_id = None
     try:
         if platform == "telegram":
             keyboard = build_followup_telegram_keyboard(scen_cfg, receipt_id=receipt_id)
             sent = await bot_or_client.send_message(
-                chat_id=user_id,
+                chat_id=effective_chat_id,
                 text=invite_text,
                 parse_mode="HTML",
                 reply_markup=keyboard,
@@ -673,44 +843,30 @@ async def resume_pending_certificate_followup(
         else:
             keyboard = build_followup_max_keyboard(scen_cfg, receipt_id=receipt_id)
             sent = await bot_or_client.send_message(
-                chat_id=user_id,
+                chat_id=effective_chat_id,
                 text=invite_text,
                 attachments=keyboard,
             )
             sent_msg_id = str(sent) if sent else None
     except Exception as exc:
-        log.error("Failed to deliver resumed invitation user_id=%s: %s", user_id, exc)
-        # Reset back to cert_sent so future interaction can retry
+        log.error("Failed to deliver resumed invitation user_id=%s chat_id=%s: %s", user_id, effective_chat_id, exc)
+        # Requirement 2: Do NOT blind-reset to cert_sent! Mark uncertain so no duplicate invite is sent
         async with session_maker() as session:
-            r = await session.get(CertificateIssuanceReceipt, receipt_id)
-            if r and r.status == "resuming_invite":
-                r.status = "cert_sent"
-                await session.commit()
+            await mark_receipt_uncertain(session, receipt_id, f"Resumption delivery failed/uncertain: {exc}")
         return False
 
-    # Mark completed and transition stage
-    async with session_maker() as session:
-        await mark_receipt_completed(session, receipt_id, invitation_message_id=str(sent_msg_id) if sent_msg_id else None)
-        if scen_cfg.target_stage:
-            await transition_user_to_stage(session, user_id, topic_id, dialogue_id, scen_cfg.target_stage)
-        await session.commit()
-
-    # Apply deferred service blocks if any, with admin stage priority
-    if deferred_raw:
-        deferred_blocks = deserialize_service_blocks(deferred_raw)
-        if deferred_blocks:
-            from automation_engine import apply_service_data_blocks, persist_service_data_blocks
-            if scen_cfg.target_stage:
-                deferred_blocks = override_service_blocks_target_stage(deferred_blocks, scen_cfg.target_stage)
-            await persist_service_data_blocks(
-                session_maker,
-                user_id=user_id,
-                dialogue_id=dialogue_id,
-                topic_id=topic_id,
-                blocks=deferred_blocks,
-                apply_fn=apply_service_data_blocks,
-            )
-
+    # Safely complete delivery and persist DATA without window (Requirement 5)
+    deferred_blocks = deserialize_service_blocks(deferred_raw) if deferred_raw else None
+    await complete_followup_delivery(
+        session_maker,
+        receipt_id=receipt_id,
+        invitation_message_id=str(sent_msg_id) if sent_msg_id else None,
+        scen_cfg=scen_cfg,
+        user_id=user_id,
+        topic_id=topic_id,
+        dialogue_id=dialogue_id,
+        deferred_blocks=deferred_blocks,
+    )
     return True
 
 
@@ -825,11 +981,20 @@ async def handle_cert_meet_click(
         if receipt is None:
             return CertCallbackResult(False, alert_text="❌ Подтверждение выдачи сертификата не найдено.")
 
+        # Requirement 4: Verify receipt belongs to user, topic and dialogue
         if receipt.user_id != user_id or receipt.topic_id != topic_id or receipt.dialogue_id != dialogue_id:
             return CertCallbackResult(False, alert_text="⛔️ Приглашение не принадлежит вашему текущему диалогу.")
 
-        if receipt.status not in ("cert_sent", "completed", "resuming_invite"):
-            return CertCallbackResult(False, alert_text="⚠️ Сертификат ещё не был успешно доставлен.")
+        # Requirement 4: Verify receipt config_id matches callback config_id
+        if receipt.config_id is not None and receipt.config_id != config_id:
+            return CertCallbackResult(False, alert_text="⛔️ Конфигурация сценария не совпадает с выданным сертификатом.")
+
+        # Requirement 4: Do not accept buttons before invitation itself is confirmed sent (completed)
+        if receipt.status != "completed":
+            return CertCallbackResult(
+                False,
+                alert_text="⚠️ Приглашение ещё не было отправлено или ожидает подтверждения.",
+            )
 
         # Idempotency / Repeat click check
         if receipt.selected_button_id is not None:
@@ -841,12 +1006,42 @@ async def handle_cert_meet_click(
                 is_repeat=True,
             )
 
-        # Record first valid selection
-        receipt.selected_button_id = action_id
-        receipt.selected_at = datetime.utcnow()
+        # Requirement 4: Atomic CAS for button selection (never separate read/write)
+        target_receipt_id = receipt.id
+        now = datetime.utcnow()
+        stmt = (
+            update(CertificateIssuanceReceipt)
+            .where(
+                CertificateIssuanceReceipt.id == target_receipt_id,
+                CertificateIssuanceReceipt.selected_button_id.is_(None),
+            )
+            .values(
+                selected_button_id=action_id,
+                selected_at=now,
+            )
+        )
+        res = await session.execute(stmt)
+        rowcount = getattr(res, "rowcount", None)
+        if not (isinstance(rowcount, int) and rowcount > 0):
+            # CAS lost: another concurrent request already selected a button
+            await session.commit()
+            receipt = await session.get(CertificateIssuanceReceipt, target_receipt_id)
+            prev_id = (receipt.selected_button_id if receipt else None) or action_id
+            prev_btn = next((b for b in buttons if b["id"] == prev_id), None)
+            prev_label = prev_btn["text"] if prev_btn else prev_id
+            return CertCallbackResult(
+                False,
+                alert_text=f"ℹ️ Вы уже выбрали: «{prev_label}». Повторный выбор не требуется.",
+                is_repeat=True,
+            )
+
+        # CAS won: persist reservation
+        await session.commit()
 
         target_step = btn["target_step"]
         response_text = btn.get("response_text") or "Спасибо за ответ!"
+        receipt.selected_button_id = action_id
+        receipt.selected_at = now
 
         await transition_user_to_stage(
             session,

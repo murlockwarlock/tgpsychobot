@@ -187,16 +187,39 @@ def _automation_menu_keyboard():
 CERT_FOLLOWUP_PAGE_SIZE = 5
 
 
-@router.callback_query(F.data.startswith("cert_followup_list"))
-async def cert_followup_list(callback: CallbackQuery, state: FSMContext):
-    from database import MediaLibrary, media_collection_items
-    await state.clear()
+def build_cert_followup_list_markup(templates: list[Any], page: int, total_pages: int) -> tuple[str, InlineKeyboardMarkup]:
+    page_templates = templates[page * CERT_FOLLOWUP_PAGE_SIZE : (page + 1) * CERT_FOLLOWUP_PAGE_SIZE]
+    text = (
+        f"🎓 <b>Сценарии после выдачи сертификатов</b> (Стр. {page + 1}/{total_pages})\n\n"
+        "Выберите шаблон изображения для перехода к настройке подписи, приглашения на встречу, "
+        "кнопок и этапов алгоритма:"
+    )
+    builder = InlineKeyboardBuilder()
+    for tmpl in page_templates:
+        # origin = (tmpl.id, -1, page, 1) where cid=-1 indicates origin from automations list page
+        builder.button(
+            text=f"📜 {tmpl.file_name or f'Шаблон #{tmpl.id}'}",
+            callback_data=f"mt:scenario:{tmpl.id}:-1:{page}:1:-1",
+        )
+    builder.adjust(1)
 
-    data_parts = (callback.data or "").split(":")
-    page = 0
-    if len(data_parts) > 1 and data_parts[1].isdigit():
-        page = max(0, int(data_parts[1]))
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cert_followup_list:{page - 1}"))
+    if total_pages > 1:
+        nav_row.append(InlineKeyboardButton(text=f"• {page + 1}/{total_pages} •", callback_data="noop"))
+    if page < total_pages - 1:
+        # Requirement 6: Button name must strictly be «Далее ➡️»
+        nav_row.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"cert_followup_list:{page + 1}"))
+    if nav_row:
+        builder.row(*nav_row)
 
+    builder.row(_back("automation_menu"))
+    return text, builder.as_markup()
+
+
+async def show_cert_followup_list_message(message: Any, page: int = 0) -> None:
+    from database import MediaLibrary
     async with async_session_maker() as session:
         stmt = (
             select(MediaLibrary)
@@ -218,45 +241,36 @@ async def cert_followup_list(callback: CallbackQuery, state: FSMContext):
             )
             templates = (await session.scalars(stmt2)).all()
 
-    builder = InlineKeyboardBuilder()
     if not templates:
-        await callback.message.edit_text(
+        empty_markup = InlineKeyboardBuilder().row(_back("automation_menu")).as_markup()
+        empty_text = (
             "🎓 <b>Сценарии после сертификатов</b>\n\n"
             "В медиатеке пока нет настроенных шаблонов изображений.\n"
-            "Настройте шаблон в разделе <b>🎨 Медиатека</b>, чтобы подключить сценарий после выдачи.",
-            reply_markup=InlineKeyboardBuilder().row(_back("automation_menu")).as_markup(),
+            "Настройте шаблон в разделе <b>🎨 Медиатека</b>, чтобы подключить сценарий после выдачи."
         )
+        try:
+            await message.edit_text(empty_text, reply_markup=empty_markup, parse_mode="HTML")
+        except Exception:
+            await message.answer(empty_text, reply_markup=empty_markup, parse_mode="HTML")
         return
 
     total_pages = max(1, (len(templates) + CERT_FOLLOWUP_PAGE_SIZE - 1) // CERT_FOLLOWUP_PAGE_SIZE)
-    page = min(page, total_pages - 1)
-    page_templates = templates[page * CERT_FOLLOWUP_PAGE_SIZE : (page + 1) * CERT_FOLLOWUP_PAGE_SIZE]
+    clamped_page = max(0, min(page, total_pages - 1))
+    text, markup = build_cert_followup_list_markup(templates, clamped_page, total_pages)
+    try:
+        await message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        await message.answer(text, reply_markup=markup, parse_mode="HTML")
 
-    text = (
-        f"🎓 <b>Сценарии после выдачи сертификатов</b> (Стр. {page + 1}/{total_pages})\n\n"
-        "Выберите шаблон изображения для перехода к настройке подписи, приглашения на встречу, "
-        "кнопок и этапов алгоритма:"
-    )
-    for tmpl in page_templates:
-        cid = 0
-        builder.button(
-            text=f"📜 {tmpl.file_name or f'Шаблон #{tmpl.id}'}",
-            callback_data=f"mt:scenario:{tmpl.id}:{cid}:1:1:-1",
-        )
-    builder.adjust(1)
 
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cert_followup_list:{page - 1}"))
-    if total_pages > 1:
-        nav_row.append(InlineKeyboardButton(text=f"• {page + 1}/{total_pages} •", callback_data="noop"))
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"cert_followup_list:{page + 1}"))
-    if nav_row:
-        builder.row(*nav_row)
-
-    builder.row(_back("automation_menu"))
-    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+@router.callback_query(F.data.startswith("cert_followup_list"))
+async def cert_followup_list(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    data_parts = (callback.data or "").split(":")
+    page = 0
+    if len(data_parts) > 1 and data_parts[1].lstrip("-").isdigit():
+        page = int(data_parts[1])
+    await show_cert_followup_list_message(callback.message, page=page)
 
 
 @router.callback_query(F.data == "automation_menu")
