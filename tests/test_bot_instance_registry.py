@@ -73,7 +73,7 @@ def test_production_registry_is_structurally_valid_and_unique():
 
     assert verifier.validate_registry(registry) == []
     assert verifier.validate_deploy_managed_count(registry) == []
-    assert len(verifier.managed_instances(registry)) == 18
+    assert len(verifier.managed_instances(registry)) == 17
     assert len({(item["platform"], item["username"]) for item in registry["instances"]}) == len(
         registry["instances"]
     )

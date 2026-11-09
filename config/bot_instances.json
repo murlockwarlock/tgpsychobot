@@ -38,8 +38,8 @@
       "mode": "new",
       "port": 8082,
       "profile": "/bot2",
-      "deploy_managed": true,
-      "active": true,
+      "deploy_managed": false,
+      "active": false,
       "bot_instance_id": "tg_alena322bot_new",
       "telegram_owner_ids": [
         272982544,
