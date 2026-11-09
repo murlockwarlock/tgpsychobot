@@ -28,6 +28,10 @@ if (fs.existsSync(runtimeEnvFile)) {
 }
 
 const PM2_LOG_DIR = `${process.env.PM2_HOME || "/root/.pm2"}/logs`;
+const BASE_BOTS_DIR = process.env.PROD_BASE_DIR || "/root/telegram_bots";
+const DEPLOYMENTS_DIR = process.env.PROD_DEPLOYMENTS_DIR || path.join(BASE_BOTS_DIR, "deployments");
+const LEGACY_DIR = process.env.PROD_REMOTE_DIR || path.join(BASE_BOTS_DIR, "newbots");
+const REMOTE_PY = process.env.PROD_REMOTE_PY || path.join(BASE_BOTS_DIR, "venv/bin/python");
 const GEMINI_PROXY = process.env.GEMINI_PROXY || "";
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || "";
 const DEEPSEEK_PROXY = process.env.DEEPSEEK_PROXY || "";
@@ -344,6 +348,38 @@ apps.forEach(app => {
   if (app.name) {
     app.env.BOT_INSTANCE_ID = app.name;
   }
+
+  // Dynamic isolated release support:
+  // If deployments/<name> exists, route to isolated directory. Otherwise maintain legacy path.
+  const deploymentDir = path.join(DEPLOYMENTS_DIR, app.name);
+  const isIsolated = fs.existsSync(deploymentDir);
+  const appRoot = isIsolated ? deploymentDir : (app.cwd || LEGACY_DIR);
+
+  if (app.name && app.name.startsWith("max_")) {
+    app.script = REMOTE_PY;
+    app.args = "-m max_messenger_bot.app";
+    app.interpreter = "none";
+    app.cwd = appRoot;
+  } else {
+    app.script = path.join(appRoot, "main.py");
+    app.cwd = appRoot;
+    app.interpreter = REMOTE_PY;
+  }
+
+  app.env.APP_DIR = appRoot;
+  if (!app.env.PYTHONPATH) {
+    app.env.PYTHONPATH = appRoot;
+  } else if (!app.env.PYTHONPATH.includes(appRoot)) {
+    app.env.PYTHONPATH = `${appRoot}:${app.env.PYTHONPATH}`;
+  }
+
+  const revFile = path.join(appRoot, "REVISION");
+  if (fs.existsSync(revFile)) {
+    try {
+      app.env.APP_REVISION = fs.readFileSync(revFile, "utf-8").trim();
+    } catch (_) {}
+  }
+
   if (GEMINI_PROXY) {
     app.env.GEMINI_PROXY = GEMINI_PROXY;
   }

@@ -429,7 +429,14 @@ def managed_runtime_process(process: dict[str, Any]) -> bool:
         pm2_env = {}
     path = str(pm2_env.get("pm_exec_path") or process.get("pm_exec_path") or "")
     cwd = str(pm2_env.get("pm_cwd") or process.get("pm_cwd") or "")
-    return "/newbots/" in path or cwd.endswith("/newbots")
+    return (
+        "/newbots/" in path
+        or cwd.endswith("/newbots")
+        or "/deployments/" in path
+        or "/deployments/" in cwd
+        or "/releases/" in path
+        or "/releases/" in cwd
+    )
 
 
 def unexpected_managed_processes(
