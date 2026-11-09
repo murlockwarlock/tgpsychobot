@@ -176,11 +176,63 @@ def _automation_menu_keyboard():
     builder.button(text="⚡ Обработчики событий", callback_data="automation_handlers")
     builder.button(text="💬 Догоняющие сообщения", callback_data="followup_campaigns")
     builder.button(text="📅 Мероприятия", callback_data="admin_events")
+    builder.button(text="🎓 Сценарии после сертификатов", callback_data="cert_followup_list")
     builder.button(text="📊 Статистика этапов", callback_data="automation_stage_stats")
     builder.button(text="📋 Формат DATA", callback_data="automation_data_help")
     builder.button(text="⬅️ В админ-панель", callback_data="admin_panel")
     builder.adjust(1)
     return builder.as_markup()
+
+
+@router.callback_query(F.data == "cert_followup_list")
+async def cert_followup_list(callback: CallbackQuery, state: FSMContext):
+    from database import MediaLibrary, media_collection_items
+    await state.clear()
+    async with async_session_maker() as session:
+        stmt = (
+            select(MediaLibrary)
+            .where(
+                MediaLibrary.media_type.in_(("photo", "image")),
+                MediaLibrary.render_template_enabled.is_(True),
+            )
+            .order_by(MediaLibrary.id.asc())
+        )
+        templates = (await session.scalars(stmt)).all()
+        if not templates:
+            stmt2 = (
+                select(MediaLibrary)
+                .where(
+                    MediaLibrary.media_type.in_(("photo", "image")),
+                    MediaLibrary.render_template_config.isnot(None),
+                )
+                .order_by(MediaLibrary.id.asc())
+            )
+            templates = (await session.scalars(stmt2)).all()
+
+    builder = InlineKeyboardBuilder()
+    if not templates:
+        await callback.message.edit_text(
+            "🎓 <b>Сценарии после сертификатов</b>\n\n"
+            "В медиатеке пока нет настроенных шаблонов изображений.\n"
+            "Настройте шаблон в разделе <b>🎨 Медиатека</b>, чтобы подключить сценарий после выдачи.",
+            reply_markup=InlineKeyboardBuilder().row(_back("automation_menu")).as_markup(),
+        )
+        return
+
+    text = (
+        "🎓 <b>Сценарии после выдачи сертификатов</b>\n\n"
+        "Выберите шаблон изображения для перехода к настройке подписи, приглашения на встречу, "
+        "кнопок и этапов алгоритма:"
+    )
+    for tmpl in templates:
+        cid = 0
+        builder.button(
+            text=f"📜 {tmpl.file_name or f'Шаблон #{tmpl.id}'}",
+            callback_data=f"mt:scenario:{tmpl.id}:{cid}:1:1:-1",
+        )
+    builder.button(text="⬅️ В автоматизации", callback_data="automation_menu")
+    builder.adjust(1)
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data == "automation_menu")

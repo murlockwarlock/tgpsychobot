@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import os
 from pathlib import Path
+import re
 import tempfile
 import time
 from datetime import datetime
@@ -1531,6 +1532,7 @@ async def get_ai_response(
     minutes_since_last_visit: int | None = None,
     minutes_since_last_message: int | None = None,
     request_type: str = "chat",
+    response_capture: dict | None = None,
 ) -> str:
     async with async_session_maker() as session:
         user = await session.scalar(
@@ -2164,7 +2166,11 @@ async def get_ai_response(
                 service_err.request_group_id = request_group_id
                 raise service_err from primary_err
 
-        if service_blocks:
+        has_media_template = bool(re.search(r'\bRENDER_IMG_MEDIA\b', visible_text, re.I))
+        if has_media_template and response_capture is not None:
+            response_capture["deferred_service_blocks"] = service_blocks
+
+        if service_blocks and not has_media_template:
             try:
                 await persist_service_data_blocks(
                     async_session_maker,

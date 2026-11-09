@@ -2727,7 +2727,11 @@ async def get_ai_response(
                 raise service_err from fb_err
 
         automation_result = None
-        if service_blocks and persist_service_data:
+        has_media_template = bool(re.search(r'\bRENDER_IMG_MEDIA\b', response_text, re.I))
+        if has_media_template and response_capture is not None:
+            response_capture["deferred_service_blocks"] = service_blocks
+
+        if service_blocks and persist_service_data and not has_media_template:
             try:
                 automation_result = await persist_service_data_blocks(
                     async_session_maker,

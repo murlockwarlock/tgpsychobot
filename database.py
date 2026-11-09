@@ -1631,6 +1631,11 @@ def _migrate_media_templates(sync_conn):
         sync_conn.execute(text('ALTER TABLE media_library ADD COLUMN render_template_config JSON'))
 
 
+def _migrate_certificate_followup(sync_conn):
+    CertificateFollowupConfig.__table__.create(sync_conn, checkfirst=True)
+    CertificateIssuanceReceipt.__table__.create(sync_conn, checkfirst=True)
+
+
 def _migrate_bot_system_messages(sync_conn):
     from sqlalchemy import inspect
 
@@ -1700,6 +1705,7 @@ async def init_db():
             dialect_name = getattr(sync_conn.dialect, "name", "")
             _migrate_media_edit_sources(sync_conn)
             _migrate_media_templates(sync_conn)
+            _migrate_certificate_followup(sync_conn)
             legacy_system_messages_migrated = _migrate_bot_system_messages(sync_conn)
             sync_conn.execute(text(
                 "UPDATE media_library SET media_type = 'photo' "
@@ -2917,6 +2923,50 @@ class PaymentNotificationOutbox(Base):
     delivered_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+# ============================================================================
+# Certificate Followup Scenario Models
+# ============================================================================
+
+class CertificateFollowupConfig(Base):
+    """Configuration for post-certificate 2-message dialogue continuation."""
+    __tablename__ = 'certificate_followup_configs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    media_id = Column(Integer, ForeignKey('media_library.id', ondelete='CASCADE'), nullable=False, unique=True, index=True)
+    topic_id = Column(Integer, ForeignKey('topics.id', ondelete='CASCADE'), nullable=True, index=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    caption_template = Column(Text, nullable=False)
+    invitation_text = Column(Text, nullable=False)
+    buttons_config_json = Column(Text, nullable=True)
+    target_stage = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class CertificateIssuanceReceipt(Base):
+    """
+    Receipt for certificate delivery & followup scenario execution.
+    Guarantees idempotency and two-phase commit safety.
+    """
+    __tablename__ = 'certificate_issuance_receipts'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'topic_id', 'dialogue_id', 'issuance_key', name='uq_cert_issuance_receipt'),
+        Index('idx_cert_receipt_status', 'user_id', 'status'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    topic_id = Column(Integer, nullable=False, default=0)
+    dialogue_id = Column(Integer, nullable=False)
+    issuance_key = Column(String(128), nullable=False)
+    status = Column(String(32), default='started', nullable=False)  # 'started', 'cert_sent', 'completed', 'failed', 'uncertain'
+    certificate_message_id = Column(String(64), nullable=True)
+    invitation_message_id = Column(String(64), nullable=True)
+    error_details = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
 
 
 # ============================================================================
