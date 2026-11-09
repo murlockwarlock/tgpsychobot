@@ -1722,10 +1722,23 @@ async def test_defect2_concurrent_certificate_issuance_telegram_single_wire_send
     Two simultaneous requests to issue the same certificate with real validation
     of Telegram methods. Atomic CAS ensures strictly ONE call to SendDocument.
     """
+    user_id = 8801
     source, config = await seed_template(session_factory)
     async with session_factory() as session:
-        user = await session.get(User, media_setup)
-        if user:
+        user = await session.get(User, user_id)
+        if not user:
+            user = User(
+                id=user_id,
+                name="ConcurrentAlice",
+                first_name="ConcurrentAlice",
+                gender="female",
+                age="25",
+                accepted_disclaimer=True,
+                current_dialogue_id=1,
+                current_topic_id=1,
+            )
+            session.add(user)
+        else:
             user.current_dialogue_id = 1
             user.current_topic_id = 1
         cfg = await get_or_create_followup_config(session, 3)
@@ -1745,8 +1758,8 @@ async def test_defect2_concurrent_certificate_issuance_telegram_single_wire_send
 
     # Run two delivery requests concurrently
     res1, res2 = await asyncio.gather(
-        handlers._deliver_media_template(bot, media_setup, ai_response, dialogue_id=1, topic_id=1),
-        handlers._deliver_media_template(bot, media_setup, ai_response, dialogue_id=1, topic_id=1),
+        handlers._deliver_media_template(bot, user_id, ai_response, dialogue_id=1, topic_id=1),
+        handlers._deliver_media_template(bot, user_id, ai_response, dialogue_id=1, topic_id=1),
     )
 
     # Verify that exactly ONE SendDocument method call occurred on the wire
@@ -1756,7 +1769,7 @@ async def test_defect2_concurrent_certificate_issuance_telegram_single_wire_send
     # Check that receipt is completed
     async with session_factory() as session:
         receipt = await session.scalar(
-            select(CertificateIssuanceReceipt).where(CertificateIssuanceReceipt.user_id == media_setup)
+            select(CertificateIssuanceReceipt).where(CertificateIssuanceReceipt.user_id == user_id)
         )
         assert receipt is not None
         assert receipt.status == 'completed'

@@ -1009,114 +1009,123 @@ async def handle_cert_meet_click(
     if len(parts) >= 4 and parts[3].isdigit():
         receipt_id = int(parts[3])
 
-    async with session_maker() as session:
-        # Check active config
-        config = await session.get(CertificateFollowupConfig, config_id)
-        if config is None:
-            return CertCallbackResult(False, alert_text="❌ Сценарий не найден или был удалён.")
-        if not config.is_active:
-            return CertCallbackResult(False, alert_text="⚠️ Этот сценарий сейчас отключен администратором.")
+    from event_service import get_user_tx_lock
 
-        # Match button
-        buttons = parse_buttons_config(config.buttons_config_json)
-        btn = next((b for b in buttons if b["id"] == action_id), None)
-        if not btn:
-            return CertCallbackResult(False, alert_text="❌ Неизвестное действие кнопки.")
+    async with get_user_tx_lock(user_id):
+        async with session_maker() as session:
+            try:
+                # Check active config
+                config = await session.get(CertificateFollowupConfig, config_id)
+                if config is None:
+                    return CertCallbackResult(False, alert_text="❌ Сценарий не найден или был удалён.")
+                if not config.is_active:
+                    return CertCallbackResult(False, alert_text="⚠️ Этот сценарий сейчас отключен администратором.")
 
-        # Find confirmed receipt
-        receipt = None
-        if receipt_id and receipt_id > 0:
-            receipt = await session.get(CertificateIssuanceReceipt, receipt_id)
-        if receipt is None:
-            receipt = await session.scalar(
-                select(CertificateIssuanceReceipt).where(
-                    CertificateIssuanceReceipt.user_id == user_id,
-                    CertificateIssuanceReceipt.topic_id == topic_id,
-                    CertificateIssuanceReceipt.dialogue_id == dialogue_id,
-                    CertificateIssuanceReceipt.config_id == config_id,
-                ).order_by(CertificateIssuanceReceipt.id.desc())
-            )
+                # Match button
+                buttons = parse_buttons_config(config.buttons_config_json)
+                btn = next((b for b in buttons if b["id"] == action_id), None)
+                if not btn:
+                    return CertCallbackResult(False, alert_text="❌ Неизвестное действие кнопки.")
 
-        if receipt is None:
-            return CertCallbackResult(False, alert_text="❌ Подтверждение выдачи сертификата не найдено.")
+                # Find confirmed receipt
+                receipt = None
+                if receipt_id and receipt_id > 0:
+                    receipt = await session.get(CertificateIssuanceReceipt, receipt_id)
+                if receipt is None:
+                    receipt = await session.scalar(
+                        select(CertificateIssuanceReceipt).where(
+                            CertificateIssuanceReceipt.user_id == user_id,
+                            CertificateIssuanceReceipt.topic_id == topic_id,
+                            CertificateIssuanceReceipt.dialogue_id == dialogue_id,
+                            CertificateIssuanceReceipt.config_id == config_id,
+                        ).order_by(CertificateIssuanceReceipt.id.desc())
+                    )
 
-        # Requirement 4: Verify receipt belongs to user, topic and dialogue
-        if receipt.user_id != user_id or receipt.topic_id != topic_id or receipt.dialogue_id != dialogue_id:
-            return CertCallbackResult(False, alert_text="⛔️ Приглашение не принадлежит вашему текущему диалогу.")
+                if receipt is None:
+                    return CertCallbackResult(False, alert_text="❌ Подтверждение выдачи сертификата не найдено.")
 
-        # Requirement 4: Verify receipt config_id matches callback config_id
-        if receipt.config_id is not None and receipt.config_id != config_id:
-            return CertCallbackResult(False, alert_text="⛔️ Конфигурация сценария не совпадает с выданным сертификатом.")
+                # Requirement 4: Verify receipt belongs to user, topic and dialogue
+                if receipt.user_id != user_id or receipt.topic_id != topic_id or receipt.dialogue_id != dialogue_id:
+                    return CertCallbackResult(False, alert_text="⛔️ Приглашение не принадлежит вашему текущему диалогу.")
 
-        # Requirement 4: Do not accept buttons before invitation itself is confirmed sent (completed)
-        if receipt.status != "completed":
-            return CertCallbackResult(
-                False,
-                alert_text="⚠️ Приглашение ещё не было отправлено или ожидает подтверждения.",
-            )
+                # Requirement 4: Verify receipt config_id matches callback config_id
+                if receipt.config_id is not None and receipt.config_id != config_id:
+                    return CertCallbackResult(False, alert_text="⛔️ Конфигурация сценария не совпадает с выданным сертификатом.")
 
-        # Idempotency / Repeat click check
-        if receipt.selected_button_id is not None:
-            prev_btn = next((b for b in buttons if b["id"] == receipt.selected_button_id), None)
-            prev_label = prev_btn["text"] if prev_btn else receipt.selected_button_id
-            return CertCallbackResult(
-                False,
-                alert_text=f"ℹ️ Вы уже выбрали: «{prev_label}». Повторный выбор не требуется.",
-                is_repeat=True,
-            )
+                # Requirement 4: Do not accept buttons before invitation itself is confirmed sent (completed)
+                if receipt.status != "completed":
+                    return CertCallbackResult(
+                        False,
+                        alert_text="⚠️ Приглашение ещё не было отправлено или ожидает подтверждения.",
+                    )
 
-        # Requirement 4: Atomic CAS for button selection (never separate read/write)
-        target_receipt_id = receipt.id
-        now = datetime.utcnow()
-        stmt = (
-            update(CertificateIssuanceReceipt)
-            .where(
-                CertificateIssuanceReceipt.id == target_receipt_id,
-                CertificateIssuanceReceipt.selected_button_id.is_(None),
-            )
-            .values(
-                selected_button_id=action_id,
-                selected_at=now,
-            )
-        )
-        res = await session.execute(stmt)
-        rowcount = getattr(res, "rowcount", None)
-        if not (isinstance(rowcount, int) and rowcount > 0):
-            # CAS lost: another concurrent request already selected a button
-            await session.commit()
-            receipt = await session.get(CertificateIssuanceReceipt, target_receipt_id)
-            prev_id = (receipt.selected_button_id if receipt else None) or action_id
-            prev_btn = next((b for b in buttons if b["id"] == prev_id), None)
-            prev_label = prev_btn["text"] if prev_btn else prev_id
-            return CertCallbackResult(
-                False,
-                alert_text=f"ℹ️ Вы уже выбрали: «{prev_label}». Повторный выбор не требуется.",
-                is_repeat=True,
-            )
+                # Idempotency / Repeat click check
+                if receipt.selected_button_id is not None:
+                    prev_btn = next((b for b in buttons if b["id"] == receipt.selected_button_id), None)
+                    prev_label = prev_btn["text"] if prev_btn else receipt.selected_button_id
+                    return CertCallbackResult(
+                        False,
+                        alert_text=f"ℹ️ Вы уже выбрали: «{prev_label}». Повторный выбор не требуется.",
+                        is_repeat=True,
+                    )
 
-        # CAS won: persist reservation
-        await session.commit()
+                # Requirement 4 & Defect 1: Atomic CAS for button selection and state transition in ONE transaction
+                target_receipt_id = receipt.id
+                now = datetime.utcnow()
+                stmt = (
+                    update(CertificateIssuanceReceipt)
+                    .where(
+                        CertificateIssuanceReceipt.id == target_receipt_id,
+                        CertificateIssuanceReceipt.selected_button_id.is_(None),
+                    )
+                    .values(
+                        selected_button_id=action_id,
+                        selected_at=now,
+                    )
+                )
+                res = await session.execute(stmt)
+                rowcount = getattr(res, "rowcount", None)
+                if not (isinstance(rowcount, int) and rowcount > 0):
+                    # CAS lost: another concurrent request already selected a button
+                    await session.rollback()
+                    async with session_maker() as fresh_sess:
+                        fresh_receipt = await fresh_sess.get(CertificateIssuanceReceipt, target_receipt_id)
+                        prev_id = (fresh_receipt.selected_button_id if fresh_receipt else None) or action_id
+                        prev_btn = next((b for b in buttons if b["id"] == prev_id), None)
+                        prev_label = prev_btn["text"] if prev_btn else prev_id
+                    return CertCallbackResult(
+                        False,
+                        alert_text=f"ℹ️ Вы уже выбрали: «{prev_label}». Повторный выбор не требуется.",
+                        is_repeat=True,
+                    )
 
-        target_step = btn["target_step"]
-        response_text = btn.get("response_text") or "Спасибо за ответ!"
-        receipt.selected_button_id = action_id
-        receipt.selected_at = now
+                # CAS won: execute state transition and AutomationStepTransition in the SAME atomic transaction
+                # Strictly NO intermediate commit here!
+                target_step = btn["target_step"]
+                response_text = btn.get("response_text") or "Спасибо за ответ!"
+                receipt.selected_button_id = action_id
+                receipt.selected_at = now
 
-        await transition_user_to_stage(
-            session,
-            user_id=user_id,
-            topic_id=topic_id,
-            dialogue_id=dialogue_id,
-            target_step=target_step,
-        )
-        await session.commit()
+                await transition_user_to_stage(
+                    session,
+                    user_id=user_id,
+                    topic_id=topic_id,
+                    dialogue_id=dialogue_id,
+                    target_step=target_step,
+                )
 
-        return CertCallbackResult(
-            True,
-            response_text=response_text,
-            alert_text="✅ Выбор сохранён.",
-            target_step=target_step,
-        )
+                # Single atomic commit for CAS update, step transition, and AutomationStepTransition
+                await session.commit()
+
+                return CertCallbackResult(
+                    True,
+                    response_text=response_text,
+                    alert_text="✅ Выбор сохранён.",
+                    target_step=target_step,
+                )
+            except Exception:
+                await session.rollback()
+                raise
 
 
 async def handle_cert_callback_max(client: Any, callback: Any) -> None:

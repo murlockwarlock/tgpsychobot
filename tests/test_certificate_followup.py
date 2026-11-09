@@ -992,3 +992,97 @@ async def test_defect1_atomicity_data_and_completed_crash_recovery(session_facto
 
         user = await session.get(User, user_id)
         assert "test_atomicity" in (user.metadata_json or "")
+
+
+@pytest.mark.asyncio
+async def test_handle_cert_meet_click_crash_between_cas_and_transition_rollback(session_factory, setup_tg_user, monkeypatch):
+    """
+    Defect 1 regression test:
+    Simulates crash right after CAS selection but before/during step transition.
+    Verifies:
+    1. Full rollback: selected_button_id remains None in DB, no transition recorded.
+    2. Repeat click succeeds (NOT blocked with 'Повторный выбор не требуется').
+    3. Exactly ONE transition recorded and exactly ONE final stage update.
+    """
+    user_id = setup_tg_user
+
+    async with session_factory() as session:
+        cfg = await get_or_create_followup_config(session, 105)
+        cfg.is_active = True
+        cfg.target_stage = "OFFER_MEETING"
+        cfg.buttons_config_json = json.dumps([
+            {"id": "accept", "text": "Да, записаться", "target_step": "MEETING_BOOKING", "response_text": "Отлично! Переходим к выбору времени."},
+            {"id": "later", "text": "Позже", "target_step": "CERT_COMPLETED", "response_text": "Хорошо, если понадобится консультация — пишите!"},
+        ], ensure_ascii=False)
+        receipt, _ = await get_or_create_receipt(session, user_id, 0, 1, "test_rollback_key", config_id=cfg.id)
+        receipt.status = "completed"
+        await session.commit()
+        config_id = cfg.id
+        receipt_id = receipt.id
+
+    callback_data = f"cert_meet:accept:{config_id}:{receipt_id}"
+
+    # 1. Force failure during transition_user_to_stage (after CAS succeeded)
+    import certificate_followup_service
+    real_transition = certificate_followup_service.transition_user_to_stage
+    crash_injected = False
+
+    async def crashing_transition(*args, **kwargs):
+        nonlocal crash_injected
+        crash_injected = True
+        raise RuntimeError("Simulated crash between CAS selection and transition commit")
+
+    monkeypatch.setattr(certificate_followup_service, "transition_user_to_stage", crashing_transition)
+
+    with pytest.raises(RuntimeError, match="Simulated crash"):
+        await handle_cert_meet_click(
+            session_factory,
+            user_id=user_id,
+            topic_id=0,
+            dialogue_id=1,
+            callback_data=callback_data,
+        )
+
+    assert crash_injected is True
+
+    # Verify atomic rollback in DB:
+    # selected_button_id must remain None, NO AutomationStepTransition recorded, user current_step unchanged
+    async with session_factory() as session:
+        r = await session.get(CertificateIssuanceReceipt, receipt_id)
+        assert r.selected_button_id is None, "selected_button_id must have rolled back to None"
+        assert r.selected_at is None
+
+        transitions = (await session.scalars(select(AutomationStepTransition).where(AutomationStepTransition.user_id == user_id))).all()
+        assert len(transitions) == 0, "No transitions must be recorded upon rollback"
+
+        conv = await session.scalar(select(AutomationConversationState).where(AutomationConversationState.user_id == user_id))
+        if conv:
+            assert conv.current_step != "MEETING_BOOKING", "Conversation stage must not have transitioned"
+
+    # 2. Recovery: repeat click with normal transition execution
+    monkeypatch.setattr(certificate_followup_service, "transition_user_to_stage", real_transition)
+
+    res = await handle_cert_meet_click(
+        session_factory,
+        user_id=user_id,
+        topic_id=0,
+        dialogue_id=1,
+        callback_data=callback_data,
+    )
+    assert res.success is True, "Repeat click after crash MUST succeed and not be blocked"
+    assert res.is_repeat is False
+    assert res.target_step == "MEETING_BOOKING"
+    assert "Переходим к выбору времени" in res.response_text
+
+    # Verify final DB state: strictly ONE transition, selected_button_id set
+    async with session_factory() as session:
+        r_final = await session.get(CertificateIssuanceReceipt, receipt_id)
+        assert r_final.selected_button_id == "accept"
+        assert r_final.selected_at is not None
+
+        transitions_final = (await session.scalars(select(AutomationStepTransition).where(AutomationStepTransition.user_id == user_id))).all()
+        assert len(transitions_final) == 1, f"Expected strictly 1 transition, got {len(transitions_final)}"
+        assert transitions_final[0].current_step == "MEETING_BOOKING"
+
+        conv_final = await session.scalar(select(AutomationConversationState).where(AutomationConversationState.user_id == user_id))
+        assert conv_final.current_step == "MEETING_BOOKING"
