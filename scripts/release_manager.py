@@ -52,6 +52,39 @@ STATE_DIR_NAME = ".state"
 # Helper Utilities & Registry
 # =============================================================================
 
+def safe_is_file(path: Path | str | None) -> bool:
+    """Check if path is a file without raising PermissionError on restricted parents."""
+    if path is None:
+        return False
+    try:
+        p = Path(path)
+        return p.is_file()
+    except (OSError, PermissionError, ValueError):
+        return False
+
+
+def safe_is_dir(path: Path | str | None) -> bool:
+    """Check if path is a directory without raising PermissionError on restricted parents."""
+    if path is None:
+        return False
+    try:
+        p = Path(path)
+        return p.is_dir()
+    except (OSError, PermissionError, ValueError):
+        return False
+
+
+def safe_exists(path: Path | str | None) -> bool:
+    """Check if path exists without raising PermissionError on restricted parents."""
+    if path is None:
+        return False
+    try:
+        p = Path(path)
+        return p.exists()
+    except (OSError, PermissionError, ValueError):
+        return False
+
+
 def load_registry(path: Path | str = DEFAULT_REGISTRY_PATH) -> dict[str, Any]:
     """Load and validate the bot instance registry."""
     path = Path(path)
@@ -346,7 +379,7 @@ def resolve_release_python_interpreter(release_dir: Path, base_dir: Path) -> Pat
 
     # 3. Environment or system python
     env_py = os.environ.get("PROD_REMOTE_PY")
-    if env_py and Path(env_py).is_file():
+    if env_py and safe_is_file(env_py):
         return Path(env_py)
 
     return Path(sys.executable)
@@ -833,7 +866,7 @@ def reload_pm2_instance(
     clears the PM2 process descriptor first so PM2 re-evaluates the ecosystem config fresh.
     """
     env = os.environ.copy()
-    if runtime_env and runtime_env.is_file():
+    if safe_is_file(runtime_env):
         env["PROD_RUNTIME_ENV"] = str(runtime_env)
 
     if restart:
@@ -856,7 +889,7 @@ def reload_pm2_instance(
         "--update-env",
     ]
     env = os.environ.copy()
-    if runtime_env and runtime_env.is_file():
+    if safe_is_file(runtime_env):
         env["PROD_RUNTIME_ENV"] = str(runtime_env)
 
     try:
@@ -936,6 +969,14 @@ def deploy_canary(
     with lock_instance(base_dir, instance_name):
         state = load_instance_state(base_dir, instance_name)
 
+        effective_runtime_env = runtime_env
+        if effective_runtime_env == DEFAULT_RUNTIME_ENV_PATH or effective_runtime_env is not None:
+            shared_cand = base_dir / "shared" / "runtime.env"
+            if safe_is_file(shared_cand):
+                effective_runtime_env = shared_cand
+            elif not safe_is_file(effective_runtime_env):
+                effective_runtime_env = None
+
         # 1. Stage the release from Git commit tree
         release_dir = stage_release(base_dir=base_dir, target_sha=target_sha)
 
@@ -987,7 +1028,7 @@ def deploy_canary(
         reload_ok, reload_msg = reload_pm2_instance(
             instance_name=instance_name,
             pm2_config=pm2_config,
-            runtime_env=runtime_env,
+            runtime_env=effective_runtime_env,
             restart=is_first_migration,
         )
 
@@ -1015,7 +1056,7 @@ def deploy_canary(
                 # Rollback to legacy
                 if deployment_link.is_symlink():
                     deployment_link.unlink()
-                rb_ok, rb_reload_msg = reload_pm2_instance(instance_name, pm2_config, runtime_env, restart=True)
+                rb_ok, rb_reload_msg = reload_pm2_instance(instance_name, pm2_config, effective_runtime_env, restart=True)
                 if not rb_ok:
                     return False, f"CRITICAL_EMERGENCY: {fail_reason} AND rollback reload to legacy failed: {rb_reload_msg}", {}
                 rb_health, rb_errors = verify_instance_health(instance_name, expected_sha="", settle_seconds=settle_seconds, base_dir=base_dir)
@@ -1025,7 +1066,7 @@ def deploy_canary(
             else:
                 # Rollback to previous target
                 atomic_symlink_switch(base_dir, instance_name, previous_target)
-                rb_ok, rb_reload_msg = reload_pm2_instance(instance_name, pm2_config, runtime_env)
+                rb_ok, rb_reload_msg = reload_pm2_instance(instance_name, pm2_config, effective_runtime_env)
                 if not rb_ok:
                     return False, f"CRITICAL_EMERGENCY: {fail_reason} AND rollback reload to {previous_sha[:8] if previous_sha else 'prev'} failed: {rb_reload_msg}", {}
                 rb_health, rb_errors = verify_instance_health(instance_name, expected_sha=previous_sha or "", settle_seconds=settle_seconds, base_dir=base_dir)
@@ -1079,6 +1120,14 @@ def rollback_instance(
         deployment_link = base_dir / "deployments" / instance_name
         releases_dir = base_dir / "releases"
 
+        effective_runtime_env = runtime_env
+        if effective_runtime_env == DEFAULT_RUNTIME_ENV_PATH or effective_runtime_env is not None:
+            shared_cand = base_dir / "shared" / "runtime.env"
+            if safe_is_file(shared_cand):
+                effective_runtime_env = shared_cand
+            elif not safe_is_file(effective_runtime_env):
+                effective_runtime_env = None
+
         target_release_dir: Path | None = None
         resolved_target_sha: str | None = None
 
@@ -1104,7 +1153,7 @@ def rollback_instance(
                 if prev_target == "legacy" or (not deployment_link.exists() and not state.get("current_release_sha")):
                     if deployment_link.is_symlink():
                         deployment_link.unlink()
-                    reload_ok, reload_msg = reload_pm2_instance(instance_name, pm2_config, runtime_env, restart=True)
+                    reload_ok, reload_msg = reload_pm2_instance(instance_name, pm2_config, effective_runtime_env, restart=True)
                     if not reload_ok:
                         return False, f"PM2 reload failed during rollback to legacy: {reload_msg}", {}
                     state["current_release_sha"] = None
@@ -1133,7 +1182,7 @@ def rollback_instance(
         reload_ok, reload_msg = reload_pm2_instance(
             instance_name=instance_name,
             pm2_config=pm2_config,
-            runtime_env=runtime_env,
+            runtime_env=effective_runtime_env,
         )
         if not reload_ok:
             return False, f"PM2 reload failed during rollback: {reload_msg}", {}

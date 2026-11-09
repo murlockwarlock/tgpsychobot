@@ -58,6 +58,10 @@ def real_pm2_harness(tmp_path: Path):
     base_dir.mkdir(parents=True, exist_ok=True)
     pm2_home.mkdir(parents=True, exist_ok=True)
     repo_dir.mkdir(parents=True, exist_ok=True)
+    shared_dir = base_dir / "shared"
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    runtime_env_file = shared_dir / "runtime.env"
+    runtime_env_file.write_text("# Test isolated runtime env\n", encoding="utf-8")
 
     # Free ports for 3 managed instances and 1 unmanaged instance
     port_alpha = get_free_port()
@@ -306,12 +310,15 @@ module.exports = {{ apps: apps }};
     pm2_env = os.environ.copy()
     pm2_env["PM2_HOME"] = str(pm2_home)
     pm2_env["PM2_CMD"] = pm2_bin
+    pm2_env["PROD_BASE_DIR"] = str(base_dir)
+    pm2_env["PROD_RUNTIME_ENV"] = str(runtime_env_file)
 
     yield {
         "pm2_bin": pm2_bin,
         "pm2_env": pm2_env,
         "base_dir": base_dir,
         "pm2_home": pm2_home,
+        "runtime_env_file": runtime_env_file,
         "repo_dir": repo_dir,
         "ecosystem_path": ecosystem_path,
         "registry": registry,
@@ -352,6 +359,8 @@ def test_real_pm2_isolated_fleet_lifecycle(real_pm2_harness: dict[str, Any], mon
     # Point release_manager to isolated PM2 environment
     monkeypatch.setenv("PM2_HOME", str(h["pm2_home"]))
     monkeypatch.setenv("PM2_CMD", pm2_bin)
+    monkeypatch.setenv("PROD_BASE_DIR", str(base_dir))
+    monkeypatch.setenv("PROD_RUNTIME_ENV", str(h["runtime_env_file"]))
 
     # 1. Stage Release 1 from Git
     rel1_dir = rm.stage_release(base_dir=base_dir, target_sha=sha1, source_dir=repo_dir)
@@ -535,6 +544,8 @@ def test_real_pm2_legacy_coexistence_and_cutover(real_pm2_harness: dict[str, Any
 
     monkeypatch.setenv("PM2_HOME", str(h["pm2_home"]))
     monkeypatch.setenv("PM2_CMD", pm2_bin)
+    monkeypatch.setenv("PROD_BASE_DIR", str(base_dir))
+    monkeypatch.setenv("PROD_RUNTIME_ENV", str(h["runtime_env_file"]))
 
     # 1. Setup legacy tree
     legacy_dir = base_dir / "newbots"
@@ -617,6 +628,8 @@ def test_real_pm2_shared_database_instances_are_not_disturbed(real_pm2_harness: 
 
     monkeypatch.setenv("PM2_HOME", str(h["pm2_home"]))
     monkeypatch.setenv("PM2_CMD", pm2_bin)
+    monkeypatch.setenv("PROD_BASE_DIR", str(base_dir))
+    monkeypatch.setenv("PROD_RUNTIME_ENV", str(h["runtime_env_file"]))
 
     # Deploy v1 to both
     rel1_dir = rm.stage_release(base_dir=base_dir, target_sha=sha1, source_dir=repo_dir)
