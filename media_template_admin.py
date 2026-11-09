@@ -25,7 +25,7 @@ from certificate_followup_service import (
     validate_stage_identifier,
 )
 from database import MediaLibrary, media_collection_items
-from html_utils import truncate_html_preview
+from admin_html_preview import truncate_html_preview
 from media_image_edit import load_media_image_bytes
 from media_template_renderer import FONT_FILES, TemplateRenderError, bind_source, normalized_source, render_template, validate_config
 from media_templates import current_issue_date, template_config_identity
