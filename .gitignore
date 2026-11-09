@@ -30,3 +30,22 @@ update_dbs.py
 system_prompts/
 
 html_utils.py
+
+# AI agent artifacts and temporary working documents
+implementation.md
+docs/superpowers/
+.superpowers/
+.agents/
+.claude/
+.tmp_*
+*-checkpoint.md
+*-acceptance-audit.md
+
+# Local scratch and regression scripts
+scripts/check_authoring_*
+scripts/check_isolated_followup_postgres.py
+scripts/content_authoring_remote.sh
+scripts/export_tg_group.py
+scripts/isolated_test_processes.py
+scripts/stop_authoring_regression.py
+
