@@ -396,8 +396,7 @@ def _steps_list_keyboard(
 
     for idx, st in enumerate(steps):
         prefix = f"{idx + 1}. {st.offset_display}"
-        short_text = (st.message_text[:30] + "...") if len(st.message_text) > 30 else st.message_text
-        clean_text = short_text.replace("\n", " ")
+        clean_text = compact_event_title(st.message_text, limit=30)
         builder.button(text=f"{prefix} — {clean_text}", callback_data=f"admin_ev_step_{st.id}")
 
     builder.adjust(1)
@@ -544,8 +543,7 @@ def _test_send_picker_keyboard(
     builder = InlineKeyboardBuilder()
     builder.button(text="✉️ Подтверждение регистрации", callback_data=f"admin_ev_do_test_send_{event_id}_0")
     for idx, s in enumerate(steps):
-        short = (s.message_text[:25] + "...") if len(s.message_text) > 25 else s.message_text
-        clean = short.replace("\n", " ")
+        clean = compact_event_title(s.message_text, limit=25)
         builder.button(
             text=f"✉️ Шаг {idx + 1} ({s.offset_display}): {clean}",
             callback_data=f"admin_ev_do_test_send_{event_id}_{s.id}",
@@ -2129,9 +2127,10 @@ async def show_steps_list(callback: CallbackQuery, state: FSMContext) -> None:
     else:
         text_lines.append(f"Всего шагов: <b>{len(steps)}</b>. Нажмите на шаг для просмотра и редактирования:\n\n")
         for idx, st in enumerate(steps):
+            preview = truncate_html_preview(st.message_text, 100, allowed_tags=ALLOWED_EVENT_HTML_TAGS)
             text_lines.append(
                 f"<b>{idx + 1}. {st.offset_display}</b> (v{st.step_version})\n"
-                f"<blockquote>{html.escape(st.message_text[:100])}</blockquote>\n"
+                f"<blockquote>{preview}</blockquote>\n"
             )
 
     await callback.message.edit_text(
@@ -2237,7 +2236,7 @@ async def process_offset_custom(message: Message, state: FSMContext) -> None:
 
 @router.message(EventAdminStates.step_text)
 async def process_step_text(message: Message, state: FSMContext) -> None:
-    raw = message.html_text if isinstance(message.html_text, str) else (message.text or "")
+    raw = message.text if (not getattr(message, "entities", None) and message.text) else (message.html_text if isinstance(message.html_text, str) else (message.text or ""))
     text = raw.strip()
     data = await state.get_data()
     event_id = data["step_event_id"]
@@ -2361,7 +2360,7 @@ async def start_edit_step_text(callback: CallbackQuery, state: FSMContext) -> No
 
 @router.message(EventAdminStates.step_edit_text)
 async def process_edit_step_text(message: Message, state: FSMContext) -> None:
-    raw = message.html_text if isinstance(message.html_text, str) else (message.text or "")
+    raw = message.text if (not getattr(message, "entities", None) and message.text) else (message.html_text if isinstance(message.html_text, str) else (message.text or ""))
     text = raw.strip()
     data = await state.get_data()
     step_id = data["edit_step_id"]

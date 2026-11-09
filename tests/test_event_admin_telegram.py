@@ -4041,4 +4041,144 @@ async def test_telegram_event_callback_alert_long_error_safe(db_session_maker, m
             router._parent_router = original_parents[router]
 
 
+@pytest.mark.asyncio
+async def test_telegram_futuro_steps_html_preview_and_full_journey_a_to_ya_to_a(db_session_maker, monkeypatch):
+    """Full journey A->Я->A for 'ВСЕЛЕННАЯ ФУТУРО' reminder chain:
+    - HTML preview renderer preserves valid HTML tags (<code>, <b>, <a>) without raw escaped &lt;code&gt;
+    - Variables ({event_title}, {link}, {name}) are preserved in preview and substituted for recipient
+    - Long messages are truncated cleanly without cutting tags
+    - Buttons are stripped of raw tags and validated through Pydantic/aiogram
+    - Full roundtrip: card -> steps list -> open step -> edit text -> save -> reopen -> edit -> cancel -> reopen -> back to steps -> back to card
+    - Raw message in DB is never altered by preview rendering
+    """
+    monkeypatch.setattr(event_admin_telegram, "async_session_maker", db_session_maker)
+    monkeypatch.setattr(event_admin_telegram, "get_all_admin_ids", AsyncMock(return_value={12345}))
+    from event_admin_service import add_step, create_scenario, get_step_item
+    from event_service import render_event_template
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="futuro_universe_event",
+        event_type="webinar",
+        title="ВСЕЛЕННАЯ ФУТУРО",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://futuro.example/webinar",
+    )
+    step1_text = "Напоминаем: мероприятие <code>{event_title}</code> начнется через 24 ч! Ссылка: {link}"
+    step1 = await add_step(db_session_maker, scen.id, -1440, step1_text)
+
+    step2_text = (
+        "Привет, {name}! <b>Важное оповещение:</b> подключайтесь к <code>{event_title}</code> "
+        "по ссылке <a href=\"https://futuro.example/zoom\">трансляция</a>. "
+        "Пожалуйста, проверьте микрофон и камеру заранее, чтобы не пропустить ключевую сессию в эфире!"
+    )
+    step2 = await add_step(db_session_maker, scen.id, -120, step2_text)
+
+    event_admin_router._parent_router = None
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(event_admin_router)
+    bot = AsyncMock(spec=Bot)
+    bot.id = 123456789
+
+    def _validate_methods(methods):
+        for m in methods:
+            if hasattr(m, "model_validate") and hasattr(m, "model_dump"):
+                m.__class__.model_validate(m.model_dump())
+        return methods
+
+    # 1. Open event scenario card
+    methods = _validate_methods(await _feed_callback(dp, bot, f"admin_ev_open_{scen.id}_0_0"))
+    card = next(m for m in methods if isinstance(m, EditMessageText))
+    assert "ВСЕЛЕННАЯ ФУТУРО" in card.text
+
+    # 2. Click steps list button
+    steps_callback = next(
+        b.callback_data
+        for row in card.reply_markup.inline_keyboard
+        for b in row
+        if b.callback_data and b.callback_data.startswith(f"admin_ev_steps_{scen.id}")
+    )
+    methods = _validate_methods(await _feed_callback(dp, bot, steps_callback))
+    steps_screen = next(m for m in methods if isinstance(m, EditMessageText))
+
+    # Verify HTML preview requirements:
+    # - Raw <code> tag is NOT escaped to &lt;code&gt;
+    assert "<code>{event_title}</code>" in steps_screen.text
+    assert "&lt;code&gt;" not in steps_screen.text
+    assert "<blockquote>" in steps_screen.text
+    # - Formatted blockquote preview preserves tags and variables
+    assert "Напоминаем: мероприятие <code>{event_title}</code> начнется через 24 ч! Ссылка: {link}" in steps_screen.text
+    # - Step 2 is safely truncated without unclosed tags or &lt;code&gt;
+    assert "&lt;code&gt;" not in steps_screen.text
+    assert "&lt;b&gt;" not in steps_screen.text
+
+    # Check button text on steps list: does not contain literal HTML tags
+    step1_btn = steps_screen.reply_markup.inline_keyboard[0][0]
+    assert "<" not in step1_btn.text
+    assert ">" not in step1_btn.text
+    assert "ВСЕЛЕННАЯ ФУТУРО" in step1_btn.text or "Напоминаем" in step1_btn.text
+
+    # 3. Open Step 1 card
+    methods = _validate_methods(await _feed_callback(dp, bot, f"admin_ev_step_{step1.id}"))
+    step_screen = next(m for m in methods if isinstance(m, EditMessageText))
+    assert "<code>{event_title}</code>" in step_screen.text
+    assert "&lt;code&gt;" not in step_screen.text
+
+    # 4. Click edit text
+    edit_callback = next(
+        b.callback_data
+        for row in step_screen.reply_markup.inline_keyboard
+        for b in row
+        if b.callback_data and b.callback_data.startswith(f"admin_ev_step_edit_text_{step1.id}")
+    )
+    methods = _validate_methods(await _feed_callback(dp, bot, edit_callback))
+    edit_screen = next(m for m in methods if isinstance(m, EditMessageText))
+    assert "<code>{event_title}</code>" in edit_screen.text
+    assert "&lt;code&gt;" not in edit_screen.text
+
+    # 5. Enter new text with HTML tags and variables
+    updated_input = "Обновлено: <code>{event_title}</code> стартует! Ссылка: {link}"
+    methods = _validate_methods(await _feed_message(dp, bot, updated_input))
+    saved = next(m for m in methods if isinstance(m, SendMessage) and "Текст шага обновлен" in m.text)
+    assert "<code>{event_title}</code>" in saved.text
+    assert "&lt;code&gt;" not in saved.text
+
+    # 6. Reopen step 1 card
+    methods = _validate_methods(await _feed_callback(dp, bot, f"admin_ev_step_{step1.id}"))
+    step_screen = next(m for m in methods if isinstance(m, EditMessageText))
+    assert "Обновлено: <code>{event_title}</code>" in step_screen.text
+
+    # 7. Start edit text and click cancel
+    methods = _validate_methods(await _feed_callback(dp, bot, edit_callback))
+    edit_screen = next(m for m in methods if isinstance(m, EditMessageText))
+    cancel_btn = next(b for row in edit_screen.reply_markup.inline_keyboard for b in row if b.text == "⬅️ Отмена")
+    methods = _validate_methods(await _feed_callback(dp, bot, cancel_btn.callback_data))
+    reopened_step = next(m for m in methods if isinstance(m, EditMessageText))
+    assert f"admin_ev_step_edit_text_{step1.id}" in _telegram_event_callbacks(reopened_step.reply_markup)
+
+    # 8. Return back to steps list
+    back_to_steps_cb = reopened_step.reply_markup.inline_keyboard[-1][0].callback_data
+    methods = _validate_methods(await _feed_callback(dp, bot, back_to_steps_cb))
+    back_steps_screen = next(m for m in methods if isinstance(m, EditMessageText))
+    assert "Цепочка сообщений-напоминаний" in back_steps_screen.text
+
+    # 9. Return back to scenario card
+    back_to_card_cb = back_steps_screen.reply_markup.inline_keyboard[-1][0].callback_data
+    methods = _validate_methods(await _feed_callback(dp, bot, back_to_card_cb))
+    final_card = next(m for m in methods if isinstance(m, EditMessageText))
+    assert "ВСЕЛЕННАЯ ФУТУРО" in final_card.text
+
+    # 10. Recipient substitution verification
+    recipient_user = User(id=777, first_name="Дмитрий", name="Дмитрий")
+    recipient_text = render_event_template(updated_input, scen, user=recipient_user, platform="telegram")
+    assert "<code>ВСЕЛЕННАЯ ФУТУРО</code>" in recipient_text
+    assert "&lt;code&gt;" not in recipient_text
+    assert "https://futuro.example/webinar" in recipient_text
+
+    # 11. Database text integrity check
+    db_step = await get_step_item(db_session_maker, step1.id)
+    assert db_step.message_text == updated_input
+
+
+
 

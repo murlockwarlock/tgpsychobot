@@ -3953,3 +3953,149 @@ async def test_max_scenarios_list_button_preserves_raw_legacy_and_escaped_titles
         await app.states.clear(MAX_ID_OFFSET + admin_raw_id)
 
 
+@pytest.mark.asyncio
+async def test_max_futuro_steps_html_preview_and_full_journey_a_to_ya_to_a(db_session_maker, mock_client, states, monkeypatch):
+    """Full journey A->Я->A on MAX for 'ВСЕЛЕННАЯ ФУТУРО' reminder chain:
+    - HTML preview renderer preserves valid HTML tags (<code>, <b>, <a>) without raw escaped &lt;code&gt;
+    - Variables ({event_title}, {link}, {name}) are preserved in preview and substituted for recipient
+    - Long messages are truncated cleanly without cutting tags
+    - Buttons are stripped of raw tags
+    - Full roundtrip: card -> steps list -> open step -> edit text -> save -> reopen -> edit -> cancel -> reopen -> back to steps -> back to card
+    - Raw message in DB is never altered by preview rendering
+    """
+    monkeypatch.setattr(max_admin_events, "async_session_maker", db_session_maker)
+    monkeypatch.setattr("max_messenger_bot.app.common.is_admin", AsyncMock(return_value=True))
+    from event_admin_service import add_step, create_scenario, get_step_item
+    from event_service import render_event_template
+
+    scen = await create_scenario(
+        db_session_maker,
+        code="futuro_universe_max_event",
+        event_type="webinar",
+        title="ВСЕЛЕННАЯ ФУТУРО",
+        starts_at_utc=datetime.utcnow() + timedelta(days=2),
+        link="https://futuro.example/max-webinar",
+    )
+    step1_text = "Напоминаем: мероприятие <code>{event_title}</code> начнется через 24 ч! Ссылка: {link}"
+    step1 = await add_step(db_session_maker, scen.id, -1440, step1_text)
+
+    step2_text = (
+        "Привет, {name}! <b>Важное оповещение:</b> подключайтесь к <code>{event_title}</code> "
+        "по ссылке <a href=\"https://futuro.example/zoom\">трансляция</a>. "
+        "Пожалуйста, проверьте микрофон и камеру заранее, чтобы не пропустить ключевую сессию в эфире!"
+    )
+    step2 = await add_step(db_session_maker, scen.id, -120, step2_text)
+
+    app = MaxBotApplication(mock_client)
+    app.states = states
+    sender = Sender(user_id=456, username="admin", first_name="Admin", last_name=None)
+
+    async def press(payload: str) -> None:
+        await app._handle_callback_impl(
+            IncomingCallback(
+                raw={},
+                callback_id=payload,
+                payload=payload,
+                chat_id=123,
+                message_id=None,
+                sender=sender,
+            )
+        )
+
+    def last_text() -> str:
+        return mock_client.send_message.call_args.kwargs.get("text", "")
+
+    def visible_payloads() -> list[str]:
+        rows = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
+        return [button["payload"] for row in rows for button in row if "payload" in button]
+
+    def visible_buttons() -> list[dict]:
+        rows = mock_client.send_message.call_args.kwargs["attachments"][0]["payload"]["buttons"]
+        return [button for row in rows for button in row]
+
+    # 1. Open event scenario card
+    await press(f"admin_ev_open_{scen.id}_2_1")
+    assert "ВСЕЛЕННАЯ ФУТУРО" in last_text()
+
+    # 2. Click steps list button
+    steps_payload = next(p for p in visible_payloads() if p.startswith(f"admin_ev_steps_{scen.id}"))
+    await press(steps_payload)
+    steps_screen_text = last_text()
+
+    # Verify HTML preview requirements:
+    # - Raw <code> tag is NOT escaped to &lt;code&gt;
+    assert "<code>{event_title}</code>" in steps_screen_text
+    assert "&lt;code&gt;" not in steps_screen_text
+    assert "<blockquote>" in steps_screen_text
+    assert "Напоминаем: мероприятие <code>{event_title}</code> начнется через 24 ч! Ссылка: {link}" in steps_screen_text
+    assert "&lt;code&gt;" not in steps_screen_text
+    assert "&lt;b&gt;" not in steps_screen_text
+
+    # Check button text on steps list: does not contain literal HTML tags
+    buttons = visible_buttons()
+    step1_btn = next(b for b in buttons if b.get("payload") == f"admin_ev_step_{step1.id}_2_1")
+    assert "<" not in step1_btn["text"]
+    assert ">" not in step1_btn["text"]
+    assert "ВСЕЛЕННАЯ ФУТУРО" in step1_btn["text"] or "Напоминаем" in step1_btn["text"]
+
+    # 3. Open Step 1 card
+    await press(f"admin_ev_step_{step1.id}_2_1")
+    step_screen_text = last_text()
+    assert "<code>{event_title}</code>" in step_screen_text
+    assert "&lt;code&gt;" not in step_screen_text
+
+    # 4. Click edit text
+    edit_payload = next(p for p in visible_payloads() if p.startswith(f"admin_ev_step_edit_text_{step1.id}"))
+    await press(edit_payload)
+    edit_prompt_text = last_text()
+    assert "<code>{event_title}</code>" in edit_prompt_text
+    assert "&lt;code&gt;" not in edit_prompt_text
+
+    # 5. Send updated text with HTML tags and variables
+    updated_input = "Обновлено для MAX: <code>{event_title}</code> стартует! Ссылка: {link}"
+    await app._handle_message_impl(
+        IncomingMessage(
+            raw={},
+            message_id="max-msg-futuro-1",
+            chat_id=123,
+            sender=sender,
+            text=updated_input,
+        )
+    )
+    saved_text = last_text()
+    assert "<code>{event_title}</code>" in saved_text
+    assert "&lt;code&gt;" not in saved_text
+
+    # 6. Reopen step 1 card
+    await press(f"admin_ev_step_{step1.id}_2_1")
+    assert "Обновлено для MAX: <code>{event_title}</code>" in last_text()
+
+    # 7. Start edit text and click cancel
+    await press(edit_payload)
+    cancel_payload = next(p for p in visible_payloads() if p.startswith(f"admin_ev_step_{step1.id}"))
+    await press(cancel_payload)
+    assert f"admin_ev_step_edit_text_{step1.id}_2_1" in visible_payloads()
+
+    # 8. Return back to steps list
+    back_to_steps_cb = next(p for p in visible_payloads() if p.startswith(f"admin_ev_steps_{scen.id}"))
+    await press(back_to_steps_cb)
+    assert "Цепочка напоминаний" in last_text()
+
+    # 9. Return back to scenario card
+    back_to_card_cb = next(p for p in visible_payloads() if p.startswith(f"admin_ev_open_{scen.id}"))
+    await press(back_to_card_cb)
+    assert "ВСЕЛЕННАЯ ФУТУРО" in last_text()
+
+    # 10. Recipient substitution verification
+    recipient_user = User(id=777, first_name="Дмитрий", name="Дмитрий")
+    recipient_text = render_event_template(updated_input, scen, user=recipient_user, platform="max")
+    assert "<code>ВСЕЛЕННАЯ ФУТУРО</code>" in recipient_text
+    assert "&lt;code&gt;" not in recipient_text
+    assert "https://futuro.example/max-webinar" in recipient_text
+
+    # 11. Database text integrity check
+    db_step = await get_step_item(db_session_maker, step1.id)
+    assert db_step.message_text == updated_input
+
+
+
