@@ -7,10 +7,14 @@ Architecture:
   - Each instance check is executed in an isolated Python subprocess to prevent
     any shared SQLAlchemy engines, connection pools, or environment variable leaks.
   - Per-recipient delivery tracking: records chat_id, success, message_id, or error.
-  - Strict delivery criterion: 100% of authorized recipients must succeed;
+  - Strict delivery criterion: 100% of tested recipients must succeed;
     partial success is rejected as a failure.
-  - Production mode: strictly requires live PM2, all 18 managed processes online,
-    and forbids any mock/placeholder tokens.
+  - Production mode (--production): strictly requires live PM2, all 18 managed processes online,
+    and forbids any mock/placeholder tokens. In standard production verification, NO live
+    messages are sent to real administrators.
+  - Live send (--live-send): permitted ONLY for specially coordinated real delivery testing,
+    and strictly requires explicit recipient chat IDs via --recipient-chat-ids.
+    Blind broadcast to all production admins is strictly forbidden.
 """
 
 import argparse
@@ -51,13 +55,21 @@ async def run_single_instance_worker(
     *,
     live_send: bool = False,
     production: bool = False,
+    recipient_chat_ids: list[int] | None = None,
     registry_path: Path | None = None,
 ) -> dict[str, Any]:
     """
     Worker routine executed inside a dedicated, isolated child process for a single instance.
     Has its own process memory, environment, and clean SQLAlchemy engine.
     """
-    is_production = production or live_send or (os.environ.get("PRODUCTION") == "1")
+    is_production = production or (os.environ.get("PRODUCTION") == "1")
+
+    # Enforce strict production mode whenever live_send is requested
+    if live_send and not is_production:
+        raise RuntimeError(
+            f"LIVE SEND FORBIDDEN for {instance_name}: live_send strictly requires production mode "
+            "(production=True). Live sending without strict production checks (PM2, real tokens, verified env) is forbidden."
+        )
 
     # 1. Enforce BOT_INSTANCE_ID
     bot_instance_id = os.environ.get("BOT_INSTANCE_ID")
@@ -158,6 +170,26 @@ async def run_single_instance_worker(
 
     # 5. Live Send & Strict Delivery Criterion Tracking
     if live_send:
+        # Enforce that recipient_chat_ids must be explicitly specified
+        if not recipient_chat_ids:
+            raise RuntimeError(
+                f"LIVE SEND FORBIDDEN for {instance_name}: --live-send requires "
+                "explicitly specified recipient chat IDs via --recipient-chat-ids. "
+                "Blind broadcast to all production admins is forbidden."
+            )
+
+        # Enforce that ALL specified recipients must be authorized admins for this instance.
+        # Do not silently filter out foreign IDs.
+        unauthorized = [cid for cid in recipient_chat_ids if cid not in admin_ids]
+        if unauthorized:
+            raise RuntimeError(
+                f"LIVE SEND REJECTED for {instance_name}: recipient chat IDs {unauthorized} "
+                f"are not authorized administrators for this instance (allowed admins: {list(admin_ids)}). "
+                "All specified recipients must be authorized; partial or unverified recipient lists are forbidden."
+            )
+
+        target_chat_ids = list(dict.fromkeys(recipient_chat_ids))
+
         # Step 5a: Confirm real bot identity via getMe
         identity = await notification_routing.verify_bot_identity_live(
             route.target_bot_token,
@@ -172,14 +204,14 @@ async def run_single_instance_worker(
                 f"LIVE GETME ID MISMATCH for {target_inst['pm2_name']}: got {identity.get('id')}, expected {route.target_platform_id}"
             )
 
-        # Step 5b: Send to each recipient and track every single attempt
+        # Step 5b: Send to each target recipient and track every single attempt
         from telegram_client import create_telegram_bot
 
         async with create_telegram_bot(route.target_bot_token) as bot:
             if bot.id != route.target_platform_id:
                 raise RuntimeError(f"CRITICAL: Aiogram bot.id {bot.id} != target {route.target_platform_id}")
 
-            for cid in admin_ids:
+            for cid in target_chat_ids:
                 try:
                     sent = await bot.send_message(
                         chat_id=cid,
@@ -251,16 +283,16 @@ async def run_single_instance_worker(
             report["delivery_criterion_met"] = True
             report["status"] = "delivered_all"
     else:
-        # Dry-run simulated delivery tracking
+        # Safe simulated delivery tracking without sending live messages to real admins
         for cid in admin_ids:
             report["recipient_results"].append({
                 "chat_id": cid,
                 "success": True,
-                "message_id": "dry_run_simulated",
+                "message_id": "dry_run_simulated" if not is_production else "production_verified_no_send",
                 "error": None,
             })
         report["delivery_criterion_met"] = True
-        report["status"] = "verified_dry_run"
+        report["status"] = "verified_dry_run" if not is_production else "verified_production_no_send"
 
     return report
 
@@ -271,6 +303,7 @@ def run_instance_in_subprocess(
     child_env: dict[str, str],
     live_send: bool = False,
     production: bool = False,
+    recipient_chat_ids: list[int] | None = None,
     registry_path: Path | None = None,
 ) -> dict[str, Any]:
     """
@@ -286,6 +319,8 @@ def run_instance_in_subprocess(
         cmd.append("--live-send")
     if production:
         cmd.append("--production")
+    if recipient_chat_ids:
+        cmd.extend(["--recipient-chat-ids", ",".join(str(c) for c in recipient_chat_ids)])
     if registry_path:
         cmd.extend(["--registry", str(registry_path)])
 
@@ -317,6 +352,7 @@ async def verify_post_deploy(
     *,
     live_send: bool = False,
     production: bool = False,
+    recipient_chat_ids: list[int] | None = None,
     registry_path: Path | None = None,
     runtime_env_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -324,12 +360,27 @@ async def verify_post_deploy(
     Main orchestrator for post-deploy verification across all 18 instances.
     Spawns isolated child processes for each instance check.
     """
-    is_production = production or live_send or (os.environ.get("PRODUCTION") == "1")
+    is_production = production or (os.environ.get("PRODUCTION") == "1")
+
+    if live_send and not is_production:
+        raise ValueError(
+            "verify_post_deploy(live_send=True) requires production=True. "
+            "Live sending without strict production checks (PM2, real tokens, verified env) is forbidden."
+        )
+
+    if live_send and not recipient_chat_ids:
+        raise ValueError(
+            "verify_post_deploy(live_send=True) requires explicit recipient_chat_ids. "
+            "Blind broadcast to all production admins is forbidden."
+        )
 
     logger.info("=" * 70)
     logger.info("RUNNING ORCHESTRATED POST-DEPLOY VERIFICATION (PR #86)")
     logger.info("Production Mode: %s", "YES (Strict Fail-Closed)" if is_production else "NO (Dry-Run / CI)")
-    logger.info("Live Send:       %s", "YES (Active Telegram Dispatch)" if live_send else "NO (Safe Simulation)")
+    logger.info(
+        "Live Send:       %s",
+        f"YES (Targeted: {recipient_chat_ids})" if live_send else "NO (Safe Simulation - No Real Messages)",
+    )
     logger.info("=" * 70)
 
     reg = notification_routing.load_bot_registry(registry_path or notification_routing.REGISTRY_PATH)
@@ -344,6 +395,7 @@ async def verify_post_deploy(
         "status": "pending",
         "production_mode": is_production,
         "live_send": live_send,
+        "recipient_chat_ids": recipient_chat_ids,
         "instances_checked": len(instances),
         "deliveries": [],
         "isolation_checks": 0,
@@ -468,6 +520,7 @@ async def verify_post_deploy(
         child_env=yw_env,
         live_send=live_send,
         production=is_production,
+        recipient_chat_ids=recipient_chat_ids,
         registry_path=registry_path,
     )
     results["deliveries"].append(yw_report)
@@ -483,6 +536,7 @@ async def verify_post_deploy(
         child_env=vv_env,
         live_send=live_send,
         production=is_production,
+        recipient_chat_ids=recipient_chat_ids,
         registry_path=registry_path,
     )
     results["deliveries"].append(vv_report)
@@ -498,6 +552,7 @@ async def verify_post_deploy(
         child_env=ab_env,
         live_send=live_send,
         production=is_production,
+        recipient_chat_ids=recipient_chat_ids,
         registry_path=registry_path,
     )
     results["deliveries"].append(ab_report)
@@ -559,13 +614,19 @@ def main():
         "--live-send",
         action="store_true",
         default=False,
-        help="Perform actual live Telegram send to authorized admins (production only).",
+        help="Perform actual live Telegram send to authorized admins (requires --recipient-chat-ids).",
     )
     parser.add_argument(
         "--production",
         action="store_true",
         default=False,
         help="Strict production mode: requires live PM2, all 18 processes online, and real tokens (fails closed).",
+    )
+    parser.add_argument(
+        "--recipient-chat-ids",
+        type=str,
+        default=None,
+        help="Comma-separated Telegram chat IDs allowed for live delivery testing under --live-send.",
     )
     parser.add_argument(
         "--registry",
@@ -581,6 +642,26 @@ def main():
     )
     args = parser.parse_args()
 
+    recipient_ids = None
+    if args.recipient_chat_ids:
+        try:
+            recipient_ids = [int(x.strip()) for x in args.recipient_chat_ids.split(",") if x.strip()]
+        except ValueError:
+            parser.error(f"Invalid --recipient-chat-ids: {args.recipient_chat_ids!r}. Expected comma-separated integers.")
+
+    if args.live_send and not args.production:
+        parser.error(
+            "--live-send requires explicit --production mode. "
+            "Live sending without strict production checks (PM2, real tokens, verified env) is forbidden."
+        )
+
+    if args.live_send and not recipient_ids:
+        parser.error(
+            "--live-send is restricted to specially coordinated testing and requires "
+            "explicit recipient chat IDs via --recipient-chat-ids (e.g. --recipient-chat-ids 272982544). "
+            "Blind broadcast to all production admins is forbidden."
+        )
+
     if args.check_instance:
         # Worker mode for a single isolated child process
         try:
@@ -589,6 +670,7 @@ def main():
                     args.check_instance,
                     live_send=args.live_send,
                     production=args.production,
+                    recipient_chat_ids=recipient_ids,
                     registry_path=args.registry,
                 )
             )
@@ -604,6 +686,7 @@ def main():
                 verify_post_deploy(
                     live_send=args.live_send,
                     production=args.production,
+                    recipient_chat_ids=recipient_ids,
                     registry_path=args.registry,
                     runtime_env_path=args.runtime_env,
                 )
