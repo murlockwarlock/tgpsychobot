@@ -165,10 +165,10 @@ async def test_telegram_admin_full_scenario_journey_a_to_ya_to_a(session_factory
     # 4. Edit caption with validation
     await click('mt:scen_caption:')
     assert 'Подпись к сертификату' in latest.text
-    # Try invalid HTML
-    await enter('Невалидный HTML <b без закрывающего')
+    # Try invalid HTML (unclosed <b> tag)
+    await enter('Невалидный HTML <b>без закрывающего')
     call_texts = [getattr(c, 'text', '') or '' for c in transport.calls]
-    assert any('Ошибка валидации' in t for t in call_texts)
+    assert any('Ошибка валидации' in t for t in call_texts), f"calls: {[getattr(c, 'text', None) for c in transport.calls]}"
     # Valid HTML
     await enter('🎉 Поздравляем, <b>{name}</b>! Ваш сертификат готов.')
     assert 'Сценарий после выдачи сертификата' in latest.text
@@ -177,10 +177,10 @@ async def test_telegram_admin_full_scenario_journey_a_to_ya_to_a(session_factory
     # 5. Edit invitation with validation
     await click('mt:scen_invite:')
     assert 'Приглашение на встречу' in latest.text
-    # Try invalid HTML
-    await enter('Ошибка <i')
+    # Try invalid HTML (unclosed <i> tag)
+    await enter('Ошибка <i>без закрытия')
     call_texts = [getattr(c, 'text', '') or '' for c in transport.calls]
-    assert any('Ошибка валидации' in t for t in call_texts)
+    assert any('Ошибка валидации' in t for t in call_texts), f"calls: {[getattr(c, 'text', None) for c in transport.calls]}"
     # Valid invitation
     await enter('Хотите обсудить дальнейшие шаги на индивидуальной консультации?')
     assert 'Хотите обсудить дальнейшие шаги' in latest.text
