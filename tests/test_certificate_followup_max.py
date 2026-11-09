@@ -779,6 +779,12 @@ async def test_defect2_concurrent_certificate_issuance_max_single_wire_send(sess
         scen_cfg.caption_template = '🎉 Поздравляем, <b>{name}</b>! Ваш сертификат готов.'
         scen_cfg.invitation_text = 'Хотите записаться на консультацию?'
         scen_cfg.target_stage = 'OFFER_MEETING'
+
+        scen_cfg_3 = await get_or_create_followup_config(session, 3, topic_id=1)
+        scen_cfg_3.is_active = True
+        scen_cfg_3.caption_template = '🎉 Поздравляем, <b>{name}</b>! Ваш сертификат готов.'
+        scen_cfg_3.invitation_text = 'Хотите записаться на консультацию?'
+        scen_cfg_3.target_stage = 'OFFER_MEETING'
         await session.commit()
 
     client = MaxTransport()
@@ -799,11 +805,12 @@ async def test_defect2_concurrent_certificate_issuance_max_single_wire_send(sess
 
     # Check that receipt is completed
     from media_templates import current_issue_date
-    expected_key = make_issuance_key(40, user_id, "ConcurrentMaxIsolated", current_issue_date())
+    expected_key_40 = make_issuance_key(40, user_id, "ConcurrentMaxIsolated", current_issue_date())
+    expected_key_3 = make_issuance_key(3, user_id, "ConcurrentMaxIsolated", current_issue_date())
     async with session_factory() as session:
         receipt = await session.scalar(
             select(CertificateIssuanceReceipt).where(
-                CertificateIssuanceReceipt.issuance_key == expected_key,
+                CertificateIssuanceReceipt.issuance_key.in_([expected_key_40, expected_key_3]),
             )
         )
         assert receipt is not None
