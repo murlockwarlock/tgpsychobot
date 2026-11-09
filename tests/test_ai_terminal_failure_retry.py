@@ -125,6 +125,11 @@ async def clean_runtime():
     handlers.user_message_buffer_leases.clear()
     handlers.user_scheduling_locks.clear()
     single_flight._active_leases.clear()
+    try:
+        from event_service import _user_tx_locks
+        _user_tx_locks.clear()
+    except Exception:
+        pass
     yield
     clear_retry_claims()
     handlers.user_message_buffers.clear()
@@ -133,6 +138,11 @@ async def clean_runtime():
     handlers.user_message_buffer_leases.clear()
     handlers.user_scheduling_locks.clear()
     single_flight._active_leases.clear()
+    try:
+        from event_service import _user_tx_locks
+        _user_tx_locks.clear()
+    except Exception:
+        pass
 
 
 @pytest_asyncio.fixture

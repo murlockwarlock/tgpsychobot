@@ -36,7 +36,7 @@ from sqlalchemy import select, func, update, delete, or_, and_, cast, String, de
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import selectinload
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.types import BufferedInputFile
 from sqlalchemy.orm import selectinload, relationship
 from aiogram.types import PreCheckoutQuery, SuccessfulPayment
@@ -274,6 +274,29 @@ from provider_models import (
 )
 from user_metadata import append_metadata_records, extract_data_blocks, extract_service_data, load_metadata_records
 from automation_engine import apply_service_data_blocks, build_runtime_automation_context, get_automation_summary, persist_service_data_blocks
+from certificate_followup_service import (
+    CaptionRenderError,
+    apply_pending_deferred_data_if_any,
+    build_followup_telegram_keyboard,
+    claim_receipt_for_invitation,
+    complete_followup_delivery,
+    get_followup_config,
+    get_or_create_receipt,
+    handle_cert_meet_click,
+    make_issuance_key,
+    mark_receipt_cert_sent,
+    mark_receipt_completed,
+    mark_receipt_failed,
+    mark_receipt_sending_cert,
+    mark_receipt_uncertain,
+    override_service_blocks_target_stage,
+    render_caption,
+    render_caption_safe,
+    render_invitation,
+    resume_pending_certificate_followup,
+    serialize_service_blocks,
+    transition_user_to_stage,
+)
 from metadata_export import metadata_export_entry
 from profile_onboarding import missing_profile_fields
 from response_buttons import (
@@ -2197,7 +2220,7 @@ class MediaEditDelivery:
     content: str | None
 
 
-async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id):
+async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id, deferred_service_blocks=None):
     async def current():
         return await media_edit_context_is_current(async_session_maker, user_id, dialogue_id, topic_id)
     if not await current():
@@ -2210,6 +2233,209 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id)
         if not rendered or not await current():
             return MediaEditDelivery(None)
         await validate_rendered_template(async_session_maker, rendered, topic_id)
+
+        # Check if CertificateFollowupConfig is active for this template
+        async with async_session_maker() as session:
+            scen_cfg = await get_followup_config(session, rendered.media_id)
+
+        if scen_cfg is not None and scen_cfg.is_active:
+            from event_service import get_user_tx_lock
+            async with get_user_tx_lock(user_id):
+                recipient_str = str((rendered.values or {}).get("recipient") or "")
+                issuance_key = make_issuance_key(rendered.media_id, user_id, recipient_str, rendered.actual_issue_date)
+                serialized_deferred = serialize_service_blocks(deferred_service_blocks)
+
+                async with async_session_maker() as session:
+                    receipt, is_new = await get_or_create_receipt(
+                        session,
+                        user_id,
+                        topic_id or 0,
+                        dialogue_id,
+                        issuance_key,
+                        config_id=scen_cfg.id,
+                        deferred_data_json=serialized_deferred,
+                    )
+                    receipt_status = receipt.status
+                    receipt_id = receipt.id
+                    await session.commit()
+
+                if receipt_status == "completed":
+                    log.info("Certificate already delivered and completed for user %s, key %s", user_id, issuance_key)
+                    await apply_pending_deferred_data_if_any(
+                        async_session_maker,
+                        receipt_id,
+                        scen_cfg,
+                        user_id,
+                        topic_id or 0,
+                        dialogue_id,
+                    )
+                    return MediaEditDelivery('[Шаблон изображения]')
+                if receipt_status in ("uncertain", "sending_cert"):
+                    log.warning("Certificate issuance receipt is %s for user_id=%s, skipping blind retry.", receipt_status, user_id)
+                    if receipt_status == "sending_cert":
+                        async with async_session_maker() as session:
+                            await mark_receipt_uncertain(session, receipt_id, "Previous process interrupted during sending_cert; automatic repeat prevented.")
+                    return MediaEditDelivery('[Шаблон изображения]')
+
+                async with async_session_maker() as session:
+                    user = await session.get(User, user_id)
+                user_context = {
+                    'name': (user.name if user else None) or recipient_str or '',
+                    'fio': recipient_str or (user.name if user else '') or '',
+                    'date': rendered.actual_issue_date or '',
+                }
+
+                if receipt_status == "cert_sent":
+                    # Requirement 4: Atomic CAS claim for invitation delivery
+                    async with async_session_maker() as session:
+                        claimed = await claim_receipt_for_invitation(session, receipt_id, user_id=user_id)
+                    if not claimed:
+                        log.info("Invitation delivery already claimed concurrently for receipt %s", receipt_id)
+                        return MediaEditDelivery('[Шаблон изображения]')
+
+                    invite_text = render_invitation(scen_cfg.invitation_text, user_context)
+                    keyboard = build_followup_telegram_keyboard(scen_cfg, receipt_id=receipt_id)
+                    try:
+                        sent_invite = await _safe_send_html(
+                            lambda text, pm: bot.send_message(
+                                chat_id=user_id,
+                                text=text,
+                                parse_mode=pm,
+                                reply_markup=keyboard,
+                            ),
+                            invite_text,
+                        )
+                    except Exception as inv_err:
+                        async with async_session_maker() as session:
+                            await mark_receipt_uncertain(session, receipt_id, str(inv_err))
+                        raise
+
+                    await complete_followup_delivery(
+                        async_session_maker,
+                        receipt_id=receipt_id,
+                        invitation_message_id=getattr(sent_invite, "message_id", None),
+                        scen_cfg=scen_cfg,
+                        user_id=user_id,
+                        topic_id=topic_id or 0,
+                        dialogue_id=dialogue_id,
+                        deferred_blocks=deferred_service_blocks,
+                    )
+                    if bot is not None:
+                        from automation_events import process_pending_events
+                        try:
+                            await process_pending_events(bot, user_id=user_id)
+                        except Exception:
+                            pass
+                    return MediaEditDelivery(invite_text)
+
+                # Phase 1: Deliver Message 1 (Certificate with admin caption)
+                # Requirement 7: Explicit caption validation before sending; reject if instructions cannot be preserved
+                try:
+                    caption_text, _ = render_caption_safe(scen_cfg.caption_template, user_context, max_limit=1024)
+                except CaptionRenderError as c_err:
+                    log.error("Certificate caption invalid or exceeds limit for user %s: %s", user_id, c_err)
+                    async with async_session_maker() as session:
+                        await mark_receipt_failed(session, receipt_id, str(c_err))
+                    raise TemplateRenderError(f"Ошибка подписи сертификата: {c_err}") from c_err
+
+                # Requirement 3 & Defect 2: Set persistent in-flight state 'sending_cert' via atomic CAS BEFORE external API call
+                async with async_session_maker() as session:
+                    claimed = await mark_receipt_sending_cert(session, receipt_id, user_id=user_id)
+                if not claimed:
+                    log.info("Certificate sending already claimed concurrently for receipt %s", receipt_id)
+                    return MediaEditDelivery('[Шаблон изображения]')
+
+                try:
+                    sent_cert = await bot.send_document(
+                        chat_id=user_id,
+                        document=BufferedInputFile(rendered.image_bytes, filename='certificate.png'),
+                        caption=caption_text or None,
+                        parse_mode='HTML',
+                    )
+                except TelegramBadRequest as br_err:
+                    if _is_html_parse_error(br_err):
+                        # Proven non-delivery due to entity parsing error: safe single fallback with plain text
+                        plain_caption = html.escape(_strip_all_html_tags(caption_text), quote=False)
+                        sent_cert = await bot.send_document(
+                            chat_id=user_id,
+                            document=BufferedInputFile(rendered.image_bytes, filename='certificate.png'),
+                            caption=plain_caption or None,
+                            parse_mode=None,
+                        )
+                    else:
+                        async with async_session_maker() as session:
+                            await mark_receipt_failed(session, receipt_id, str(br_err))
+                        raise
+                except (asyncio.TimeoutError, TimeoutError, TelegramNetworkError) as net_err:
+                    # UNCERTAIN: Document may have reached Telegram, response was lost. NEVER repeat SendDocument!
+                    async with async_session_maker() as session:
+                        await mark_receipt_uncertain(session, receipt_id, str(net_err))
+                    raise
+                except Exception as send_err:
+                    async with async_session_maker() as session:
+                        await mark_receipt_uncertain(session, receipt_id, str(send_err))
+                    raise
+
+                if not await current():
+                    return MediaEditDelivery(None)
+
+                async with async_session_maker() as session:
+                    await mark_receipt_cert_sent(
+                        session,
+                        receipt_id,
+                        message_id=getattr(sent_cert, "message_id", None),
+                        config_id=scen_cfg.id,
+                        deferred_data_json=serialized_deferred,
+                    )
+
+                # Phase 2: Deliver Message 2 (Invitation with buttons)
+                # Requirement 4: Atomic CAS claim for Phase 2 invitation
+                async with async_session_maker() as session:
+                    claimed = await claim_receipt_for_invitation(session, receipt_id, user_id=user_id)
+                if not claimed:
+                    log.info("Phase 2 invitation claimed concurrently for receipt %s", receipt_id)
+                    return MediaEditDelivery(caption_text)
+
+                invite_text = render_invitation(scen_cfg.invitation_text, user_context)
+                keyboard = build_followup_telegram_keyboard(scen_cfg, receipt_id=receipt_id)
+                try:
+                    sent_invite = await _safe_send_html(
+                        lambda text, pm: bot.send_message(
+                            chat_id=user_id,
+                            text=text,
+                            parse_mode=pm,
+                            reply_markup=keyboard,
+                        ),
+                        invite_text,
+                    )
+                except Exception as inv_err:
+                    log.error("Certificate delivered, but invitation failed user_id=%s: %s", user_id, inv_err)
+                    async with async_session_maker() as session:
+                        await mark_receipt_uncertain(session, receipt_id, str(inv_err))
+                    return MediaEditDelivery(caption_text)
+
+                # Requirement 5: Complete delivery and persist DATA without window
+                await complete_followup_delivery(
+                    async_session_maker,
+                    receipt_id=receipt_id,
+                    invitation_message_id=getattr(sent_invite, "message_id", None),
+                    scen_cfg=scen_cfg,
+                    user_id=user_id,
+                    topic_id=topic_id or 0,
+                    dialogue_id=dialogue_id,
+                    deferred_blocks=deferred_service_blocks,
+                )
+
+                if bot is not None:
+                    from automation_events import process_pending_events
+                    try:
+                        await process_pending_events(bot, user_id=user_id)
+                    except Exception:
+                        pass
+
+                return MediaEditDelivery(invite_text)
+
+        # Legacy fallback delivery
         clean = synchronize_template_caption(clean, rendered.actual_issue_date)
         clean, rows = extract_response_buttons(clean)
         presentation = await _prepare_telegram_response_buttons(user_id, rows)
@@ -2236,6 +2462,23 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id)
                 caption=None,
                 reply_markup=_telegram_response_text_markup(presentation),
             )
+
+        if deferred_service_blocks:
+            await persist_service_data_blocks(
+                async_session_maker,
+                user_id=user_id,
+                dialogue_id=dialogue_id,
+                topic_id=topic_id,
+                blocks=deferred_service_blocks,
+                apply_fn=apply_service_data_blocks,
+            )
+            if bot is not None:
+                from automation_events import process_pending_events
+                try:
+                    await process_pending_events(bot, user_id=user_id)
+                except Exception:
+                    pass
+
         return MediaEditDelivery(clean or '[Шаблон изображения]')
     except Exception as exc:
         if not await current():
@@ -2245,9 +2488,9 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id)
         return MediaEditDelivery(text)
 
 
-async def _deliver_media_edit(bot, user_id, response, dialogue_id, topic_id, ai_config):
+async def _deliver_media_edit(bot, user_id, response, dialogue_id, topic_id, ai_config, deferred_service_blocks=None):
     if re.search(r'\bRENDER_IMG_MEDIA\b', response, re.I):
-        return await _deliver_media_template(bot, user_id, response, dialogue_id, topic_id)
+        return await _deliver_media_template(bot, user_id, response, dialogue_id, topic_id, deferred_service_blocks=deferred_service_blocks)
     directive, clean_text = extract_media_edit_directive(response)
     if clean_text == response.strip() and directive is None:
         return None
@@ -2570,6 +2813,21 @@ async def process_buffered_messages(
             ai_config = await session.get(AIConfig, 1)
             general_config = await session.get(BotGeneralConfig, 1)
             locale = await resolve_user_effective_locale(session, user_id)
+
+        # Requirement 5: Resume pending invitation delivery if cert was sent but invite was interrupted
+        if request_user is not None:
+            try:
+                await resume_pending_certificate_followup(
+                    bot,
+                    user_id=user_id,
+                    topic_id=request_topic_id or 0,
+                    dialogue_id=request_dialogue_id or 1,
+                    session_maker=async_session_maker,
+                    platform="telegram",
+                )
+            except Exception as resume_err:
+                log.debug("resume_pending_certificate_followup error ignored: %s", resume_err)
+
         processing_message = await _send_ai_processing_message(
             bot,
             user_id,
@@ -2589,7 +2847,15 @@ async def process_buffered_messages(
         ai_context_content = response_capture.get("raw_response") or response_text
         if not await _check_scope_guard():
             return
-        media_delivery = await _deliver_media_edit(bot, user_id, response_text, request_dialogue_id, request_topic_id, ai_config)
+        media_delivery = await _deliver_media_edit(
+            bot,
+            user_id,
+            response_text,
+            request_dialogue_id,
+            request_topic_id,
+            ai_config,
+            deferred_service_blocks=response_capture.get("deferred_service_blocks") if response_capture else None,
+        )
         if media_delivery is not None:
             await _delete_ai_processing_message(processing_message)
             if media_delivery.content is not None and await media_edit_context_is_current(async_session_maker, user_id, request_dialogue_id, request_topic_id):
@@ -4473,23 +4739,35 @@ def _strip_all_html_tags(text: str) -> str:
     return re.sub(r'<[^>]+>', '', text)
 
 
+def _is_html_parse_error(exc: Exception) -> bool:
+    if isinstance(exc, TelegramBadRequest):
+        msg = (getattr(exc, "message", "") or "").lower()
+        return "can't parse entities" in msg or "character" in msg or "parse" in msg
+    return False
+
+
 async def _safe_send_html(send_coro_factory, chunk: str):
     """Отправляет chunk с parse_mode='HTML'.
 
-    При ошибке парсинга — прогоняет через _fix_unclosed_html_tags и пробует снова.
+    При ошибке парсинга (TelegramBadRequest) — прогоняет через _fix_unclosed_html_tags и пробует снова.
     Если всё равно не получилось — полностью удаляет теги, html-escape-ит текст
     и отправляет с parse_mode='HTML' (чистый текст, но символы безопасны).
+    При сетевых/транспортных ошибках и таймаутах НЕ повторяет запрос и сразу пробрасывает исключение.
     """
     try:
-        await send_coro_factory(chunk, 'HTML')
-    except Exception:
+        return await send_coro_factory(chunk, 'HTML')
+    except Exception as exc:
+        if not _is_html_parse_error(exc):
+            raise
         fixed = _fix_unclosed_html_tags(chunk)
         try:
-            await send_coro_factory(fixed, 'HTML')
-        except Exception:
+            return await send_coro_factory(fixed, 'HTML')
+        except Exception as exc2:
+            if not _is_html_parse_error(exc2):
+                raise
             plain = html.escape(_strip_all_html_tags(chunk), quote=False)
             if plain.strip():
-                await send_coro_factory(plain, 'HTML')
+                return await send_coro_factory(plain, 'HTML')
 
 
 def infer_gender(name: str) -> str:
@@ -4633,6 +4911,47 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
 async def cb_event_reminder_actions(callback: CallbackQuery):
     from event_service import handle_event_callback_telegram
     await handle_event_callback_telegram(callback)
+
+
+@router.callback_query(F.data.startswith("cert_meet:"), StateFilter("*"))
+async def cb_cert_meet_actions(callback: CallbackQuery):
+    admin_flag = await is_admin(callback.from_user.id)
+    async with async_session_maker() as session:
+        user = await session.get(User, callback.from_user.id)
+        topic_id = user.current_topic_id if user and user.current_topic_id else 0
+        dialogue_id = user.current_dialogue_id if user and user.current_dialogue_id else 1
+
+    res = await handle_cert_meet_click(
+        async_session_maker,
+        user_id=callback.from_user.id,
+        topic_id=topic_id,
+        dialogue_id=dialogue_id,
+        callback_data=callback.data or "",
+        is_admin_user=admin_flag,
+    )
+
+    if not res.success:
+        await callback.answer(res.alert_text or "Действие недоступно.", show_alert=True)
+        return
+
+    if res.is_test:
+        await callback.answer(res.alert_text or "Тестовый выбор зафиксирован.", show_alert=True)
+        if res.response_text:
+            await callback.message.answer(res.response_text)
+        return
+
+    await callback.answer(res.alert_text or "Выбор сохранён.")
+    if res.response_text:
+        await callback.message.answer(res.response_text)
+        async with async_session_maker() as session:
+            session.add(DBMessage(
+                user_id=callback.from_user.id,
+                role="assistant",
+                content=res.response_text,
+                dialogue_id=dialogue_id,
+                topic_id=topic_id,
+            ))
+            await session.commit()
 
 
 @router.callback_query(F.data.startswith("select_telegram_language:"))
@@ -9192,14 +9511,24 @@ async def process_user_prompt(message: Message, user_id: int, prompt_text: str, 
                 f"[СИСТЕМНАЯ ИНФОРМАЦИЯ: Для ответа используй следующий контекст или метафору (интегрируй это в ответ органично, если уместно): «{random_phrase}»]"
             )
     try:
+        resp_cap = {}
         response_text = await get_ai_response(
             user_id,
             ai_prompt_text,
             user_name,
             user_gender,
             bot=bot,
+            response_capture=resp_cap,
         )
-        media_delivery = await _deliver_media_edit(bot, user_id, response_text, dialogue_id, topic_id, ai_config)
+        media_delivery = await _deliver_media_edit(
+            bot,
+            user_id,
+            response_text,
+            dialogue_id,
+            topic_id,
+            ai_config,
+            deferred_service_blocks=resp_cap.get("deferred_service_blocks"),
+        )
         if media_delivery is not None:
             await _delete_ai_processing_message(thinking_msg)
             if media_delivery.content is not None and await media_edit_context_is_current(async_session_maker, user_id, dialogue_id, topic_id):
@@ -24977,7 +25306,8 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
         # =========================================================================
         visible_text, service_blocks, invalid_data_blocks = extract_service_data(analysis_result)
 
-        if service_blocks:
+        has_media_template = bool(re.search(r'\bRENDER_IMG_MEDIA\b', visible_text, re.I))
+        if service_blocks and not has_media_template:
             try:
                 await persist_service_data_blocks(
                     async_session_maker,
@@ -24992,7 +25322,7 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
                 raise AIServiceError(f"Ошибка сохранения служебных данных ИИ: {exc}") from exc
 
         # Process automation events after successful DATA commit
-        if service_blocks:
+        if service_blocks and not has_media_template:
             from automation_events import process_pending_events
             try:
                 await process_pending_events(bot, user_id=user_id)
@@ -25021,7 +25351,15 @@ async def handle_photo_message(message: Message, state: FSMContext, bot: Bot):
         # =========================================================================
         # Outer Conversational Layer: Fresh scope checks, message sending, assistant DB persistence
         # =========================================================================
-        media_delivery = await _deliver_media_edit(bot, user_id, visible_text, current_dialogue_id, current_topic_id, ai_config)
+        media_delivery = await _deliver_media_edit(
+            bot,
+            user_id,
+            visible_text,
+            current_dialogue_id,
+            current_topic_id,
+            ai_config,
+            deferred_service_blocks=service_blocks if has_media_template else None,
+        )
         if media_delivery is not None:
             if processing_msg:
                 await _delete_ai_processing_message(processing_msg)

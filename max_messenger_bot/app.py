@@ -1198,6 +1198,11 @@ class MaxBotApplication:
             await handle_event_callback_max(self.client, callback)
             return
 
+        if data.startswith("cert_meet:"):
+            from certificate_followup_service import handle_cert_callback_max
+            await handle_cert_callback_max(self.client, callback)
+            return
+
         if data == "main_menu":
             await self.client.answer_callback(callback.callback_id)
             state = await self.states.get(user_id)

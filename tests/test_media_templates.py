@@ -499,6 +499,28 @@ async def test_admin_actual_navigation_setup_save_cancel_preview(session_factory
         await click('admin_coll_file_view_1_10_0_0')
         await click('mt:home:')
         assert 'Поля: 2' in latest.text and 'включен' in latest.text
+
+        # Visit scenario actions
+        await click('mt:scenario:')
+        assert 'Сценарий после выдачи' in latest.text
+        await click('mt:scen_toggle:')
+        assert 'Сценарий после выдачи' in latest.text
+        await click('mt:scen_caption:')
+        await enter('Новая подпись для {name}')
+        assert 'Новая подпись для {name}' in latest.text
+        await click('mt:scen_invite:')
+        await enter('Приглашаем {name}')
+        assert 'Приглашаем {name}' in latest.text
+        await click('mt:scen_stage:')
+        await enter('CUSTOM_STAGE')
+        assert 'CUSTOM_STAGE' in latest.text
+        await click('mt:scen_buttons:')
+        assert 'Кнопки выбора' in latest.text
+        await click('mt:scen_btn_edit:')
+        await click('mt:scen_cancel:')
+        assert 'Сценарий после выдачи' in latest.text
+        await click('mt:scen_test:')
+        await click('mt:scen_back:')
         assert visited == set(BUTTON_CONTRACTS)
     finally:
         dispatcher.sub_routers.clear(); handlers.router._parent_router = None; await bot.session.close()
