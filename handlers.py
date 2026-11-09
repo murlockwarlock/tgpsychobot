@@ -36,7 +36,7 @@ from sqlalchemy import select, func, update, delete, or_, and_, cast, String, de
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import selectinload
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.types import BufferedInputFile
 from sqlalchemy.orm import selectinload, relationship
 from aiogram.types import PreCheckoutQuery, SuccessfulPayment
@@ -284,8 +284,12 @@ from certificate_followup_service import (
     mark_receipt_completed,
     mark_receipt_failed,
     mark_receipt_uncertain,
+    override_service_blocks_target_stage,
     render_caption,
+    render_caption_safe,
     render_invitation,
+    resume_pending_certificate_followup,
+    serialize_service_blocks,
     transition_user_to_stage,
 )
 from metadata_export import metadata_export_entry
@@ -2232,9 +2236,18 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
         if scen_cfg is not None and scen_cfg.is_active:
             recipient_str = str((rendered.values or {}).get("recipient") or "")
             issuance_key = make_issuance_key(rendered.media_id, user_id, recipient_str, rendered.actual_issue_date)
+            serialized_deferred = serialize_service_blocks(deferred_service_blocks)
 
             async with async_session_maker() as session:
-                receipt, is_new = await get_or_create_receipt(session, user_id, topic_id or 0, dialogue_id, issuance_key)
+                receipt, is_new = await get_or_create_receipt(
+                    session,
+                    user_id,
+                    topic_id or 0,
+                    dialogue_id,
+                    issuance_key,
+                    config_id=scen_cfg.id,
+                    deferred_data_json=serialized_deferred,
+                )
                 receipt_status = receipt.status
                 receipt_id = receipt.id
                 await session.commit()
@@ -2257,7 +2270,7 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
             if receipt_status == "cert_sent":
                 # Resume Phase 2 without duplicate certificate (Requirement 5)
                 invite_text = render_invitation(scen_cfg.invitation_text, user_context)
-                keyboard = build_followup_telegram_keyboard(scen_cfg)
+                keyboard = build_followup_telegram_keyboard(scen_cfg, receipt_id=receipt_id)
                 sent_invite = await _safe_send_html(
                     lambda text, pm: bot.send_message(
                         chat_id=user_id,
@@ -2273,12 +2286,15 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
                         await transition_user_to_stage(session, user_id, topic_id or 0, dialogue_id, scen_cfg.target_stage)
                     await session.commit()
                 if deferred_service_blocks:
+                    applied_blocks = deferred_service_blocks
+                    if scen_cfg.target_stage:
+                        applied_blocks = override_service_blocks_target_stage(applied_blocks, scen_cfg.target_stage)
                     await persist_service_data_blocks(
                         async_session_maker,
                         user_id=user_id,
                         dialogue_id=dialogue_id,
                         topic_id=topic_id,
-                        blocks=deferred_service_blocks,
+                        blocks=applied_blocks,
                         apply_fn=apply_service_data_blocks,
                     )
                 if bot is not None:
@@ -2290,37 +2306,56 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
                 return MediaEditDelivery(invite_text)
 
             # Phase 1: Deliver Message 1 (Certificate with admin caption)
-            caption_text = render_caption(scen_cfg.caption_template, user_context)
-            caption_text = truncate_html_preview(caption_text, 1024)
+            caption_text, caption_errors = render_caption_safe(scen_cfg.caption_template, user_context, max_limit=1024)
+            if caption_errors:
+                log.warning("Certificate caption had errors for user %s: %s; using safe fallback", user_id, caption_errors)
 
             try:
-                sent_cert = await _safe_send_html(
-                    lambda text, pm: bot.send_document(
+                sent_cert = await bot.send_document(
+                    chat_id=user_id,
+                    document=BufferedInputFile(rendered.image_bytes, filename='certificate.png'),
+                    caption=caption_text or None,
+                    parse_mode='HTML',
+                )
+            except TelegramBadRequest as br_err:
+                if _is_html_parse_error(br_err):
+                    # Proven non-delivery due to entity parsing error: safe single fallback with plain text
+                    plain_caption = html.escape(_strip_all_html_tags(caption_text), quote=False)
+                    sent_cert = await bot.send_document(
                         chat_id=user_id,
                         document=BufferedInputFile(rendered.image_bytes, filename='certificate.png'),
-                        caption=text or None,
-                        parse_mode=pm,
-                    ),
-                    caption_text,
-                )
-            except (asyncio.TimeoutError, TimeoutError) as to_err:
+                        caption=plain_caption or None,
+                        parse_mode=None,
+                    )
+                else:
+                    async with async_session_maker() as session:
+                        await mark_receipt_failed(session, receipt_id, str(br_err))
+                    raise
+            except (asyncio.TimeoutError, TimeoutError, TelegramNetworkError) as net_err:
+                # UNCERTAIN: Document may have reached Telegram, response was lost. NEVER repeat SendDocument!
                 async with async_session_maker() as session:
-                    await mark_receipt_uncertain(session, receipt_id, str(to_err))
+                    await mark_receipt_uncertain(session, receipt_id, str(net_err))
                 raise
             except Exception as send_err:
                 async with async_session_maker() as session:
-                    await mark_receipt_failed(session, receipt_id, str(send_err))
+                    await mark_receipt_uncertain(session, receipt_id, str(send_err))
                 raise
 
             if not await current():
                 return MediaEditDelivery(None)
 
             async with async_session_maker() as session:
-                await mark_receipt_cert_sent(session, receipt_id, message_id=getattr(sent_cert, "message_id", None))
+                await mark_receipt_cert_sent(
+                    session,
+                    receipt_id,
+                    message_id=getattr(sent_cert, "message_id", None),
+                    config_id=scen_cfg.id,
+                    deferred_data_json=serialized_deferred,
+                )
 
             # Phase 2: Deliver Message 2 (Invitation with buttons)
             invite_text = render_invitation(scen_cfg.invitation_text, user_context)
-            keyboard = build_followup_telegram_keyboard(scen_cfg)
+            keyboard = build_followup_telegram_keyboard(scen_cfg, receipt_id=receipt_id)
             try:
                 sent_invite = await _safe_send_html(
                     lambda text, pm: bot.send_message(
@@ -2342,12 +2377,15 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
                 await session.commit()
 
             if deferred_service_blocks:
+                applied_blocks = deferred_service_blocks
+                if scen_cfg.target_stage:
+                    applied_blocks = override_service_blocks_target_stage(applied_blocks, scen_cfg.target_stage)
                 await persist_service_data_blocks(
                     async_session_maker,
                     user_id=user_id,
                     dialogue_id=dialogue_id,
                     topic_id=topic_id,
-                    blocks=deferred_service_blocks,
+                    blocks=applied_blocks,
                     apply_fn=apply_service_data_blocks,
                 )
 
@@ -2738,6 +2776,18 @@ async def process_buffered_messages(
             ai_config = await session.get(AIConfig, 1)
             general_config = await session.get(BotGeneralConfig, 1)
             locale = await resolve_user_effective_locale(session, user_id)
+
+        # Requirement 5: Resume pending invitation delivery if cert was sent but invite was interrupted
+        if request_user is not None:
+            await resume_pending_certificate_followup(
+                bot,
+                user_id=user_id,
+                topic_id=request_topic_id or 0,
+                dialogue_id=request_dialogue_id or 1,
+                session_maker=async_session_maker,
+                platform="telegram",
+            )
+
         processing_message = await _send_ai_processing_message(
             bot,
             user_id,
@@ -4649,20 +4699,32 @@ def _strip_all_html_tags(text: str) -> str:
     return re.sub(r'<[^>]+>', '', text)
 
 
+def _is_html_parse_error(exc: Exception) -> bool:
+    if isinstance(exc, TelegramBadRequest):
+        msg = (getattr(exc, "message", "") or "").lower()
+        return "can't parse entities" in msg or "character" in msg or "parse" in msg
+    return False
+
+
 async def _safe_send_html(send_coro_factory, chunk: str):
     """Отправляет chunk с parse_mode='HTML'.
 
-    При ошибке парсинга — прогоняет через _fix_unclosed_html_tags и пробует снова.
+    При ошибке парсинга (TelegramBadRequest) — прогоняет через _fix_unclosed_html_tags и пробует снова.
     Если всё равно не получилось — полностью удаляет теги, html-escape-ит текст
     и отправляет с parse_mode='HTML' (чистый текст, но символы безопасны).
+    При сетевых/транспортных ошибках и таймаутах НЕ повторяет запрос и сразу пробрасывает исключение.
     """
     try:
         return await send_coro_factory(chunk, 'HTML')
-    except Exception:
+    except Exception as exc:
+        if not _is_html_parse_error(exc):
+            raise
         fixed = _fix_unclosed_html_tags(chunk)
         try:
             return await send_coro_factory(fixed, 'HTML')
-        except Exception:
+        except Exception as exc2:
+            if not _is_html_parse_error(exc2):
+                raise
             plain = html.escape(_strip_all_html_tags(chunk), quote=False)
             if plain.strip():
                 return await send_coro_factory(plain, 'HTML')
@@ -4813,38 +4875,43 @@ async def cb_event_reminder_actions(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("cert_meet:"), StateFilter("*"))
 async def cb_cert_meet_actions(callback: CallbackQuery):
-    data = (callback.data or "").split(":")
-    if len(data) < 3:
-        await callback.answer()
-        return
-    action_id = data[1]
-    try:
-        config_id = int(data[2])
-    except ValueError:
-        config_id = 0
-    await callback.answer()
+    admin_flag = await is_admin(callback.from_user.id)
     async with async_session_maker() as session:
         user = await session.get(User, callback.from_user.id)
         topic_id = user.current_topic_id if user and user.current_topic_id else 0
         dialogue_id = user.current_dialogue_id if user and user.current_dialogue_id else 1
-    response_text, target_step = await handle_cert_meet_click(
+
+    res = await handle_cert_meet_click(
         async_session_maker,
         user_id=callback.from_user.id,
         topic_id=topic_id,
         dialogue_id=dialogue_id,
-        action_id=action_id,
-        config_id=config_id,
+        callback_data=callback.data or "",
+        is_admin_user=admin_flag,
     )
-    await callback.message.answer(response_text)
-    async with async_session_maker() as session:
-        session.add(DBMessage(
-            user_id=callback.from_user.id,
-            role="assistant",
-            content=response_text,
-            dialogue_id=dialogue_id,
-            topic_id=topic_id,
-        ))
-        await session.commit()
+
+    if not res.success:
+        await callback.answer(res.alert_text or "Действие недоступно.", show_alert=True)
+        return
+
+    if res.is_test:
+        await callback.answer(res.alert_text or "Тестовый выбор зафиксирован.", show_alert=True)
+        if res.response_text:
+            await callback.message.answer(res.response_text)
+        return
+
+    await callback.answer(res.alert_text or "Выбор сохранён.")
+    if res.response_text:
+        await callback.message.answer(res.response_text)
+        async with async_session_maker() as session:
+            session.add(DBMessage(
+                user_id=callback.from_user.id,
+                role="assistant",
+                content=res.response_text,
+                dialogue_id=dialogue_id,
+                topic_id=topic_id,
+            ))
+            await session.commit()
 
 
 @router.callback_query(F.data.startswith("select_telegram_language:"))

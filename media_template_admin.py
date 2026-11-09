@@ -14,6 +14,7 @@ from certificate_followup_service import (
     get_or_create_followup_config,
     parse_buttons_config,
     render_caption,
+    render_caption_safe,
     render_invitation,
     save_followup_caption,
     save_followup_invitation,
@@ -352,8 +353,7 @@ def register_template_admin(router, *, session_factory, require_admin, show_medi
                     'fio': sample_values.get('recipient') or callback.from_user.full_name or 'Пользователь',
                     'date': current_issue_date(),
                 }
-                caption_text = render_caption(scen_cfg.caption_template, test_context)
-                caption_text = truncate_html_preview(caption_text, 1024)
+                caption_text, _ = render_caption_safe(scen_cfg.caption_template, test_context, max_limit=1024)
                 await callback.bot.send_document(
                     chat_id=callback.from_user.id,
                     document=BufferedInputFile(result.image_bytes, filename='test-certificate.png'),
@@ -361,9 +361,9 @@ def register_template_admin(router, *, session_factory, require_admin, show_medi
                     parse_mode='HTML',
                 )
 
-                # Message 2: Invitation
+                # Message 2: Invitation (with is_test=True so clicking buttons does not alter admin stage)
                 invite_text = render_invitation(scen_cfg.invitation_text, test_context)
-                test_keyboard = build_followup_telegram_keyboard(scen_cfg)
+                test_keyboard = build_followup_telegram_keyboard(scen_cfg, is_test=True)
                 await callback.bot.send_message(
                     chat_id=callback.from_user.id,
                     text=invite_text,

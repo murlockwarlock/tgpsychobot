@@ -184,10 +184,19 @@ def _automation_menu_keyboard():
     return builder.as_markup()
 
 
-@router.callback_query(F.data == "cert_followup_list")
+CERT_FOLLOWUP_PAGE_SIZE = 5
+
+
+@router.callback_query(F.data.startswith("cert_followup_list"))
 async def cert_followup_list(callback: CallbackQuery, state: FSMContext):
     from database import MediaLibrary, media_collection_items
     await state.clear()
+
+    data_parts = (callback.data or "").split(":")
+    page = 0
+    if len(data_parts) > 1 and data_parts[1].isdigit():
+        page = max(0, int(data_parts[1]))
+
     async with async_session_maker() as session:
         stmt = (
             select(MediaLibrary)
@@ -219,19 +228,34 @@ async def cert_followup_list(callback: CallbackQuery, state: FSMContext):
         )
         return
 
+    total_pages = max(1, (len(templates) + CERT_FOLLOWUP_PAGE_SIZE - 1) // CERT_FOLLOWUP_PAGE_SIZE)
+    page = min(page, total_pages - 1)
+    page_templates = templates[page * CERT_FOLLOWUP_PAGE_SIZE : (page + 1) * CERT_FOLLOWUP_PAGE_SIZE]
+
     text = (
-        "🎓 <b>Сценарии после выдачи сертификатов</b>\n\n"
+        f"🎓 <b>Сценарии после выдачи сертификатов</b> (Стр. {page + 1}/{total_pages})\n\n"
         "Выберите шаблон изображения для перехода к настройке подписи, приглашения на встречу, "
         "кнопок и этапов алгоритма:"
     )
-    for tmpl in templates:
+    for tmpl in page_templates:
         cid = 0
         builder.button(
             text=f"📜 {tmpl.file_name or f'Шаблон #{tmpl.id}'}",
             callback_data=f"mt:scenario:{tmpl.id}:{cid}:1:1:-1",
         )
-    builder.button(text="⬅️ В автоматизации", callback_data="automation_menu")
     builder.adjust(1)
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cert_followup_list:{page - 1}"))
+    if total_pages > 1:
+        nav_row.append(InlineKeyboardButton(text=f"• {page + 1}/{total_pages} •", callback_data="noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"cert_followup_list:{page + 1}"))
+    if nav_row:
+        builder.row(*nav_row)
+
+    builder.row(_back("automation_menu"))
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
 
 

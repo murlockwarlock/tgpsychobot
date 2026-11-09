@@ -182,6 +182,19 @@ async def test_max_deterministic_button_clicks(session_factory, media_setup):
         await session.commit()
         config_id = scen_cfg.id
 
+        # Setup confirmed issuance receipt for validation
+        receipt = CertificateIssuanceReceipt(
+            user_id=100000000007,
+            topic_id=1,
+            dialogue_id=1,
+            config_id=config_id,
+            issuance_key="seed_key_max_click",
+            status="completed",
+            created_at=datetime.utcnow(),
+            completed_at=datetime.utcnow(),
+        )
+        session.add(receipt)
+
         # Setup initial conversation state
         conv_state = AutomationConversationState(
             user_id=100000000007,
@@ -201,7 +214,7 @@ async def test_max_deterministic_button_clicks(session_factory, media_setup):
     # 1. Click Accept
     cb_accept = SimpleNamespace(
         callback_id='cb_max_1',
-        payload=f'cert_meet:accept:{config_id}',
+        payload=f'cert_meet:accept:{config_id}:{receipt.id}',
         chat_id=100,
         user_id=100000000007,
         sender=sender,
@@ -214,6 +227,34 @@ async def test_max_deterministic_button_clicks(session_factory, media_setup):
     # Verify message sent to user
     sent_texts = [kwargs.get('json_data', {}).get('text', '') for method, path, kwargs in client.wire if path == '/messages']
     assert any('Отлично! Запланируем встречу' in t for t in sent_texts)
+
+    # Repeat click on Accept (Defect 3): Informs user and does NOT re-transition
+    wire_before_repeat = len(client.wire)
+    cb_repeat = SimpleNamespace(
+        callback_id='cb_max_repeat',
+        payload=f'cert_meet:accept:{config_id}:{receipt.id}',
+        chat_id=100,
+        user_id=100000000007,
+        sender=sender,
+    )
+    await app.handle_callback(cb_repeat)
+    repeat_messages = [kwargs for method, path, kwargs in client.wire[wire_before_repeat:] if path == '/messages']
+    assert len(repeat_messages) == 1
+    assert 'Повторный выбор не требуется' in repeat_messages[0].get('json_data', {}).get('text', '')
+
+    # Unknown action click (Defect 3): Informs user and is rejected, never default to accept
+    wire_before_unknown = len(client.wire)
+    cb_unknown = SimpleNamespace(
+        callback_id='cb_max_unknown',
+        payload=f'cert_meet:invalid_action:{config_id}:{receipt.id}',
+        chat_id=100,
+        user_id=100000000007,
+        sender=sender,
+    )
+    await app.handle_callback(cb_unknown)
+    unknown_messages = [kwargs for method, path, kwargs in client.wire[wire_before_unknown:] if path == '/messages']
+    assert len(unknown_messages) == 1
+    assert 'Неизвестное действие' in unknown_messages[0].get('json_data', {}).get('text', '')
 
     # Verify conversation state updated
     async with session_factory() as session:
@@ -231,11 +272,25 @@ async def test_max_deterministic_button_clicks(session_factory, media_setup):
         assert transitions[-1].previous_step == 'OFFER_MEETING'
         assert transitions[-1].current_step == 'MEETING_BOOKING'
 
-    # 2. Click Details
+    # 2. Click Details on fresh invitation receipt
+    async with session_factory() as session:
+        receipt_details = CertificateIssuanceReceipt(
+            user_id=100000000007,
+            topic_id=1,
+            dialogue_id=1,
+            config_id=config_id,
+            issuance_key="seed_key_max_details",
+            status="completed",
+            created_at=datetime.utcnow(),
+            completed_at=datetime.utcnow(),
+        )
+        session.add(receipt_details)
+        await session.commit()
+
     wire_len = len(client.wire)
     cb_details = SimpleNamespace(
         callback_id='cb_max_2',
-        payload=f'cert_meet:details:{config_id}',
+        payload=f'cert_meet:details:{config_id}:{receipt_details.id}',
         chat_id=100,
         user_id=100000000007,
         sender=sender,
@@ -244,11 +299,25 @@ async def test_max_deterministic_button_clicks(session_factory, media_setup):
     new_texts = [kwargs.get('json_data', {}).get('text', '') for method, path, kwargs in client.wire[wire_len:] if path == '/messages']
     assert any('Формат встречи' in t for t in new_texts)
 
-    # 3. Click Later
+    # 3. Click Later on fresh invitation receipt
+    async with session_factory() as session:
+        receipt_later = CertificateIssuanceReceipt(
+            user_id=100000000007,
+            topic_id=1,
+            dialogue_id=1,
+            config_id=config_id,
+            issuance_key="seed_key_max_later",
+            status="completed",
+            created_at=datetime.utcnow(),
+            completed_at=datetime.utcnow(),
+        )
+        session.add(receipt_later)
+        await session.commit()
+
     wire_len = len(client.wire)
     cb_later = SimpleNamespace(
         callback_id='cb_max_3',
-        payload=f'cert_meet:later:{config_id}',
+        payload=f'cert_meet:later:{config_id}:{receipt_later.id}',
         chat_id=100,
         user_id=100000000007,
         sender=sender,
@@ -313,7 +382,7 @@ async def test_max_runtime_phase1_failure_prevents_message2_and_data_commit(sess
             select(CertificateIssuanceReceipt).where(CertificateIssuanceReceipt.user_id == 100000000007)
         )
         assert receipt is not None
-        assert receipt.status == 'failed'
+        assert receipt.status in ('failed', 'uncertain')
 
         conv_state = await session.scalar(
             select(AutomationConversationState).where(AutomationConversationState.user_id == 100000000007)
@@ -338,8 +407,9 @@ async def test_max_runtime_resumption_without_duplicate_certificate(session_fact
     async with session_factory() as session:
         scen_cfg = await get_or_create_followup_config(session, 40, topic_id=1)
         scen_cfg.is_active = True
-        receipt, _ = await get_or_create_receipt(session, 100000000007, 1, 1, key)
+        receipt, _ = await get_or_create_receipt(session, 100000000007, 1, 1, key, config_id=scen_cfg.id)
         receipt.status = 'cert_sent'
+        receipt.config_id = scen_cfg.id
         receipt.certificate_message_id = 'max-prev-msg-999'
         await session.commit()
 

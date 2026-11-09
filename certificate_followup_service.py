@@ -1,4 +1,5 @@
 import hashlib
+import html
 import json
 import logging
 import re
@@ -6,7 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import (
@@ -17,7 +18,7 @@ from database import (
     MediaLibrary,
     User,
 )
-from event_content_validator import TelegramHtmlValidator
+from event_content_validator import TelegramHtmlValidator, utf16_code_units_len
 
 log = logging.getLogger(__name__)
 
@@ -58,7 +59,56 @@ ALLOWED_CAPTION_VARS = {"name", "fio", "recipient", "date"}
 ALLOWED_INVITE_VARS = {"name"}
 
 
-def validate_caption_template(template: str) -> None:
+def render_caption_safe(
+    template: str,
+    context: dict[str, Any],
+    max_limit: int = 1024,
+) -> tuple[str, list[str]]:
+    """
+    Renders certificate caption safely:
+    - Escapes all user inputs (name, fio, recipient, date) so raw characters do not break HTML.
+    - Validates resulting HTML structure with TelegramHtmlValidator.
+    - Strictly checks UTF-16 code units length against max_limit (no silent truncation!).
+    - If length exceeds limit or HTML is invalid, returns safe fallback and list of errors.
+    """
+    raw_template = (template or DEFAULT_CAPTION_TEMPLATE).strip()
+    raw_name = str(context.get("name") or "").strip()
+    raw_fio = str(context.get("fio") or context.get("recipient") or raw_name).strip()
+    raw_date = str(context.get("date") or "").strip()
+
+    # Safely HTML-escape user parameters
+    escaped_values = {
+        "name": html.escape(raw_name or raw_fio, quote=False),
+        "fio": html.escape(raw_fio or raw_name, quote=False),
+        "recipient": html.escape(raw_fio or raw_name, quote=False),
+        "date": html.escape(raw_date, quote=False),
+    }
+
+    result = raw_template
+    for key, val in escaped_values.items():
+        result = result.replace(f"{{{key}}}", val)
+
+    errors: list[str] = []
+    try:
+        TelegramHtmlValidator.validate(result)
+    except Exception as exc:
+        errors.append(f"Ошибка валидации HTML в подписи: {exc}")
+
+    actual_length = utf16_code_units_len(result)
+    if actual_length > max_limit:
+        errors.append(
+            f"Длина подписи ({actual_length} UTF-16 символов) превышает лимит {max_limit} символов."
+        )
+
+    if errors:
+        safe_name = html.escape((raw_name or raw_fio)[:40], quote=False)
+        fallback = f"🎓 Поздравляем, <b>{safe_name}</b>! Ваш сертификат готов." if safe_name else "🎓 Ваш сертификат готов."
+        return fallback, errors
+
+    return result, []
+
+
+def validate_caption_template(template: str, max_limit: int = 1024) -> None:
     clean = (template or "").strip()
     if not clean:
         raise ValueError("Подпись к сертификату не может быть пустой.")
@@ -69,8 +119,19 @@ def validate_caption_template(template: str) -> None:
             raise ValueError(f"Неизвестная переменная {{{var_name}}}. Доступны: {allowed_str}")
     TelegramHtmlValidator.validate(clean)
 
+    # Check length using standard sample values to verify bounds
+    sample_context = {
+        "name": "Иван Иванович Иванов",
+        "fio": "Иванов Иван Иванович",
+        "recipient": "Иванов Иван Иванович",
+        "date": "09.11.2026",
+    }
+    rendered, errors = render_caption_safe(clean, sample_context, max_limit=max_limit)
+    if errors:
+        raise ValueError("; ".join(errors))
 
-def validate_invitation_text(text: str) -> None:
+
+def validate_invitation_text(text: str, max_limit: int = 4096) -> None:
     clean = (text or "").strip()
     if not clean:
         raise ValueError("Текст приглашения не может быть пустым.")
@@ -79,6 +140,8 @@ def validate_invitation_text(text: str) -> None:
         if var_name not in ALLOWED_INVITE_VARS:
             raise ValueError(f"Неизвестная переменная {{{var_name}}}. Доступна только {{name}}")
     TelegramHtmlValidator.validate(clean)
+    if utf16_code_units_len(clean) > max_limit:
+        raise ValueError(f"Длина текста приглашения превышает лимит {max_limit} символов.")
 
 
 def validate_stage_identifier(stage: str) -> str:
@@ -117,29 +180,17 @@ def parse_buttons_config(raw: Any) -> list[dict[str, str]]:
     return valid if valid else [dict(b) for b in DEFAULT_BUTTONS_CONFIG]
 
 
-def render_caption(template: str, context: dict[str, Any]) -> str:
-    if not template:
-        template = DEFAULT_CAPTION_TEMPLATE
-    name = str(context.get("name") or "").strip()
-    fio = str(context.get("fio") or context.get("recipient") or name).strip()
-    date_str = str(context.get("date") or "").strip()
-    values = {
-        "name": name or fio,
-        "fio": fio or name,
-        "recipient": fio or name,
-        "date": date_str,
-    }
-    result = template
-    for key, val in values.items():
-        result = result.replace(f"{{{key}}}", val)
-    return result
+def render_caption(template: str, context: dict[str, Any], max_limit: int = 1024) -> str:
+    rendered, _ = render_caption_safe(template, context, max_limit=max_limit)
+    return rendered
 
 
 def render_invitation(text: str, context: dict[str, Any]) -> str:
     if not text:
         text = DEFAULT_INVITATION_TEXT
     name = str(context.get("name") or "").strip()
-    return text.replace("{name}", name)
+    safe_name = html.escape(name, quote=False)
+    return text.replace("{name}", safe_name)
 
 
 def make_issuance_key(media_id: int, user_id: int, recipient: str, date: str | None = None) -> str:
@@ -162,10 +213,12 @@ async def get_or_create_followup_config(
     if config is not None:
         return config
 
+    # Requirement 1: Scenario must be created INACTIVE.
+    # Opening «После выдачи» does not activate scenario; publication requires explicit admin action.
     config = CertificateFollowupConfig(
         media_id=media_id,
         topic_id=topic_id,
-        is_active=True,
+        is_active=False,
         caption_template=DEFAULT_CAPTION_TEMPLATE,
         invitation_text=DEFAULT_INVITATION_TEXT,
         buttons_config_json=json.dumps(DEFAULT_BUTTONS_CONFIG, ensure_ascii=False),
@@ -240,22 +293,42 @@ async def update_followup_button(
     return config
 
 
-def build_followup_telegram_keyboard(config: CertificateFollowupConfig) -> InlineKeyboardMarkup:
+def build_followup_telegram_keyboard(
+    config: CertificateFollowupConfig,
+    receipt_id: int | None = None,
+    *,
+    is_test: bool = False,
+) -> InlineKeyboardMarkup:
     buttons = parse_buttons_config(config.buttons_config_json)
     rows = []
     for btn in buttons:
-        callback_data = f"cert_meet:{btn['id']}:{config.id}"
+        if is_test:
+            callback_data = f"cert_meet:test:{config.id}:{btn['id']}"
+        elif receipt_id is not None:
+            callback_data = f"cert_meet:{btn['id']}:{config.id}:{receipt_id}"
+        else:
+            callback_data = f"cert_meet:{btn['id']}:{config.id}:0"
         rows.append([InlineKeyboardButton(text=btn["text"], callback_data=callback_data)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_followup_max_keyboard(config: CertificateFollowupConfig) -> list[dict[str, Any]]:
+def build_followup_max_keyboard(
+    config: CertificateFollowupConfig,
+    receipt_id: int | None = None,
+    *,
+    is_test: bool = False,
+) -> list[dict[str, Any]]:
     from max_messenger_bot.keyboards import callback_button, inline_keyboard
 
     buttons = parse_buttons_config(config.buttons_config_json)
     rows = []
     for btn in buttons:
-        callback_data = f"cert_meet:{btn['id']}:{config.id}"
+        if is_test:
+            callback_data = f"cert_meet:test:{config.id}:{btn['id']}"
+        elif receipt_id is not None:
+            callback_data = f"cert_meet:{btn['id']}:{config.id}:{receipt_id}"
+        else:
+            callback_data = f"cert_meet:{btn['id']}:{config.id}:0"
         rows.append([callback_button(btn["text"], callback_data)])
     return inline_keyboard(rows)
 
@@ -266,6 +339,8 @@ async def get_or_create_receipt(
     topic_id: int,
     dialogue_id: int,
     issuance_key: str,
+    config_id: int | None = None,
+    deferred_data_json: str | None = None,
 ) -> tuple[CertificateIssuanceReceipt, bool]:
     existing = await session.scalar(
         select(CertificateIssuanceReceipt).where(
@@ -276,6 +351,10 @@ async def get_or_create_receipt(
         )
     )
     if existing is not None:
+        if config_id and not existing.config_id:
+            existing.config_id = config_id
+        if deferred_data_json and not existing.deferred_data_json:
+            existing.deferred_data_json = deferred_data_json
         return existing, False
 
     receipt = CertificateIssuanceReceipt(
@@ -284,18 +363,30 @@ async def get_or_create_receipt(
         dialogue_id=dialogue_id,
         issuance_key=issuance_key,
         status="started",
+        config_id=config_id,
+        deferred_data_json=deferred_data_json,
     )
     session.add(receipt)
     await session.flush()
     return receipt, True
 
 
-async def mark_receipt_cert_sent(session: AsyncSession, receipt_id: int, message_id: str | None = None) -> None:
+async def mark_receipt_cert_sent(
+    session: AsyncSession,
+    receipt_id: int,
+    message_id: str | None = None,
+    config_id: int | None = None,
+    deferred_data_json: str | None = None,
+) -> None:
     receipt = await session.get(CertificateIssuanceReceipt, receipt_id)
     if receipt:
         receipt.status = "cert_sent"
         if message_id:
             receipt.certificate_message_id = str(message_id)
+        if config_id:
+            receipt.config_id = config_id
+        if deferred_data_json:
+            receipt.deferred_data_json = deferred_data_json
         await session.commit()
 
 
@@ -325,6 +416,110 @@ async def mark_receipt_uncertain(session: AsyncSession, receipt_id: int, error: 
         receipt.status = "uncertain"
         receipt.error_details = str(error)[:1000]
         await session.commit()
+
+
+async def claim_receipt_for_invitation(
+    session: AsyncSession,
+    receipt_id: int,
+) -> bool:
+    """
+    Atomic compare-and-swap claiming the receipt to deliver the invitation.
+    Guarantees that concurrent handlers cannot deliver duplicate invitations.
+    """
+    stmt = (
+        update(CertificateIssuanceReceipt)
+        .where(
+            CertificateIssuanceReceipt.id == receipt_id,
+            CertificateIssuanceReceipt.status == "cert_sent",
+        )
+        .values(status="resuming_invite")
+    )
+    res = await session.execute(stmt)
+    await session.commit()
+    return bool(res.rowcount and res.rowcount > 0)
+
+
+async def find_pending_followup_receipt(
+    session: AsyncSession,
+    user_id: int,
+    topic_id: int,
+    dialogue_id: int,
+) -> CertificateIssuanceReceipt | None:
+    return await session.scalar(
+        select(CertificateIssuanceReceipt).where(
+            CertificateIssuanceReceipt.user_id == user_id,
+            CertificateIssuanceReceipt.topic_id == topic_id,
+            CertificateIssuanceReceipt.dialogue_id == dialogue_id,
+            CertificateIssuanceReceipt.status == "cert_sent",
+        ).order_by(CertificateIssuanceReceipt.id.desc())
+    )
+
+
+def override_service_blocks_target_stage(
+    blocks: list[Any], target_stage: str
+) -> list[Any]:
+    """
+    Enforces admin priority: ensures that admin's target_stage strictly overrides
+    any conflicting current_step emitted by AI inside <DATA> blocks.
+    """
+    if not target_stage or not blocks:
+        return blocks
+    from user_metadata import ServiceDataBlock
+    overridden = []
+    for b in blocks:
+        new_state = dict(getattr(b, "current_state", None) or {})
+        new_state["current_step"] = target_stage
+        overridden.append(
+            ServiceDataBlock(
+                current_state=new_state,
+                events=list(getattr(b, "events", []) or []),
+                metadata=dict(getattr(b, "metadata", None) or {}),
+                save_mode=getattr(b, "save_mode", "merge"),
+                raw_json=getattr(b, "raw_json", "{}"),
+                legacy=getattr(b, "legacy", False),
+            )
+        )
+    return overridden
+
+
+def serialize_service_blocks(blocks: list[Any] | None) -> str | None:
+    if not blocks:
+        return None
+    data = []
+    for b in blocks:
+        data.append({
+            "current_state": getattr(b, "current_state", {}),
+            "events": getattr(b, "events", []),
+            "metadata": getattr(b, "metadata", {}),
+            "save_mode": getattr(b, "save_mode", "merge"),
+            "raw_json": getattr(b, "raw_json", "{}"),
+            "legacy": getattr(b, "legacy", False),
+        })
+    return json.dumps(data, ensure_ascii=False)
+
+
+def deserialize_service_blocks(raw: str | None) -> list[Any]:
+    if not raw:
+        return []
+    from user_metadata import ServiceDataBlock
+    try:
+        items = json.loads(raw)
+        blocks = []
+        for item in items:
+            blocks.append(
+                ServiceDataBlock(
+                    current_state=dict(item.get("current_state") or {}),
+                    events=list(item.get("events") or []),
+                    metadata=dict(item.get("metadata") or {}),
+                    save_mode=str(item.get("save_mode") or "merge"),
+                    raw_json=str(item.get("raw_json") or "{}"),
+                    legacy=bool(item.get("legacy", False)),
+                )
+            )
+        return blocks
+    except Exception as exc:
+        log.warning("Failed to deserialize service blocks: %s", exc)
+        return []
 
 
 async def transition_user_to_stage(
@@ -382,27 +577,245 @@ async def transition_user_to_stage(
         )
 
 
+async def resume_pending_certificate_followup(
+    bot_or_client: Any,
+    user_id: int,
+    topic_id: int,
+    dialogue_id: int,
+    session_maker: Any,
+    *,
+    platform: str = "telegram",
+) -> bool:
+    """
+    Resumes delivery of Message 2 (invitation) if Message 1 (certificate) was already delivered
+    (status == 'cert_sent').
+    - Does NOT re-send certificate (zero duplication).
+    - Does NOT require AI to issue RENDER_IMG_MEDIA again.
+    - Protected against concurrent execution via atomic status claim ('resuming_invite').
+    - Applies deferred data blocks with admin target_stage priority.
+    """
+    receipt_id = None
+    config_id = None
+    deferred_raw = None
+
+    async with session_maker() as session:
+        receipt = await find_pending_followup_receipt(session, user_id, topic_id, dialogue_id)
+        if receipt is None:
+            return False
+        receipt_id = receipt.id
+        config_id = receipt.config_id
+        deferred_raw = receipt.deferred_data_json
+
+    async with session_maker() as session:
+        claimed = await claim_receipt_for_invitation(session, receipt_id)
+        if not claimed:
+            # Another concurrent handler already claimed resumption
+            return False
+
+    async with session_maker() as session:
+        scen_cfg = await session.get(CertificateFollowupConfig, config_id) if config_id else None
+        if scen_cfg is None or not scen_cfg.is_active:
+            # Config missing or disabled; close receipt without duplicate action
+            await mark_receipt_completed(session, receipt_id)
+            return False
+
+        user = await session.get(User, user_id)
+        user_context = {
+            "name": (user.name if user else "") or "",
+            "fio": (user.name if user else "") or "",
+            "date": "",
+        }
+
+    invite_text = render_invitation(scen_cfg.invitation_text, user_context)
+
+    sent_msg_id = None
+    try:
+        if platform == "telegram":
+            keyboard = build_followup_telegram_keyboard(scen_cfg, receipt_id=receipt_id)
+            sent = await bot_or_client.send_message(
+                chat_id=user_id,
+                text=invite_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            sent_msg_id = getattr(sent, "message_id", None)
+        else:
+            keyboard = build_followup_max_keyboard(scen_cfg, receipt_id=receipt_id)
+            sent = await bot_or_client.send_message(
+                chat_id=user_id,
+                text=invite_text,
+                attachments=keyboard,
+            )
+            sent_msg_id = str(sent) if sent else None
+    except Exception as exc:
+        log.error("Failed to deliver resumed invitation user_id=%s: %s", user_id, exc)
+        # Reset back to cert_sent so future interaction can retry
+        async with session_maker() as session:
+            r = await session.get(CertificateIssuanceReceipt, receipt_id)
+            if r and r.status == "resuming_invite":
+                r.status = "cert_sent"
+                await session.commit()
+        return False
+
+    # Mark completed and transition stage
+    async with session_maker() as session:
+        await mark_receipt_completed(session, receipt_id, invitation_message_id=str(sent_msg_id) if sent_msg_id else None)
+        if scen_cfg.target_stage:
+            await transition_user_to_stage(session, user_id, topic_id, dialogue_id, scen_cfg.target_stage)
+        await session.commit()
+
+    # Apply deferred service blocks if any, with admin stage priority
+    if deferred_raw:
+        deferred_blocks = deserialize_service_blocks(deferred_raw)
+        if deferred_blocks:
+            from automation_engine import apply_service_data_blocks, persist_service_data_blocks
+            if scen_cfg.target_stage:
+                deferred_blocks = override_service_blocks_target_stage(deferred_blocks, scen_cfg.target_stage)
+            await persist_service_data_blocks(
+                session_maker,
+                user_id=user_id,
+                dialogue_id=dialogue_id,
+                topic_id=topic_id,
+                blocks=deferred_blocks,
+                apply_fn=apply_service_data_blocks,
+            )
+
+    return True
+
+
+class CertCallbackResult:
+    def __init__(
+        self,
+        success: bool,
+        response_text: str = "",
+        alert_text: str = "",
+        target_step: str | None = None,
+        is_repeat: bool = False,
+        is_test: bool = False,
+    ):
+        self.success = success
+        self.response_text = response_text
+        self.alert_text = alert_text
+        self.target_step = target_step
+        self.is_repeat = is_repeat
+        self.is_test = is_test
+
+
 async def handle_cert_meet_click(
     session_maker: Any,
     user_id: int,
     topic_id: int,
     dialogue_id: int,
-    action_id: str,
-    config_id: int,
-) -> tuple[str, str]:
+    callback_data: str,
+    *,
+    is_admin_user: bool = False,
+) -> CertCallbackResult:
+    """
+    Handles cert_meet callback query with strict validations:
+    - Rejects unknown config_id / action_id (never defaults to accept).
+    - Requires active scenario config.
+    - Requires confirmed issuance receipt for matching user, topic, dialogue.
+    - Detects repeat clicks (idempotency): does not alter stage or re-send messages.
+    - Handles test send clicks without modifying admin's real dialogue stage.
+    """
+    parts = (callback_data or "").split(":")
+    if len(parts) < 3 or parts[0] != "cert_meet":
+        return CertCallbackResult(False, alert_text="Некорректный формат данных кнопки.")
+
+    # 1. Test click path: cert_meet:test:<config_id>:<action_id>
+    if parts[1] == "test":
+        if not is_admin_user:
+            return CertCallbackResult(False, alert_text="⛔️ Тестовые кнопки доступны только администраторам.")
+        if len(parts) < 4:
+            return CertCallbackResult(False, alert_text="Некорректный формат тестовой кнопки.")
+        try:
+            config_id = int(parts[2])
+        except ValueError:
+            return CertCallbackResult(False, alert_text="Некорректный ID конфигурации.")
+        action_id = parts[3]
+
+        async with session_maker() as session:
+            config = await session.get(CertificateFollowupConfig, config_id)
+            if not config:
+                return CertCallbackResult(False, alert_text="Сценарий не найден.")
+            buttons = parse_buttons_config(config.buttons_config_json)
+            btn = next((b for b in buttons if b["id"] == action_id), None)
+            if not btn:
+                return CertCallbackResult(False, alert_text="Кнопка не найдена в сценарии.")
+
+            # Test mode: do NOT update user.current_step, do NOT record transition
+            return CertCallbackResult(
+                True,
+                response_text=f"🧪 [Тест] Ответ бота:\n{btn.get('response_text', '')}\n\n(Ваш реальный этап диалога не изменён)",
+                alert_text=f"🧪 Тестовый выбор: «{btn['text']}». Реальный этап не изменён.",
+                target_step=btn["target_step"],
+                is_test=True,
+            )
+
+    # 2. Production click path: cert_meet:<action_id>:<config_id>[:<receipt_id>]
+    action_id = parts[1]
+    try:
+        config_id = int(parts[2])
+    except ValueError:
+        return CertCallbackResult(False, alert_text="Некорректный ID сценария.")
+
+    receipt_id = None
+    if len(parts) >= 4 and parts[3].isdigit():
+        receipt_id = int(parts[3])
+
     async with session_maker() as session:
+        # Check active config
         config = await session.get(CertificateFollowupConfig, config_id)
         if config is None:
-            buttons = DEFAULT_BUTTONS_CONFIG
-        else:
-            buttons = parse_buttons_config(config.buttons_config_json)
+            return CertCallbackResult(False, alert_text="❌ Сценарий не найден или был удалён.")
+        if not config.is_active:
+            return CertCallbackResult(False, alert_text="⚠️ Этот сценарий сейчас отключен администратором.")
 
-        button_match = next((b for b in buttons if b["id"] == action_id), None)
-        if not button_match:
-            button_match = DEFAULT_BUTTONS_CONFIG[0]
+        # Match button
+        buttons = parse_buttons_config(config.buttons_config_json)
+        btn = next((b for b in buttons if b["id"] == action_id), None)
+        if not btn:
+            return CertCallbackResult(False, alert_text="❌ Неизвестное действие кнопки.")
 
-        target_step = button_match["target_step"]
-        response_text = button_match.get("response_text") or "Спасибо за ответ!"
+        # Find confirmed receipt
+        receipt = None
+        if receipt_id and receipt_id > 0:
+            receipt = await session.get(CertificateIssuanceReceipt, receipt_id)
+        if receipt is None:
+            receipt = await session.scalar(
+                select(CertificateIssuanceReceipt).where(
+                    CertificateIssuanceReceipt.user_id == user_id,
+                    CertificateIssuanceReceipt.topic_id == topic_id,
+                    CertificateIssuanceReceipt.dialogue_id == dialogue_id,
+                    CertificateIssuanceReceipt.config_id == config_id,
+                ).order_by(CertificateIssuanceReceipt.id.desc())
+            )
+
+        if receipt is None:
+            return CertCallbackResult(False, alert_text="❌ Подтверждение выдачи сертификата не найдено.")
+
+        if receipt.user_id != user_id or receipt.topic_id != topic_id or receipt.dialogue_id != dialogue_id:
+            return CertCallbackResult(False, alert_text="⛔️ Приглашение не принадлежит вашему текущему диалогу.")
+
+        if receipt.status not in ("cert_sent", "completed", "resuming_invite"):
+            return CertCallbackResult(False, alert_text="⚠️ Сертификат ещё не был успешно доставлен.")
+
+        # Idempotency / Repeat click check
+        if receipt.selected_button_id is not None:
+            prev_btn = next((b for b in buttons if b["id"] == receipt.selected_button_id), None)
+            prev_label = prev_btn["text"] if prev_btn else receipt.selected_button_id
+            return CertCallbackResult(
+                False,
+                alert_text=f"ℹ️ Вы уже выбрали: «{prev_label}». Повторный выбор не требуется.",
+                is_repeat=True,
+            )
+
+        # Record first valid selection
+        receipt.selected_button_id = action_id
+        receipt.selected_at = datetime.utcnow()
+
+        target_step = btn["target_step"]
+        response_text = btn.get("response_text") or "Спасибо за ответ!"
 
         await transition_user_to_stage(
             session,
@@ -412,21 +825,17 @@ async def handle_cert_meet_click(
             target_step=target_step,
         )
         await session.commit()
-        return response_text, target_step
+
+        return CertCallbackResult(
+            True,
+            response_text=response_text,
+            alert_text="✅ Выбор сохранён.",
+            target_step=target_step,
+        )
 
 
 async def handle_cert_callback_max(client: Any, callback: Any) -> None:
     data = str(callback.payload or "")
-    parts = data.split(":")
-    if len(parts) >= 3 and parts[0] == "cert_meet":
-        action_id = parts[1]
-        try:
-            config_id = int(parts[2])
-        except ValueError:
-            config_id = 0
-    else:
-        return
-
     from database import async_session_maker
     user_id = callback.sender.user_id
     chat_id = callback.chat_id
@@ -435,15 +844,19 @@ async def handle_cert_callback_max(client: Any, callback: Any) -> None:
         user = await session.get(User, user_id)
         topic_id = user.current_topic_id if user and user.current_topic_id else 0
         dialogue_id = user.current_dialogue_id if user and user.current_dialogue_id else 1
+        is_admin = bool(user and getattr(user, "is_admin", False))
 
-    await client.answer_callback(callback.callback_id)
-    response_text, _ = await handle_cert_meet_click(
+    res = await handle_cert_meet_click(
         async_session_maker,
         user_id=user_id,
         topic_id=topic_id,
         dialogue_id=dialogue_id,
-        action_id=action_id,
-        config_id=config_id,
+        callback_data=data,
+        is_admin_user=is_admin,
     )
-    await client.send_message(chat_id=chat_id, text=response_text)
 
+    await client.answer_callback(callback.callback_id)
+    if not res.success and res.alert_text:
+        await client.send_message(chat_id=chat_id, text=res.alert_text)
+    elif res.success and res.response_text:
+        await client.send_message(chat_id=chat_id, text=res.response_text)

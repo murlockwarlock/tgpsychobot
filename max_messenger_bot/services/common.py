@@ -40,8 +40,12 @@ from certificate_followup_service import (
     mark_receipt_completed,
     mark_receipt_failed,
     mark_receipt_uncertain,
+    override_service_blocks_target_stage,
     render_caption,
+    render_caption_safe,
     render_invitation,
+    resume_pending_certificate_followup,
+    serialize_service_blocks,
     transition_user_to_stage,
 )
 from ..storage import MaxContentMedia, StateStore
@@ -1013,8 +1017,17 @@ async def _deliver_media_template(client, chat_id, user_id, response, dialogue_i
             recipient_str = str((rendered.values or {}).get("recipient") or "")
             issuance_key = make_issuance_key(rendered.media_id, user_id, recipient_str, rendered.actual_issue_date)
 
+            serialized_deferred = serialize_service_blocks(deferred_service_blocks)
             async with async_session_maker() as session:
-                receipt, is_new = await get_or_create_receipt(session, user_id, topic_id or 0, dialogue_id, issuance_key)
+                receipt, is_new = await get_or_create_receipt(
+                    session,
+                    user_id,
+                    topic_id or 0,
+                    dialogue_id,
+                    issuance_key,
+                    config_id=scen_cfg.id,
+                    deferred_data_json=serialized_deferred,
+                )
                 receipt_status = receipt.status
                 receipt_id = receipt.id
                 await session.commit()
@@ -1037,7 +1050,7 @@ async def _deliver_media_template(client, chat_id, user_id, response, dialogue_i
             if receipt_status == "cert_sent":
                 # Resume Phase 2: Send Message 2
                 invite_text = render_invitation(scen_cfg.invitation_text, user_context)
-                max_kb = build_followup_max_keyboard(scen_cfg)
+                max_kb = build_followup_max_keyboard(scen_cfg, receipt_id=receipt_id)
                 sent_invite = await client.send_message(chat_id=chat_id, text=invite_text, attachments=max_kb)
                 async with async_session_maker() as session:
                     await mark_receipt_completed(session, receipt_id, invitation_message_id=str(sent_invite) if sent_invite else None)
@@ -1045,20 +1058,24 @@ async def _deliver_media_template(client, chat_id, user_id, response, dialogue_i
                         await transition_user_to_stage(session, user_id, topic_id or 0, dialogue_id, scen_cfg.target_stage)
                     await session.commit()
                 if deferred_service_blocks:
+                    applied_blocks = deferred_service_blocks
+                    if scen_cfg.target_stage:
+                        applied_blocks = override_service_blocks_target_stage(applied_blocks, scen_cfg.target_stage)
                     await persist_service_data_blocks(
                         async_session_maker,
                         user_id=user_id,
                         dialogue_id=dialogue_id,
                         topic_id=topic_id,
-                        blocks=deferred_service_blocks,
+                        blocks=applied_blocks,
                         apply_fn=apply_service_data_blocks,
                     )
                 await save_ai_message(user_id, invite_text, dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)
                 return True
 
-            # Phase 1: Upload and deliver certificate
-            caption_text = render_caption(scen_cfg.caption_template, user_context)
-            max_caption = split_text(caption_text, 1024)[0] if caption_text else 'certificate.png'
+            # Phase 1: Upload and deliver certificate (safe caption rendering without silent slicing)
+            caption_text, caption_errors = render_caption_safe(scen_cfg.caption_template, user_context, max_limit=1024)
+            if caption_errors:
+                log.warning("MAX caption had errors: %s, using safe fallback", caption_errors)
 
             try:
                 with tempfile.NamedTemporaryFile(suffix='.png') as temporary:
@@ -1068,25 +1085,31 @@ async def _deliver_media_template(client, chat_id, user_id, response, dialogue_i
                 token = upload.get('token') or upload.get('fileId') or upload.get('id')
                 if not isinstance(token, str) or not token:
                     raise TemplateRenderError('Не удалось отправить заполненный шаблон.')
-                sent_cert = await client.send_media_attachment(chat_id=chat_id, media_type='file', token=token, caption=max_caption)
+                sent_cert = await client.send_media_attachment(chat_id=chat_id, media_type='file', token=token, caption=caption_text)
             except (asyncio.TimeoutError, TimeoutError) as to_err:
                 async with async_session_maker() as session:
                     await mark_receipt_uncertain(session, receipt_id, str(to_err))
                 raise
             except Exception as send_err:
                 async with async_session_maker() as session:
-                    await mark_receipt_failed(session, receipt_id, str(send_err))
+                    await mark_receipt_uncertain(session, receipt_id, str(send_err))
                 raise
 
             if not await current():
                 return True
 
             async with async_session_maker() as session:
-                await mark_receipt_cert_sent(session, receipt_id, message_id=str(sent_cert) if sent_cert else None)
+                await mark_receipt_cert_sent(
+                    session,
+                    receipt_id,
+                    message_id=str(sent_cert) if sent_cert else None,
+                    config_id=scen_cfg.id,
+                    deferred_data_json=serialized_deferred,
+                )
 
             # Phase 2: Deliver Message 2 (Invitation + MAX buttons)
             invite_text = render_invitation(scen_cfg.invitation_text, user_context)
-            max_kb = build_followup_max_keyboard(scen_cfg)
+            max_kb = build_followup_max_keyboard(scen_cfg, receipt_id=receipt_id)
             try:
                 sent_invite = await client.send_message(chat_id=chat_id, text=invite_text, attachments=max_kb)
             except Exception as inv_err:
@@ -1101,12 +1124,15 @@ async def _deliver_media_template(client, chat_id, user_id, response, dialogue_i
                 await session.commit()
 
             if deferred_service_blocks:
+                applied_blocks = deferred_service_blocks
+                if scen_cfg.target_stage:
+                    applied_blocks = override_service_blocks_target_stage(applied_blocks, scen_cfg.target_stage)
                 await persist_service_data_blocks(
                     async_session_maker,
                     user_id=user_id,
                     dialogue_id=dialogue_id,
                     topic_id=topic_id,
-                    blocks=deferred_service_blocks,
+                    blocks=applied_blocks,
                     apply_fn=apply_service_data_blocks,
                 )
 
@@ -1235,6 +1261,16 @@ async def _execute_ai_dialogue_turn(
     final_prompt = prompt_text
     if topic_phrase:
         final_prompt = f"{prompt_text}\n\nКонтекст для ответа: {topic_phrase}"
+
+    # Requirement 5: Resume pending invitation delivery if cert was sent but invite was interrupted
+    await resume_pending_certificate_followup(
+        client,
+        user_id=user_id,
+        topic_id=request_topic_id or 0,
+        dialogue_id=request_dialogue_id or 1,
+        session_maker=async_session_maker,
+        platform="max",
+    )
 
     try:
         resp_capture = {}

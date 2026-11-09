@@ -2170,7 +2170,8 @@ async def get_ai_response(
         if has_media_template and response_capture is not None:
             response_capture["deferred_service_blocks"] = service_blocks
 
-        if service_blocks and not has_media_template:
+        # If response_capture is None, or there is no media template: persist immediately
+        if service_blocks and (not has_media_template or response_capture is None):
             try:
                 await persist_service_data_blocks(
                     async_session_maker,

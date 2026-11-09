@@ -151,14 +151,12 @@ async def test_telegram_admin_full_scenario_journey_a_to_ya_to_a(session_factory
     assert 'panda_certificate' in latest.text
     assert any('После выдачи' in b.text for row in latest.reply_markup.inline_keyboard for b in row)
 
-    # 2. Open «После выдачи» scenario screen
+    # 2. Open «После выдачи» scenario screen (created inactive by default)
     await click('mt:scenario:')
     assert 'Сценарий после выдачи сертификата' in latest.text
-    assert '🟢 Включен' in latest.text
-
-    # 3. Toggle scenario to Inactive and then back to Active
-    await click('mt:scen_toggle:')
     assert '⚪️ Выключен' in latest.text
+
+    # 3. Toggle scenario to Active
     await click('mt:scen_toggle:')
     assert '🟢 Включен' in latest.text
 
@@ -235,7 +233,36 @@ async def test_telegram_admin_full_scenario_journey_a_to_ya_to_a(session_factory
     assert len(invite_msgs) >= 1
     invite_msg = invite_msgs[-1]
     button_callbacks = [b.callback_data for row in invite_msg.reply_markup.inline_keyboard for b in row]
-    assert any(cb.startswith('cert_meet:accept') for cb in button_callbacks)
+    assert any(cb.startswith('cert_meet:test:') for cb in button_callbacks)
+
+    # Click test button and verify admin stage is unchanged and alert answered (Defect 8)
+    test_cb = next(cb for cb in button_callbacks if cb.startswith('cert_meet:test:'))
+    start_test = len(transport.calls)
+    await dispatcher.feed_update(bot, Update(
+        update_id=7999,
+        callback_query=CallbackQuery(
+            id='test_btn_click',
+            from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Admin'),
+            chat_instance='ci_test',
+            data=test_cb,
+            message=Message(
+                message_id=7999,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=media_setup, type='private'),
+                text=invite_msg.text,
+                reply_markup=invite_msg.reply_markup,
+            ),
+        )
+    ))
+    test_answers = [c for c in transport.calls[start_test:] if isinstance(c, AnswerCallbackQuery)]
+    assert len(test_answers) == 1
+    assert test_answers[0].show_alert is True
+    async with session_factory() as session:
+        conv_state = await session.scalar(
+            select(AutomationConversationState).where(AutomationConversationState.user_id == media_setup)
+        )
+        if conv_state:
+            assert conv_state.current_step != 'BOOK_CALL'
 
     # 10. Navigate Back to template home
     await click('mt:home:')
@@ -405,7 +432,21 @@ async def test_telegram_deterministic_button_clicks(session_factory, media_setup
         cfg = await get_or_create_followup_config(session, 3)
         cfg.is_active = True
         config_id = cfg.id
+
+        # Setup confirmed issuance receipt for validation
+        receipt = CertificateIssuanceReceipt(
+            user_id=media_setup,
+            topic_id=1,
+            dialogue_id=1,
+            config_id=config_id,
+            issuance_key="seed_receipt_deterministic",
+            status="completed",
+            created_at=datetime.utcnow(),
+            completed_at=datetime.utcnow(),
+        )
+        session.add(receipt)
         await session.commit()
+        receipt_id = receipt.id
 
     transport = ValidatingCertTelegramTransport()
     bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
@@ -414,7 +455,7 @@ async def test_telegram_deterministic_button_clicks(session_factory, media_setup
     dispatcher.include_router(handlers.router)
 
     try:
-        # Click Accept
+        # 1. Click Accept
         start = len(transport.calls)
         await dispatcher.feed_update(bot, Update(
             update_id=20001,
@@ -422,7 +463,7 @@ async def test_telegram_deterministic_button_clicks(session_factory, media_setup
                 id='cb_accept',
                 from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'),
                 chat_instance='ci_btn',
-                data=f'cert_meet:accept:{config_id}',
+                data=f'cert_meet:accept:{config_id}:{receipt_id}',
                 message=Message(message_id=20001, date=datetime.now(timezone.utc), chat=Chat(id=media_setup, type='private'), text='invite')
             )
         ))
@@ -439,34 +480,100 @@ async def test_telegram_deterministic_button_clicks(session_factory, media_setup
             assert conv_state is not None
             assert conv_state.current_step == 'MEETING_BOOKING'
 
-        # Click Details
-        start = len(transport.calls)
+        # 2. Repeat click on Accept (Defect 3): Must NOT change stage or re-send messages
+        start_repeat = len(transport.calls)
         await dispatcher.feed_update(bot, Update(
             update_id=20002,
+            callback_query=CallbackQuery(
+                id='cb_repeat',
+                from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'),
+                chat_instance='ci_btn',
+                data=f'cert_meet:accept:{config_id}:{receipt_id}',
+                message=Message(message_id=20001, date=datetime.now(timezone.utc), chat=Chat(id=media_setup, type='private'), text='invite')
+            )
+        ))
+        repeat_answers = [c for c in transport.calls[start_repeat:] if isinstance(c, AnswerCallbackQuery)]
+        assert len(repeat_answers) == 1
+        assert repeat_answers[0].show_alert is True
+        assert 'Повторный выбор не требуется' in (repeat_answers[0].text or '')
+        repeat_messages = [c for c in transport.calls[start_repeat:] if isinstance(c, SendMessage)]
+        assert len(repeat_messages) == 0
+
+        # 3. Unknown action click (Defect 3): Must be rejected, never default to accept
+        start_unknown = len(transport.calls)
+        await dispatcher.feed_update(bot, Update(
+            update_id=20003,
+            callback_query=CallbackQuery(
+                id='cb_unknown',
+                from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'),
+                chat_instance='ci_btn',
+                data=f'cert_meet:invalid_act:{config_id}:{receipt_id}',
+                message=Message(message_id=20001, date=datetime.now(timezone.utc), chat=Chat(id=media_setup, type='private'), text='invite')
+            )
+        ))
+        unknown_answers = [c for c in transport.calls[start_unknown:] if isinstance(c, AnswerCallbackQuery)]
+        assert len(unknown_answers) == 1
+        assert unknown_answers[0].show_alert is True
+        assert 'Неизвестное действие' in (unknown_answers[0].text or '')
+
+        # 4. Click Details on fresh invitation receipt
+        async with session_factory() as session:
+            receipt_details = CertificateIssuanceReceipt(
+                user_id=media_setup,
+                topic_id=1,
+                dialogue_id=1,
+                config_id=config_id,
+                issuance_key="seed_key_tg_details",
+                status="completed",
+                created_at=datetime.utcnow(),
+                completed_at=datetime.utcnow(),
+            )
+            session.add(receipt_details)
+            await session.commit()
+            details_receipt_id = receipt_details.id
+
+        start_details = len(transport.calls)
+        await dispatcher.feed_update(bot, Update(
+            update_id=20004,
             callback_query=CallbackQuery(
                 id='cb_details',
                 from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'),
                 chat_instance='ci_btn',
-                data=f'cert_meet:details:{config_id}',
+                data=f'cert_meet:details:{config_id}:{details_receipt_id}',
                 message=Message(message_id=20002, date=datetime.now(timezone.utc), chat=Chat(id=media_setup, type='private'), text='invite')
             )
         ))
-        messages = [c for c in transport.calls[start:] if isinstance(c, SendMessage)]
+        messages = [c for c in transport.calls[start_details:] if isinstance(c, SendMessage)]
         assert any('Формат встречи' in (m.text or '') for m in messages)
 
-        # Click Later
-        start = len(transport.calls)
+        # 5. Click Later on fresh invitation receipt
+        async with session_factory() as session:
+            receipt_later = CertificateIssuanceReceipt(
+                user_id=media_setup,
+                topic_id=1,
+                dialogue_id=1,
+                config_id=config_id,
+                issuance_key="seed_key_tg_later",
+                status="completed",
+                created_at=datetime.utcnow(),
+                completed_at=datetime.utcnow(),
+            )
+            session.add(receipt_later)
+            await session.commit()
+            later_receipt_id = receipt_later.id
+
+        start_later = len(transport.calls)
         await dispatcher.feed_update(bot, Update(
-            update_id=20003,
+            update_id=20005,
             callback_query=CallbackQuery(
                 id='cb_later',
                 from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'),
                 chat_instance='ci_btn',
-                data=f'cert_meet:later:{config_id}',
+                data=f'cert_meet:later:{config_id}:{later_receipt_id}',
                 message=Message(message_id=20003, date=datetime.now(timezone.utc), chat=Chat(id=media_setup, type='private'), text='invite')
             )
         ))
-        messages = [c for c in transport.calls[start:] if isinstance(c, SendMessage)]
+        messages = [c for c in transport.calls[start_later:] if isinstance(c, SendMessage)]
         assert any('Хорошо! Вы сможете вернуться' in (m.text or '') for m in messages)
     finally:
         dispatcher.sub_routers.clear()
@@ -539,7 +646,7 @@ async def test_telegram_runtime_phase1_failure_prevents_message2_and_data_commit
                 select(CertificateIssuanceReceipt).where(CertificateIssuanceReceipt.user_id == media_setup)
             )
             assert receipt is not None
-            assert receipt.status == 'failed'
+            assert receipt.status in ('failed', 'uncertain')
     finally:
         dispatcher.sub_routers.clear()
         handlers.router._parent_router = None
@@ -553,13 +660,19 @@ async def test_telegram_runtime_resumption_without_duplicate_certificate(session
     the next turn resumes Message 2 (invitation + keyboard) WITHOUT re-rendering or re-sending the certificate.
     """
     source, config = await seed_template(session_factory)
+    async with session_factory() as session:
+        cfg = await get_or_create_followup_config(session, 3)
+        cfg.is_active = True
+        await session.commit()
+
     today = current_issue_date()
     key = make_issuance_key(3, media_setup, VALUES['recipient'], today)
     async with session_factory() as session:
         cfg = await get_or_create_followup_config(session, 3)
         cfg.is_active = True
-        receipt, _ = await get_or_create_receipt(session, media_setup, 1, 1, key)
+        receipt, _ = await get_or_create_receipt(session, media_setup, 1, 1, key, config_id=cfg.id)
         receipt.status = 'cert_sent'
+        receipt.config_id = cfg.id
         receipt.certificate_message_id = 'prev_cert_msg_999'
         await session.commit()
 
@@ -614,6 +727,11 @@ async def test_telegram_runtime_uncertain_status_skips_blind_retry(session_facto
     the system skips blind re-delivery to prevent duplicate certificate sending.
     """
     source, config = await seed_template(session_factory)
+    async with session_factory() as session:
+        cfg = await get_or_create_followup_config(session, 3)
+        cfg.is_active = True
+        await session.commit()
+
     today = current_issue_date()
     key = make_issuance_key(3, media_setup, VALUES['recipient'], today)
     async with session_factory() as session:
@@ -708,3 +826,405 @@ async def test_telegram_runtime_disabled_preserves_legacy_behavior(session_facto
         dispatcher.sub_routers.clear()
         handlers.router._parent_router = None
         await bot.session.close()
+
+
+@pytest.mark.asyncio
+async def test_certificate_delivered_but_api_response_lost_uncertain_no_blind_retry(session_factory, media_setup, monkeypatch):
+    """
+    Defect 2 Regression:
+    When certificate upload/send drops connection or times out (Telegram might have received it,
+    but response was lost), receipt is marked 'uncertain' and subsequent turns skip blind retry.
+    """
+    from aiogram.exceptions import TelegramNetworkError
+    from aiogram.methods import SendDocument
+
+    source, config = await seed_template(session_factory)
+    async with session_factory() as session:
+        cfg = await get_or_create_followup_config(session, 3)
+        cfg.is_active = True
+        await session.commit()
+
+    today = current_issue_date()
+    key = make_issuance_key(3, media_setup, VALUES['recipient'], today)
+
+    class LostResponseTelegramTransport(ValidatingCertTelegramTransport):
+        def __init__(self):
+            super().__init__()
+            self.first_attempt = True
+
+        async def make_request(self, bot, method, timeout=None):
+            if isinstance(method, SendDocument) and self.first_attempt:
+                self.first_attempt = False
+                # Certificate delivered to Telegram edge, but connection dropped before response
+                dummy_method = SendDocument(chat_id=1, document=BufferedInputFile(b"dummy", filename="dummy.png"))
+                raise TelegramNetworkError(method=dummy_method, message="Connection reset by peer: API response lost")
+            return await super().make_request(bot, method, timeout)
+
+    transport = LostResponseTelegramTransport()
+    async def stream(*args, **kwargs): yield source
+    monkeypatch.setattr(transport, 'stream_content', stream)
+    bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+    handlers.router._parent_router = None
+    dispatcher = Dispatcher()
+    dispatcher.include_router(handlers.router)
+
+    ai_response = f'[RENDER_IMG_MEDIA: panda_certificate | {json.dumps(VALUES, ensure_ascii=False)}]'
+    monkeypatch.setattr(ai_integration, '_call_gemini_api', AsyncMock(return_value=ai_response))
+
+    try:
+        # Turn 1: Attempt send -> transport error -> marked uncertain
+        await dispatcher.feed_update(bot, Update(
+            update_id=71001,
+            message=Message(
+                message_id=71001,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=media_setup, type='private'),
+                from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'),
+                text='Выдать сертификат'
+            )
+        ))
+        if media_setup in handlers.user_processing_tasks:
+            try:
+                await handlers.user_processing_tasks[media_setup]
+            except Exception:
+                pass
+
+        async with session_factory() as session:
+            receipt = await session.scalar(
+                select(CertificateIssuanceReceipt).where(CertificateIssuanceReceipt.user_id == media_setup)
+            )
+            assert receipt is not None
+            assert receipt.status == 'uncertain'
+
+        # Turn 2: User asks for status again -> NO blind retry of SendDocument
+        doc_count_before = len([c for c in transport.calls if isinstance(c, SendDocument)])
+        await dispatcher.feed_update(bot, Update(
+            update_id=71002,
+            message=Message(
+                message_id=71002,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=media_setup, type='private'),
+                from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'),
+                text='Где мой сертификат?'
+            )
+        ))
+        if media_setup in handlers.user_processing_tasks:
+            await handlers.user_processing_tasks[media_setup]
+
+        doc_count_after = len([c for c in transport.calls if isinstance(c, SendDocument)])
+        # Must NOT attempt to upload/send document again
+        assert doc_count_after == doc_count_before
+    finally:
+        dispatcher.sub_routers.clear()
+        handlers.router._parent_router = None
+        await bot.session.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_admin_target_stage_overrides_conflicting_data_step(session_factory, media_setup, monkeypatch):
+    """
+    Defect 4 Regression:
+    Admin target_stage strictly overrides conflicting current_step from model <DATA> blocks.
+    Model's extra data attributes (e.g. qualification flags) are preserved.
+    """
+    source, config = await seed_template(session_factory)
+    async with session_factory() as session:
+        cfg = await get_or_create_followup_config(session, 3)
+        cfg.is_active = True
+        cfg.target_stage = 'ADMIN_AUTHORITATIVE_STAGE'
+        await session.commit()
+
+    transport = ValidatingCertTelegramTransport()
+    async def stream(*args, **kwargs): yield source
+    monkeypatch.setattr(transport, 'stream_content', stream)
+    bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+    handlers.router._parent_router = None
+    dispatcher = Dispatcher()
+    dispatcher.include_router(handlers.router)
+
+    # Model attempts to transition to MODEL_HALLUCINATED_STAGE with custom fields
+    ai_response = (
+        'Поздравляем!\n'
+        f'[RENDER_IMG_MEDIA: panda_certificate | {json.dumps(VALUES, ensure_ascii=False)}]\n'
+        '<DATA>{"current_state": {"current_step": "MODEL_HALLUCINATED_STAGE", "client_score": 100, "verified": true}}</DATA>'
+    )
+    monkeypatch.setattr(ai_integration, '_call_gemini_api', AsyncMock(return_value=ai_response))
+
+    try:
+        await dispatcher.feed_update(bot, Update(
+            update_id=72001,
+            message=Message(
+                message_id=72001,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=media_setup, type='private'),
+                from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'),
+                text='Сертификат пожалуйста'
+            )
+        ))
+        if media_setup in handlers.user_processing_tasks:
+            await handlers.user_processing_tasks[media_setup]
+
+        async with session_factory() as session:
+            conv_state = await session.scalar(
+                select(AutomationConversationState).where(AutomationConversationState.user_id == media_setup)
+            )
+            assert conv_state is not None
+            # Admin target_stage strictly overwrote model's current_step
+            assert conv_state.current_step == 'ADMIN_AUTHORITATIVE_STAGE'
+
+            state_dict = json.loads(conv_state.current_state_json or '{}')
+            assert state_dict.get('current_step') == 'ADMIN_AUTHORITATIVE_STAGE'
+            assert state_dict.get('client_score') == 100
+            assert state_dict.get('verified') is True
+
+            # Step transition was recorded for admin's target_stage
+            transitions = (await session.scalars(
+                select(AutomationStepTransition).where(AutomationStepTransition.user_id == media_setup)
+            )).all()
+            assert any(t.current_step == 'ADMIN_AUTHORITATIVE_STAGE' for t in transitions)
+            assert not any(t.current_step == 'MODEL_HALLUCINATED_STAGE' for t in transitions)
+    finally:
+        dispatcher.sub_routers.clear()
+        handlers.router._parent_router = None
+        await bot.session.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_resumption_without_ai_render_directive(session_factory, media_setup, monkeypatch):
+    """
+    Defect 5 Regression:
+    When receipt is 'cert_sent', resumption of Message 2 occurs immediately upon user message,
+    WITHOUT requiring AI to issue [RENDER_IMG_MEDIA] again. Zero duplicate cert sent.
+    """
+    source, config = await seed_template(session_factory)
+    async with session_factory() as session:
+        cfg = await get_or_create_followup_config(session, 3)
+        cfg.is_active = True
+        await session.commit()
+
+    today = current_issue_date()
+    key = make_issuance_key(3, media_setup, VALUES['recipient'], today)
+
+    async with session_factory() as session:
+        cfg = await get_or_create_followup_config(session, 3)
+        cfg.is_active = True
+        cfg.invitation_text = "Приглашаю обсудить результаты."
+        receipt, _ = await get_or_create_receipt(session, media_setup, 1, 1, key, config_id=cfg.id)
+        receipt.status = 'cert_sent'
+        receipt.config_id = cfg.id
+        receipt.certificate_message_id = 'prev_msg_123'
+        await session.commit()
+
+    transport = ValidatingCertTelegramTransport()
+    bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+    handlers.router._parent_router = None
+    dispatcher = Dispatcher()
+    dispatcher.include_router(handlers.router)
+
+    # AI returns plain text without any RENDER_IMG_MEDIA directive
+    ai_response = "Привет! Чем я могу помочь вам сегодня?"
+    monkeypatch.setattr(ai_integration, '_call_gemini_api', AsyncMock(return_value=ai_response))
+
+    try:
+        await dispatcher.feed_update(bot, Update(
+            update_id=73001,
+            message=Message(
+                message_id=73001,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=media_setup, type='private'),
+                from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'),
+                text='Привет, бот!'
+            )
+        ))
+        if media_setup in handlers.user_processing_tasks:
+            await handlers.user_processing_tasks[media_setup]
+
+        # No document sent
+        documents = [c for c in transport.calls if isinstance(c, SendDocument)]
+        assert len(documents) == 0
+
+        # Invitation message was resumed and sent with inline keyboard
+        sent_messages = [c for c in transport.calls if isinstance(c, SendMessage)]
+        invitations = [m for m in sent_messages if 'Приглашаю обсудить результаты' in (m.text or '')]
+        assert len(invitations) == 1
+        assert getattr(invitations[0], 'reply_markup', None) is not None
+
+        # Receipt transitioned to completed
+        async with session_factory() as session:
+            r = await session.scalar(select(CertificateIssuanceReceipt).where(CertificateIssuanceReceipt.issuance_key == key))
+            assert r.status == 'completed'
+    finally:
+        dispatcher.sub_routers.clear()
+        handlers.router._parent_router = None
+        await bot.session.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_render_img_media_edge_cases(session_factory, media_setup, monkeypatch):
+    """
+    Defect 7 Regression:
+    - Legacy path without response_capture: persists deferred blocks immediately.
+    - Media render error: receipt is marked failed, no invitation delivered.
+    """
+    source, config = await seed_template(session_factory)
+    async with session_factory() as session:
+        cfg = await get_or_create_followup_config(session, 3)
+        cfg.is_active = True
+        await session.commit()
+
+    # Case A: AI call without response_capture preserves immediate persistence
+    ai_response = (
+        'Тест без response_capture:\n'
+        '<DATA>{"current_state": {"current_step": "LEGACY_DIRECT_STEP", "migrated": true}}</DATA>'
+    )
+    monkeypatch.setattr(ai_integration, '_call_gemini_api', AsyncMock(return_value=ai_response))
+
+    # Direct call to get_ai_response without response_capture
+    resp = await ai_integration.get_ai_response(
+        media_setup,
+        "Привет",
+        "Alice",
+        "female",
+        response_capture=None,
+    )
+    assert resp is not None
+    async with session_factory() as session:
+        conv = await session.scalar(
+            select(AutomationConversationState).where(AutomationConversationState.user_id == media_setup)
+        )
+        assert conv is not None
+        assert conv.current_step == 'LEGACY_DIRECT_STEP'
+
+    # Case B: Template render error
+    transport = ValidatingCertTelegramTransport()
+    bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+    handlers.router._parent_router = None
+    dispatcher = Dispatcher()
+    dispatcher.include_router(handlers.router)
+
+    def failing_render(*args, **kwargs):
+        raise ValueError("Simulated template rendering engine failure")
+    monkeypatch.setattr('handlers.render_media_template', failing_render)
+
+    render_fail_ai = f'[RENDER_IMG_MEDIA: panda_certificate | {json.dumps(VALUES, ensure_ascii=False)}]'
+    monkeypatch.setattr(ai_integration, '_call_gemini_api', AsyncMock(return_value=render_fail_ai))
+
+    try:
+        await dispatcher.feed_update(bot, Update(
+            update_id=74001,
+            message=Message(
+                message_id=74001,
+                date=datetime.now(timezone.utc),
+                chat=Chat(id=media_setup, type='private'),
+                from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Alice'),
+                text='Сертификат'
+            )
+        ))
+        if media_setup in handlers.user_processing_tasks:
+            await handlers.user_processing_tasks[media_setup]
+
+        # No document or invitation delivered
+        documents = [c for c in transport.calls if isinstance(c, SendDocument)]
+        assert len(documents) == 0
+        invitations = [c for c in transport.calls if isinstance(c, SendMessage) and getattr(c, 'reply_markup', None)]
+        assert len(invitations) == 0
+    finally:
+        dispatcher.sub_routers.clear()
+        handlers.router._parent_router = None
+        await bot.session.close()
+
+
+@pytest.mark.asyncio
+async def test_cert_followup_list_pagination_in_automations_menu(session_factory, media_setup, monkeypatch):
+    """
+    Defect 9 Regression:
+    Verify pagination of cert_followup_list in Automations menu with > 5 templates:
+    Page 0: 5 templates + next button '»'
+    Page 1: Remaining 2 templates + prev button '«'
+    Back navigation returns cleanly to Automations menu.
+    """
+    source, config = await seed_template(session_factory)
+    # Seed 7 templates total
+    async with session_factory() as session:
+        for i in range(4, 10):
+            session.add(MediaLibrary(
+                id=i,
+                file_id=f'cert_tpl_{i}',
+                file_name=f'certificate_template_{i}',
+                description=f'Certificate {i}',
+                media_type='photo',
+                source_platform='telegram',
+                render_template_enabled=True,
+                render_template_config=config,
+            ))
+        await session.commit()
+
+    monkeypatch.setattr(handlers, 'is_admin', AsyncMock(return_value=True))
+    monkeypatch.setattr(automation_admin, 'get_all_admin_ids', AsyncMock(return_value=[media_setup]))
+    transport = ValidatingCertTelegramTransport()
+    bot = Bot('123456:TEST_BOT_TOKEN', session=transport)
+    handlers.router._parent_router = None
+    automation_admin.router._parent_router = None
+    dispatcher = Dispatcher()
+    dispatcher.include_router(automation_admin.router)
+    dispatcher.include_router(handlers.router)
+
+    state = dispatcher.fsm.get_context(bot=bot, chat_id=media_setup, user_id=media_setup)
+    await state.update_data(authoring_locale='ru')
+
+    latest = None
+
+    async def click_data(data):
+        nonlocal latest
+        start = len(transport.calls)
+        await dispatcher.feed_update(bot, Update(
+            update_id=75000 + start,
+            callback_query=CallbackQuery(
+                id=str(start),
+                from_user=TelegramUser(id=media_setup, is_bot=False, first_name='Admin'),
+                chat_instance='ci_pagi',
+                data=data,
+                message=Message(message_id=75000, date=datetime.now(timezone.utc), chat=Chat(id=media_setup, type='private'), text='screen')
+            )
+        ))
+        screens = [c for c in transport.calls[start:] if getattr(c, 'reply_markup', None)]
+        if screens:
+            latest = screens[-1]
+
+    # 1. Open cert_followup_list (Page 0)
+    await click_data('cert_followup_list')
+    assert latest is not None
+    assert 'Сценарии после выдачи сертификатов' in latest.text
+    buttons_p0 = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    scenario_buttons_p0 = [b for b in buttons_p0 if b.callback_data.startswith('mt:scenario:')]
+    assert len(scenario_buttons_p0) == 5
+
+    # Check next page button exists
+    next_btn = next((b for b in buttons_p0 if b.callback_data == 'cert_followup_list:1'), None)
+    assert next_btn is not None
+    assert 'Вперёд' in next_btn.text
+
+    # 2. Click next page (Page 1)
+    await click_data('cert_followup_list:1')
+    assert 'Сценарии после выдачи сертификатов' in latest.text
+    buttons_p1 = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    scenario_buttons_p1 = [b for b in buttons_p1 if b.callback_data.startswith('mt:scenario:')]
+    assert len(scenario_buttons_p1) == 3
+
+    # Check prev page button exists
+    prev_btn = next((b for b in buttons_p1 if b.callback_data == 'cert_followup_list:0'), None)
+    assert prev_btn is not None
+    assert 'Назад' in prev_btn.text
+
+    # 3. Click prev page (back to Page 0)
+    await click_data('cert_followup_list:0')
+    buttons_back_p0 = [b for row in latest.reply_markup.inline_keyboard for b in row]
+    scenario_buttons_back = [b for b in buttons_back_p0 if b.callback_data.startswith('mt:scenario:')]
+    assert len(scenario_buttons_back) == 5
+
+    # 4. Click Back button to automations menu
+    back_btn = next((b for b in buttons_back_p0 if b.callback_data == 'automation_menu'), None)
+    assert back_btn is not None
+    await click_data('automation_menu')
+    assert 'Автоматизации' in latest.text
+

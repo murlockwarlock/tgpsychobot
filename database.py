@@ -1632,8 +1632,20 @@ def _migrate_media_templates(sync_conn):
 
 
 def _migrate_certificate_followup(sync_conn):
+    from sqlalchemy import inspect
     CertificateFollowupConfig.__table__.create(sync_conn, checkfirst=True)
     CertificateIssuanceReceipt.__table__.create(sync_conn, checkfirst=True)
+    inspector = inspect(sync_conn)
+    if inspector.has_table('certificate_issuance_receipts'):
+        cols = {column['name'] for column in inspector.get_columns('certificate_issuance_receipts')}
+        if 'config_id' not in cols:
+            sync_conn.execute(text('ALTER TABLE certificate_issuance_receipts ADD COLUMN config_id INTEGER'))
+        if 'deferred_data_json' not in cols:
+            sync_conn.execute(text('ALTER TABLE certificate_issuance_receipts ADD COLUMN deferred_data_json TEXT'))
+        if 'selected_button_id' not in cols:
+            sync_conn.execute(text('ALTER TABLE certificate_issuance_receipts ADD COLUMN selected_button_id VARCHAR(64)'))
+        if 'selected_at' not in cols:
+            sync_conn.execute(text('ALTER TABLE certificate_issuance_receipts ADD COLUMN selected_at DATETIME'))
 
 
 def _migrate_bot_system_messages(sync_conn):
@@ -2936,7 +2948,7 @@ class CertificateFollowupConfig(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     media_id = Column(Integer, ForeignKey('media_library.id', ondelete='CASCADE'), nullable=False, unique=True, index=True)
     topic_id = Column(Integer, ForeignKey('topics.id', ondelete='CASCADE'), nullable=True, index=True)
-    is_active = Column(Boolean, default=True, nullable=False)
+    is_active = Column(Boolean, default=False, nullable=False)
     caption_template = Column(Text, nullable=False)
     invitation_text = Column(Text, nullable=False)
     buttons_config_json = Column(Text, nullable=True)
@@ -2961,9 +2973,13 @@ class CertificateIssuanceReceipt(Base):
     topic_id = Column(Integer, nullable=False, default=0)
     dialogue_id = Column(Integer, nullable=False)
     issuance_key = Column(String(128), nullable=False)
-    status = Column(String(32), default='started', nullable=False)  # 'started', 'cert_sent', 'completed', 'failed', 'uncertain'
+    status = Column(String(32), default='started', nullable=False)  # 'started', 'cert_sent', 'resuming_invite', 'completed', 'failed', 'uncertain'
+    config_id = Column(Integer, ForeignKey('certificate_followup_configs.id', ondelete='SET NULL'), nullable=True)
     certificate_message_id = Column(String(64), nullable=True)
     invitation_message_id = Column(String(64), nullable=True)
+    deferred_data_json = Column(Text, nullable=True)
+    selected_button_id = Column(String(64), nullable=True)
+    selected_at = Column(DateTime, nullable=True)
     error_details = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     completed_at = Column(DateTime, nullable=True)
