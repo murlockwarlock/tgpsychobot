@@ -412,7 +412,11 @@ async def get_or_create_receipt(
             raise
 
 
-async def mark_receipt_sending_cert(session: AsyncSession, receipt_id: int) -> bool:
+async def mark_receipt_sending_cert(
+    session: AsyncSession,
+    receipt_id: int,
+    user_id: int | None = None,
+) -> bool:
     """
     Requirement 3 & Defect 2: Atomic compare-and-swap claiming the receipt to deliver the certificate.
     Atomically updates status 'started' -> 'sending_cert'.
@@ -420,24 +424,32 @@ async def mark_receipt_sending_cert(session: AsyncSession, receipt_id: int) -> b
     """
     if not isinstance(receipt_id, int):
         return False
-    try:
-        stmt = (
-            update(CertificateIssuanceReceipt)
-            .where(
-                CertificateIssuanceReceipt.id == receipt_id,
-                CertificateIssuanceReceipt.status == "started",
+
+    async def _cas():
+        try:
+            stmt = (
+                update(CertificateIssuanceReceipt)
+                .where(
+                    CertificateIssuanceReceipt.id == receipt_id,
+                    CertificateIssuanceReceipt.status == "started",
+                )
+                .values(status="sending_cert")
             )
-            .values(status="sending_cert")
-        )
-        res = await session.execute(stmt)
-        await session.commit()
-        rowcount = getattr(res, "rowcount", None)
-        if isinstance(rowcount, int):
-            return rowcount > 0
-        return False
-    except Exception as exc:
-        log.warning("mark_receipt_sending_cert error: %s", exc)
-        return False
+            res = await session.execute(stmt)
+            await session.commit()
+            rowcount = getattr(res, "rowcount", None)
+            if isinstance(rowcount, int):
+                return rowcount > 0
+            return False
+        except Exception as exc:
+            log.warning("mark_receipt_sending_cert error: %s", exc)
+            return False
+
+    if user_id is not None:
+        from event_service import get_user_tx_lock
+        async with get_user_tx_lock(user_id):
+            return await _cas()
+    return await _cas()
 
 
 async def mark_receipt_cert_sent(
@@ -506,6 +518,7 @@ async def _safe_scalar(session: Any, stmt: Any) -> Any:
 async def claim_receipt_for_invitation(
     session: AsyncSession,
     receipt_id: int,
+    user_id: int | None = None,
 ) -> bool:
     """
     Atomic compare-and-swap claiming the receipt to deliver the invitation.
@@ -513,23 +526,31 @@ async def claim_receipt_for_invitation(
     """
     if not isinstance(receipt_id, int):
         return False
-    try:
-        stmt = (
-            update(CertificateIssuanceReceipt)
-            .where(
-                CertificateIssuanceReceipt.id == receipt_id,
-                CertificateIssuanceReceipt.status == "cert_sent",
+
+    async def _cas():
+        try:
+            stmt = (
+                update(CertificateIssuanceReceipt)
+                .where(
+                    CertificateIssuanceReceipt.id == receipt_id,
+                    CertificateIssuanceReceipt.status == "cert_sent",
+                )
+                .values(status="resuming_invite")
             )
-            .values(status="resuming_invite")
-        )
-        res = await session.execute(stmt)
-        await session.commit()
-        rowcount = getattr(res, "rowcount", None)
-        if isinstance(rowcount, int):
-            return rowcount > 0
-        return False
-    except Exception:
-        return False
+            res = await session.execute(stmt)
+            await session.commit()
+            rowcount = getattr(res, "rowcount", None)
+            if isinstance(rowcount, int):
+                return rowcount > 0
+            return False
+        except Exception:
+            return False
+
+    if user_id is not None:
+        from event_service import get_user_tx_lock
+        async with get_user_tx_lock(user_id):
+            return await _cas()
+    return await _cas()
 
 
 async def find_pending_followup_receipt(

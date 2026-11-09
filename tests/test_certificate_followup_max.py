@@ -757,6 +757,10 @@ async def test_defect2_concurrent_certificate_issuance_max_single_wire_send(sess
     """
     source, config = await seed_max_template(session_factory)
     async with session_factory() as session:
+        user = await session.get(User, 100000000007)
+        if user:
+            user.current_dialogue_id = 1
+            user.current_topic_id = 1
         scen_cfg = await get_or_create_followup_config(session, 40, topic_id=1)
         scen_cfg.is_active = True
         scen_cfg.caption_template = '🎉 Поздравляем, <b>{name}</b>! Ваш сертификат готов.'
@@ -767,7 +771,7 @@ async def test_defect2_concurrent_certificate_issuance_max_single_wire_send(sess
     client = MaxTransport()
     monkeypatch.setattr(client, 'download_attachment_url', AsyncMock(return_value=source))
 
-    values = dict(VALUES, recipient="ConcurrentMax")
+    values = dict(VALUES, recipient="ConcurrentMaxIsolated")
     ai_response = f'[RENDER_IMG_MEDIA: panda_certificate | {json.dumps(values, ensure_ascii=False)}]'
 
     # Run two delivery requests concurrently
@@ -775,14 +779,19 @@ async def test_defect2_concurrent_certificate_issuance_max_single_wire_send(sess
         common._deliver_media_template(client, chat_id=100, user_id=100000000007, response=ai_response, dialogue_id=1, topic_id=1),
         common._deliver_media_template(client, chat_id=100, user_id=100000000007, response=ai_response, dialogue_id=1, topic_id=1),
     )
+    assert res1 is True and res2 is True
 
     # Strictly ONE upload_file call must be made
     assert len(client.uploads) == 1, f"Expected strictly 1 upload, got {len(client.uploads)}"
 
     # Check that receipt is completed
+    from media_templates import current_issue_date
+    expected_key = make_issuance_key(40, 100000000007, "ConcurrentMaxIsolated", current_issue_date())
     async with session_factory() as session:
         receipt = await session.scalar(
-            select(CertificateIssuanceReceipt).where(CertificateIssuanceReceipt.user_id == 100000000007)
+            select(CertificateIssuanceReceipt).where(
+                CertificateIssuanceReceipt.issuance_key == expected_key,
+            )
         )
         assert receipt is not None
         assert receipt.status == 'completed'

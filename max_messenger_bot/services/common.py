@@ -1066,7 +1066,7 @@ async def _deliver_media_template(client, chat_id, user_id, response, dialogue_i
             if receipt_status == "cert_sent":
                 # Requirement 4: Atomic CAS claim for invitation delivery
                 async with async_session_maker() as session:
-                    claimed = await claim_receipt_for_invitation(session, receipt_id)
+                    claimed = await claim_receipt_for_invitation(session, receipt_id, user_id=user_id)
                 if not claimed:
                     log.info("MAX invitation claimed concurrently for receipt %s", receipt_id)
                     return True
@@ -1108,7 +1108,7 @@ async def _deliver_media_template(client, chat_id, user_id, response, dialogue_i
 
             # Requirement 3 & Defect 2: Set persistent in-flight state 'sending_cert' via atomic CAS BEFORE external API call
             async with async_session_maker() as session:
-                claimed = await mark_receipt_sending_cert(session, receipt_id)
+                claimed = await mark_receipt_sending_cert(session, receipt_id, user_id=user_id)
             if not claimed:
                 log.info("MAX certificate sending already claimed concurrently for receipt %s", receipt_id)
                 return True
@@ -1149,7 +1149,7 @@ async def _deliver_media_template(client, chat_id, user_id, response, dialogue_i
             # Phase 2: Deliver Message 2 (Invitation + MAX buttons)
             # Requirement 4: Atomic CAS claim for Phase 2 invitation
             async with async_session_maker() as session:
-                claimed = await claim_receipt_for_invitation(session, receipt_id)
+                claimed = await claim_receipt_for_invitation(session, receipt_id, user_id=user_id)
             if not claimed:
                 log.info("MAX Phase 2 invitation claimed concurrently for receipt %s", receipt_id)
                 await save_ai_message(user_id, caption_text, dialogue_id=dialogue_id, topic_id=topic_id, require_current_scope=True)

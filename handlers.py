@@ -2286,7 +2286,7 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
             if receipt_status == "cert_sent":
                 # Requirement 4: Atomic CAS claim for invitation delivery
                 async with async_session_maker() as session:
-                    claimed = await claim_receipt_for_invitation(session, receipt_id)
+                    claimed = await claim_receipt_for_invitation(session, receipt_id, user_id=user_id)
                 if not claimed:
                     log.info("Invitation delivery already claimed concurrently for receipt %s", receipt_id)
                     return MediaEditDelivery('[Шаблон изображения]')
@@ -2338,7 +2338,7 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
 
             # Requirement 3 & Defect 2: Set persistent in-flight state 'sending_cert' via atomic CAS BEFORE external API call
             async with async_session_maker() as session:
-                claimed = await mark_receipt_sending_cert(session, receipt_id)
+                claimed = await mark_receipt_sending_cert(session, receipt_id, user_id=user_id)
             if not claimed:
                 log.info("Certificate sending already claimed concurrently for receipt %s", receipt_id)
                 return MediaEditDelivery('[Шаблон изображения]')
@@ -2389,7 +2389,7 @@ async def _deliver_media_template(bot, user_id, response, dialogue_id, topic_id,
             # Phase 2: Deliver Message 2 (Invitation with buttons)
             # Requirement 4: Atomic CAS claim for Phase 2 invitation
             async with async_session_maker() as session:
-                claimed = await claim_receipt_for_invitation(session, receipt_id)
+                claimed = await claim_receipt_for_invitation(session, receipt_id, user_id=user_id)
             if not claimed:
                 log.info("Phase 2 invitation claimed concurrently for receipt %s", receipt_id)
                 return MediaEditDelivery(caption_text)
