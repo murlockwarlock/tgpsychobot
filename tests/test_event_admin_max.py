@@ -3975,6 +3975,7 @@ async def test_max_futuro_steps_html_preview_and_full_journey_a_to_ya_to_a(db_se
         title="ВСЕЛЕННАЯ ФУТУРО",
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://futuro.example/max-webinar",
+        is_active=True,
     )
     step1_text = "Напоминаем: мероприятие <code>{event_title}</code> начнется через 24 ч! Ссылка: {link}"
     step1 = await add_step(db_session_maker, scen.id, -1440, step1_text)
@@ -4096,6 +4097,93 @@ async def test_max_futuro_steps_html_preview_and_full_journey_a_to_ya_to_a(db_se
     # 11. Database text integrity check
     db_step = await get_step_item(db_session_maker, step1.id)
     assert db_step.message_text == updated_input
+
+    # 12. Test-send menu & buttons on MAX
+    await press(f"admin_ev_test_send_menu_{scen.id}")
+    assert "Тестовая отправка" in last_text()
+
+    # Verify buttons in test send menu have tags stripped
+    test_buttons = visible_buttons()
+    for b in test_buttons:
+        assert "<" not in b["text"]
+        assert ">" not in b["text"]
+    step1_test_btn = next(b for b in test_buttons if b.get("payload") == f"admin_ev_do_test_send_{scen.id}_{step1.id}")
+    assert "ВСЕЛЕННАЯ ФУТУРО" in step1_test_btn["text"] or "Обновлено" in step1_test_btn["text"]
+
+    # Trigger test send through MAX dispatcher
+    mock_client.send_message.reset_mock()
+    mock_client.send_message.return_value = {"message_id": "max_test_msg_99"}
+    await press(f"admin_ev_do_test_send_{scen.id}_{step1.id}")
+    assert mock_client.send_message.called
+    test_send_kwargs = mock_client.send_message.call_args.kwargs
+    test_send_text = test_send_kwargs.get("text", "")
+    assert "ТЕСТОВОЕ СООБЩЕНИЕ MAX" in test_send_text
+    assert "ВСЕЛЕННАЯ ФУТУРО" in test_send_text
+    assert "https://futuro.example/max-webinar" in test_send_text
+
+    # 13. Real event delivery worker execution for MAX
+    from event_service import register_user_for_event
+    from event_delivery_worker import run_event_delivery_worker_cycle
+
+    max_recipient_user_id = MAX_ID_OFFSET + 777002
+    async with db_session_maker() as session:
+        session.add(User(id=max_recipient_user_id, first_name="Дмитрий", name="Дмитрий", username="dmitry_max_futuro"))
+        await session.commit()
+
+    reg_now = scen.starts_at - timedelta(days=3)
+    reg_res = await register_user_for_event(
+        db_session_maker,
+        max_recipient_user_id,
+        scen.code,
+        platform="max",
+        now=reg_now,
+    )
+    assert reg_res.status == "registered"
+
+    mock_client.send_message.reset_mock()
+    mock_client.send_message.return_value = {"message_id": "max_worker_msg_777"}
+
+    step1_due = scen.starts_at - timedelta(minutes=1440) + timedelta(seconds=1)
+    worker_stats = await run_event_delivery_worker_cycle(
+        db_session_maker,
+        max_client=mock_client,
+        now=step1_due,
+    )
+    assert worker_stats["sent"] >= 1
+    assert worker_stats["failed"] == 0
+
+    step_call = next(
+        call for call in mock_client.send_message.call_args_list
+        if "Обновлено для MAX:" in call.kwargs.get("text", "")
+    )
+    delivery_kwargs = step_call.kwargs
+    assert delivery_kwargs["user_id"] == 777002  # raw MAX user ID
+    assert "ВСЕЛЕННАЯ ФУТУРО" in delivery_kwargs["text"]
+    assert "https://futuro.example/max-webinar" in delivery_kwargs["text"]
+
+    # Delivery row in database marked as sent with external_message_id
+    async with db_session_maker() as session:
+        deliv = (
+            await session.execute(
+                select(EventDelivery).where(
+                    EventDelivery.user_id == max_recipient_user_id,
+                    EventDelivery.step_id == step1.id,
+                )
+            )
+        ).scalar_one()
+        assert deliv.status == "sent"
+        assert deliv.external_message_id == "max_worker_msg_777"
+
+    # 14. Return back to scenario card and list on MAX, verify state is clear
+    await press(f"admin_ev_open_{scen.id}_2_1")
+    assert "ВСЕЛЕННАЯ ФУТУРО" in last_text()
+
+    await press("admin_ev_page_1_1")
+    assert "Мероприятия" in last_text()
+
+    current_state = await states.get(123)
+    assert current_state is None
+
 
 
 

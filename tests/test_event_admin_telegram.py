@@ -4063,6 +4063,7 @@ async def test_telegram_futuro_steps_html_preview_and_full_journey_a_to_ya_to_a(
         title="ВСЕЛЕННАЯ ФУТУРО",
         starts_at_utc=datetime.utcnow() + timedelta(days=2),
         link="https://futuro.example/webinar",
+        is_active=True,
     )
     step1_text = "Напоминаем: мероприятие <code>{event_title}</code> начнется через 24 ч! Ссылка: {link}"
     step1 = await add_step(db_session_maker, scen.id, -1440, step1_text)
@@ -4178,6 +4179,113 @@ async def test_telegram_futuro_steps_html_preview_and_full_journey_a_to_ya_to_a(
     # 11. Database text integrity check
     db_step = await get_step_item(db_session_maker, step1.id)
     assert db_step.message_text == updated_input
+
+    # 12. Test-send menu & buttons contract check
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=999))
+    methods = _validate_methods(await _feed_callback(dp, bot, f"admin_ev_test_send_menu_{scen.id}"))
+    test_send_screen = next(m for m in methods if isinstance(m, EditMessageText))
+    assert "Тестовая отправка" in test_send_screen.text
+
+    # Verify test-send keyboard buttons have tags stripped and valid callbacks
+    test_send_buttons = [b for row in test_send_screen.reply_markup.inline_keyboard for b in row]
+    for b in test_send_buttons:
+        assert "<" not in b.text
+        assert ">" not in b.text
+    step1_test_btn = next(b for b in test_send_buttons if b.callback_data == f"admin_ev_do_test_send_{scen.id}_{step1.id}")
+    assert "ВСЕЛЕННАЯ ФУТУРО" in step1_test_btn.text or "Обновлено" in step1_test_btn.text
+
+    # Trigger test send through dispatcher and validate outgoing Telegram method via Pydantic
+    methods = _validate_methods(await _feed_callback(dp, bot, f"admin_ev_do_test_send_{scen.id}_{step1.id}"))
+    assert bot.send_message.called
+    test_call_kwargs = bot.send_message.call_args.kwargs
+    validated_test_send = SendMessage.model_validate({
+        "chat_id": test_call_kwargs["chat_id"],
+        "text": test_call_kwargs["text"],
+        "parse_mode": test_call_kwargs.get("parse_mode", "HTML"),
+        "reply_markup": test_call_kwargs.get("reply_markup"),
+    })
+    assert "🧪 <b>[ТЕСТОВОЕ СООБЩЕНИЕ]</b>" in validated_test_send.text
+    assert "Обновлено: <code>ВСЕЛЕННАЯ ФУТУРО</code> стартует! Ссылка: https://futuro.example/webinar" in validated_test_send.text
+    assert "&lt;code&gt;" not in validated_test_send.text
+
+    # 13. Real event delivery worker execution with Pydantic validation of outgoing message
+    from event_service import register_user_for_event
+    from event_delivery_worker import run_event_delivery_worker_cycle
+
+    recipient_user_id = 777001
+    async with db_session_maker() as session:
+        session.add(User(id=recipient_user_id, first_name="Дмитрий", name="Дмитрий", username="dmitry_futuro"))
+        await session.commit()
+
+    reg_now = scen.starts_at - timedelta(days=3)
+    reg_res = await register_user_for_event(
+        db_session_maker,
+        recipient_user_id,
+        scen.code,
+        platform="telegram",
+        now=reg_now,
+    )
+    assert reg_res.status == "registered"
+
+    delivery_bot = AsyncMock(spec=Bot)
+    delivery_bot.id = 123456789
+    mock_deliv_msg = MagicMock()
+    mock_deliv_msg.message_id = 880055
+    delivery_bot.send_message = AsyncMock(return_value=mock_deliv_msg)
+
+    # Worker executes at step 1 due time
+    step1_due = scen.starts_at - timedelta(minutes=1440) + timedelta(seconds=1)
+    worker_stats = await run_event_delivery_worker_cycle(
+        db_session_maker,
+        bot=delivery_bot,
+        now=step1_due,
+    )
+    assert worker_stats["sent"] >= 1
+    assert worker_stats["failed"] == 0
+
+    # Intercept outgoing Telegram method and perform Pydantic validation
+    step_call = next(
+        call for call in delivery_bot.send_message.call_args_list
+        if "Обновлено:" in call.kwargs.get("text", "")
+    )
+    delivery_kwargs = step_call.kwargs
+    validated_worker_send = SendMessage.model_validate({
+        "chat_id": delivery_kwargs["chat_id"],
+        "text": delivery_kwargs["text"],
+        "parse_mode": delivery_kwargs.get("parse_mode", "HTML"),
+        "reply_markup": delivery_kwargs.get("reply_markup"),
+    })
+    assert validated_worker_send.chat_id == recipient_user_id
+    assert "<code>ВСЕЛЕННАЯ ФУТУРО</code>" in validated_worker_send.text
+    assert "&lt;code&gt;" not in validated_worker_send.text
+    assert "https://futuro.example/webinar" in validated_worker_send.text
+
+    # Delivery row in database marked as sent with external_message_id
+    async with db_session_maker() as session:
+        deliv = (
+            await session.execute(
+                select(EventDelivery).where(
+                    EventDelivery.user_id == recipient_user_id,
+                    EventDelivery.step_id == step1.id,
+                )
+            )
+        ).scalar_one()
+        assert deliv.status == "sent"
+        assert deliv.external_message_id == "880055"
+
+    # 14. Return back to Admin scenario card and list, verify FSM state is clear
+    methods = _validate_methods(await _feed_callback(dp, bot, f"admin_ev_open_{scen.id}_0_0"))
+    card_reopened = next(m for m in methods if isinstance(m, EditMessageText))
+    assert "ВСЕЛЕННАЯ ФУТУРО" in card_reopened.text
+
+    methods = _validate_methods(await _feed_callback(dp, bot, "admin_ev_page_0_0"))
+    list_reopened = next(m for m in methods if isinstance(m, EditMessageText))
+    assert "Сценарии мероприятий" in list_reopened.text
+
+    fsm_key = StorageKey(bot_id=bot.id, chat_id=12345, user_id=12345)
+    fsm_state = await dp.fsm.storage.get_state(fsm_key)
+    assert fsm_state is None
+
 
 
 
