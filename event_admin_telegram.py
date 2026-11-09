@@ -2261,7 +2261,12 @@ async def process_step_text(message: Message, state: FSMContext) -> None:
         )
     except Exception as exc:
         log.exception("Add step failed: %s", exc)
-        await message.answer(f"❌ Ошибка: {exc}")
+        await message.answer(
+            f"❌ Ошибка: {html.escape(str(exc))}\n\n"
+            f"Пожалуйста, исправьте разметку и отправьте текст снова или нажмите «Отмена»:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=f"admin_ev_steps_{event_id}").as_markup(),
+        )
 
 
 async def _render_step_card_view(
@@ -2389,7 +2394,12 @@ async def process_edit_step_text(message: Message, state: FSMContext) -> None:
             ),
         )
     except Exception as exc:
-        await message.answer(f"❌ Ошибка: {exc}")
+        await message.answer(
+            f"❌ Ошибка: {html.escape(str(exc))}\n\n"
+            f"Пожалуйста, исправьте разметку и отправьте текст снова или нажмите «Отмена»:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardBuilder().button(text="⬅️ Отмена", callback_data=f"admin_ev_step_{step_id}").as_markup(),
+        )
 
 
 @router.callback_query(F.data.startswith("admin_ev_step_edit_offset_"))

@@ -4052,7 +4052,44 @@ async def test_max_futuro_steps_html_preview_and_full_journey_a_to_ya_to_a(db_se
     assert "<code>{event_title}</code>" in edit_prompt_text
     assert "&lt;code&gt;" not in edit_prompt_text
 
-    # 5. Send updated text with HTML tags and variables
+    # 4a. HTML pre-commit validation tests:
+    # 4a.1: Unclosed tag rejection
+    await app._handle_message_impl(
+        IncomingMessage(
+            raw={},
+            message_id="max-msg-err-1",
+            chat_id=123,
+            sender=sender,
+            text="<b>Невалидный HTML без закрывающего тега {event_title}",
+        )
+    )
+    assert "❌ Ошибка" in last_text()
+    assert "не закрыты теги" in last_text()
+    db_step_mid = await get_step_item(db_session_maker, step1.id)
+    assert db_step_mid.message_text == step1_text
+    assert db_step_mid.step_version == 1
+    state_snap = await states.get(456)
+    assert state_snap is not None and state_snap.state == "max_event_step_edit_text"
+
+    # 4a.2: Unsupported tag rejection
+    await app._handle_message_impl(
+        IncomingMessage(
+            raw={},
+            message_id="max-msg-err-2",
+            chat_id=123,
+            sender=sender,
+            text="<script>alert(1)</script>",
+        )
+    )
+    assert "❌ Ошибка" in last_text()
+    assert "неподдерживается" in last_text()
+    db_step_mid = await get_step_item(db_session_maker, step1.id)
+    assert db_step_mid.message_text == step1_text
+    assert db_step_mid.step_version == 1
+    state_snap = await states.get(456)
+    assert state_snap is not None and state_snap.state == "max_event_step_edit_text"
+
+    # 5. Send updated valid text with HTML tags and variables
     updated_input = "Обновлено для MAX: <code>{event_title}</code> стартует! Ссылка: {link}"
     await app._handle_message_impl(
         IncomingMessage(

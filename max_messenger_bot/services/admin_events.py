@@ -2051,7 +2051,11 @@ async def receive_step_text(
         await show_steps(client, chat_id, event_id, back=list_back)
     except Exception as exc:
         log.exception("MAX add step error: %s", exc)
-        await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
+        await client.send_message(
+            chat_id=chat_id,
+            text=f"❌ Ошибка: {exc}\n\nПожалуйста, исправьте разметку и отправьте текст снова или нажмите «Назад»:",
+            attachments=inline_keyboard([_back(_event_steps_callback(event_id, list_back))]),
+        )
 
 
 async def start_edit_step_text(
@@ -2098,7 +2102,11 @@ async def receive_edit_step_text(
         await client.send_message(chat_id=chat_id, text=f"✅ Текст обновлен (v{updated.step_version}).")
         await show_step(client, chat_id, step_id, back=list_back)
     except Exception as exc:
-        await client.send_message(chat_id=chat_id, text=f"❌ Ошибка: {exc}")
+        await client.send_message(
+            chat_id=chat_id,
+            text=f"❌ Ошибка: {exc}\n\nПожалуйста, исправьте разметку и отправьте текст снова или нажмите «Назад»:",
+            attachments=inline_keyboard([_back(_event_step_callback(step_id, list_back))]),
+        )
 
 
 async def start_edit_step_offset(

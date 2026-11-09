@@ -4137,7 +4137,29 @@ async def test_telegram_futuro_steps_html_preview_and_full_journey_a_to_ya_to_a(
     assert "<code>{event_title}</code>" in edit_screen.text
     assert "&lt;code&gt;" not in edit_screen.text
 
-    # 5. Enter new text with HTML tags and variables
+    # 4a. HTML pre-commit validation tests:
+    # 4a.1: Unclosed tag rejection
+    methods_err1 = _validate_methods(await _feed_message(dp, bot, "<b>Текст без закрывающего тега {event_title}"))
+    err_msg1 = next(m for m in methods_err1 if isinstance(m, SendMessage) and "❌ Ошибка" in m.text)
+    assert "не закрыты теги" in err_msg1.text
+    # Verify DB step intact
+    db_step_mid = await get_step_item(db_session_maker, step1.id)
+    assert db_step_mid.message_text == step1_text
+    assert db_step_mid.step_version == 1
+    # Verify FSM state preserved
+    fsm_key = StorageKey(bot_id=bot.id, chat_id=12345, user_id=12345)
+    assert await dp.fsm.storage.get_state(fsm_key) == event_admin_telegram.EventAdminStates.step_edit_text.state
+
+    # 4a.2: Unsupported tag rejection
+    methods_err2 = _validate_methods(await _feed_message(dp, bot, "<script>alert('xss')</script>"))
+    err_msg2 = next(m for m in methods_err2 if isinstance(m, SendMessage) and "❌ Ошибка" in m.text)
+    assert "неподдерживается" in err_msg2.text
+    db_step_mid = await get_step_item(db_session_maker, step1.id)
+    assert db_step_mid.message_text == step1_text
+    assert db_step_mid.step_version == 1
+    assert await dp.fsm.storage.get_state(fsm_key) == event_admin_telegram.EventAdminStates.step_edit_text.state
+
+    # 5. Enter new valid text with HTML tags and variables
     updated_input = "Обновлено: <code>{event_title}</code> стартует! Ссылка: {link}"
     methods = _validate_methods(await _feed_message(dp, bot, updated_input))
     saved = next(m for m in methods if isinstance(m, SendMessage) and "Текст шага обновлен" in m.text)
