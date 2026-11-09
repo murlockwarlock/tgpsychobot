@@ -755,10 +755,23 @@ async def test_defect2_concurrent_certificate_issuance_max_single_wire_send(sess
     Two simultaneous requests to issue the same certificate.
     Atomic CAS ensures strictly ONE call to upload_file and send_media_attachment.
     """
+    user_id = 100000000099
     source, config = await seed_max_template(session_factory)
     async with session_factory() as session:
-        user = await session.get(User, 100000000007)
-        if user:
+        user = await session.get(User, user_id)
+        if not user:
+            user = User(
+                id=user_id,
+                name="ConcurrentMaxUser",
+                first_name="ConcurrentMaxUser",
+                gender="male",
+                age="30",
+                accepted_disclaimer=True,
+                current_dialogue_id=1,
+                current_topic_id=1,
+            )
+            session.add(user)
+        else:
             user.current_dialogue_id = 1
             user.current_topic_id = 1
         scen_cfg = await get_or_create_followup_config(session, 40, topic_id=1)
@@ -776,8 +789,8 @@ async def test_defect2_concurrent_certificate_issuance_max_single_wire_send(sess
 
     # Run two delivery requests concurrently
     res1, res2 = await asyncio.gather(
-        common._deliver_media_template(client, chat_id=100, user_id=100000000007, response=ai_response, dialogue_id=1, topic_id=1),
-        common._deliver_media_template(client, chat_id=100, user_id=100000000007, response=ai_response, dialogue_id=1, topic_id=1),
+        common._deliver_media_template(client, chat_id=100, user_id=user_id, response=ai_response, dialogue_id=1, topic_id=1),
+        common._deliver_media_template(client, chat_id=100, user_id=user_id, response=ai_response, dialogue_id=1, topic_id=1),
     )
     assert res1 is True and res2 is True
 
@@ -786,7 +799,7 @@ async def test_defect2_concurrent_certificate_issuance_max_single_wire_send(sess
 
     # Check that receipt is completed
     from media_templates import current_issue_date
-    expected_key = make_issuance_key(40, 100000000007, "ConcurrentMaxIsolated", current_issue_date())
+    expected_key = make_issuance_key(40, user_id, "ConcurrentMaxIsolated", current_issue_date())
     async with session_factory() as session:
         receipt = await session.scalar(
             select(CertificateIssuanceReceipt).where(
