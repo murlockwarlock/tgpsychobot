@@ -11,6 +11,7 @@ Directory Layout:
       requirements.txt            # Dependency specification
       requirements.sha256         # Hash of normalized requirements
     deployments/<instance_name>   # Atomic symlink to releases/<commit_sha_40>
+    deployments/.state/           # Instance state and rollback history files
     shared/                       # Shared runtime environment, logs, backups
     newbots/                      # Legacy static code tree for unmigrated bots
 """
@@ -18,7 +19,10 @@ Directory Layout:
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -29,6 +33,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import time
 from typing import Any
 
@@ -40,6 +45,7 @@ DEFAULT_ECOSYSTEM_PATH = REPO_ROOT / "ecosystem.config.js"
 DEFAULT_RUNTIME_ENV_PATH = Path(os.environ.get("PROD_RUNTIME_ENV", "/root/telegram_bots/runtime.env"))
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 SHORT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+STATE_DIR_NAME = ".state"
 
 
 # =============================================================================
@@ -78,7 +84,7 @@ def resolve_git_commit_sha(repo_dir: Path = REPO_ROOT, revision: str | None = No
     rev = revision or "HEAD"
     try:
         proc = subprocess.run(
-            ["git", "rev-parse", "--verify", rev],
+            ["git", "rev-parse", "--verify", f"{rev}^{{commit}}"],
             cwd=str(repo_dir),
             capture_output=True,
             text=True,
@@ -90,6 +96,158 @@ def resolve_git_commit_sha(repo_dir: Path = REPO_ROOT, revision: str | None = No
         return sha
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"Unable to resolve git revision '{rev}' in {repo_dir}: {exc.stderr.strip()}") from exc
+
+
+# =============================================================================
+# Instance State & Concurrency Locking
+# =============================================================================
+
+def get_state_dir(base_dir: Path) -> Path:
+    """Return and create the state directory <base_dir>/deployments/.state."""
+    state_dir = base_dir / "deployments" / STATE_DIR_NAME
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir
+
+
+def get_instance_state_path(base_dir: Path, instance_name: str) -> Path:
+    return get_state_dir(base_dir) / f"{instance_name}.json"
+
+
+@contextmanager
+def lock_instance(base_dir: Path, instance_name: str, timeout_seconds: float = 10.0):
+    """File lock to serialize deploy and rollback per instance."""
+    lock_path = get_state_dir(base_dir) / f"{instance_name}.lock"
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    start_time = time.time()
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, OSError):
+                if time.time() - start_time > timeout_seconds:
+                    raise TimeoutError(f"Unable to acquire lock for instance '{instance_name}' after {timeout_seconds}s")
+                time.sleep(0.1)
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+
+
+def load_instance_state(base_dir: Path, instance_name: str) -> dict[str, Any]:
+    """Load the state history of a single bot instance."""
+    path = get_instance_state_path(base_dir, instance_name)
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+    # Initialize from current deployment link if no state file exists
+    dep_link = base_dir / "deployments" / instance_name
+    current_sha = None
+    current_target = None
+    if dep_link.is_symlink() or dep_link.is_dir():
+        try:
+            resolved = dep_link.resolve()
+            current_target = str(resolved)
+            rev_f = resolved / "REVISION"
+            if rev_f.is_file():
+                current_sha = rev_f.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+
+    return {
+        "instance_name": instance_name,
+        "current_release_sha": current_sha,
+        "current_target_dir": current_target,
+        "previous_successful_release_sha": None,
+        "previous_successful_target_dir": None,
+        "last_action": "init",
+        "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "history": [],
+    }
+
+
+def save_instance_state(base_dir: Path, instance_name: str, state: dict[str, Any]) -> None:
+    """Atomically save instance state to file."""
+    path = get_instance_state_path(base_dir, instance_name)
+    state["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+# =============================================================================
+# Release Protection & Integrity Verification
+# =============================================================================
+
+def is_release_protected(base_dir: Path, sha: str) -> tuple[bool, str]:
+    """Check if a release is actively in use or protected as a rollback target."""
+    deployments_dir = base_dir / "deployments"
+    if deployments_dir.is_dir():
+        for link in deployments_dir.iterdir():
+            if link.name == STATE_DIR_NAME or link.name.startswith("."):
+                continue
+            if link.is_symlink() or link.is_dir():
+                try:
+                    resolved = link.resolve()
+                    if resolved.name == sha or resolved.name.startswith(sha):
+                        return True, f"in active use by deployment symlink '{link.name}'"
+                except OSError:
+                    pass
+
+    # Check instance state files for rollback protection
+    state_dir = deployments_dir / STATE_DIR_NAME
+    if state_dir.is_dir():
+        for st_file in state_dir.glob("*.json"):
+            try:
+                st = json.loads(st_file.read_text(encoding="utf-8"))
+                inst = st.get("instance_name", st_file.stem)
+                if st.get("current_release_sha") == sha:
+                    return True, f"recorded as active release for instance '{inst}'"
+                if st.get("previous_successful_release_sha") == sha:
+                    return True, f"protected as rollback target for instance '{inst}'"
+            except Exception:
+                pass
+    return False, ""
+
+
+def verify_release_integrity(release_dir: Path, expected_sha: str) -> tuple[bool, str]:
+    """Verify release directory integrity: REVISION, requirements.sha256, and python bytecode compile."""
+    if not release_dir.is_dir():
+        return False, f"Directory does not exist: {release_dir}"
+    rev_file = release_dir / "REVISION"
+    if not rev_file.is_file():
+        return False, "Missing REVISION file"
+    actual_sha = rev_file.read_text(encoding="utf-8").strip()
+    if actual_sha != expected_sha and not actual_sha.startswith(expected_sha) and not expected_sha.startswith(actual_sha):
+        return False, f"REVISION mismatch: expected {expected_sha[:8]}, got {actual_sha[:8]}"
+    hash_file = release_dir / "requirements.sha256"
+    if not hash_file.is_file():
+        return False, "Missing requirements.sha256 file"
+    req_file = release_dir / "requirements.txt"
+    if req_file.is_file():
+        expected_hash = hash_requirements(req_file)
+        actual_hash = hash_file.read_text(encoding="utf-8").strip()
+        if actual_hash != expected_hash:
+            return False, f"requirements.sha256 mismatch: expected {expected_hash[:8]}, got {actual_hash[:8]}"
+    # Syntax validation
+    for py_file in release_dir.rglob("*.py"):
+        if py_file.is_file() and not py_file.name.startswith("._") and "__pycache__" not in str(py_file):
+            try:
+                py_compile.compile(str(py_file), doraise=True)
+            except Exception as exc:
+                return False, f"Python compile failed on {py_file.name}: {exc}"
+    return True, "integrity_ok"
 
 
 # =============================================================================
@@ -105,7 +263,6 @@ def normalize_requirements(req_path: Path) -> str:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        # Strip inline comments
         if " #" in line:
             line = line.split(" #", 1)[0].strip()
         lines.append(line.lower())
@@ -124,15 +281,11 @@ def audit_dependency_compatibility(
     target_req_path: Path,
     registry: dict[str, Any],
 ) -> tuple[bool, str, dict[str, Any]]:
-    """Audit dependency compatibility between target release and active instances.
-
-    Ensures that releasing code does not silently mutate or break the shared virtualenv
-    for running or rollback-target releases.
-    """
+    """Audit dependency compatibility between target release and active instances."""
     target_hash = hash_requirements(target_req_path)
     deployments_dir = base_dir / "deployments"
     legacy_dir = base_dir / "newbots"
-    
+
     active_hashes: dict[str, str] = {}
     managed = get_managed_instances(registry)
 
@@ -152,7 +305,6 @@ def audit_dependency_compatibility(
             if legacy_req.is_file():
                 active_hashes[name] = hash_requirements(legacy_req)
 
-    # Check if there are active instances with a differing requirements hash
     differing = {name: h for name, h in active_hashes.items() if h != target_hash}
 
     details = {
@@ -164,20 +316,54 @@ def audit_dependency_compatibility(
     if not differing:
         return True, "dependencies_strictly_compatible", details
 
-    # If requirements differ, check whether isolated venv exists for target release
-    # (e.g. <base_dir>/venvs/<target_hash> or <target_release>/venv)
+    # If requirements differ, check for isolated virtualenv
     target_venv = base_dir / "venvs" / target_hash
     if target_venv.is_dir() and (target_venv / "bin" / "python").is_file():
         details["isolated_venv"] = str(target_venv)
         return True, "isolated_virtualenv_available", details
 
-    # Fail closed: shared venv mutation would risk breaking active releases
     return (
         False,
         f"dependency_mismatch: target requirements ({target_hash[:8]}) differ from "
         f"{len(differing)} active instance(s) using shared venv. An isolated virtualenv is required.",
         details,
     )
+
+
+def resolve_release_python_interpreter(release_dir: Path, base_dir: Path) -> Path:
+    """Determine the appropriate Python interpreter for the release."""
+    # 1. Release-specific venv
+    for sub in ["venv/bin/python", "venv/bin/python3"]:
+        candidate = release_dir / sub
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+
+    # 2. Base venv
+    for sub in ["venv/bin/python", "venv/bin/python3"]:
+        candidate = base_dir / sub
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+
+    # 3. Environment or system python
+    env_py = os.environ.get("PROD_REMOTE_PY")
+    if env_py and Path(env_py).is_file():
+        return Path(env_py)
+
+    return Path(sys.executable)
+
+
+def verify_python_interpreter(interpreter: Path) -> tuple[bool, str]:
+    """Verify that the selected interpreter is functional."""
+    try:
+        proc = subprocess.run(
+            [str(interpreter), "-c", "import sys; print(sys.version)"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return True, proc.stdout.strip()
+    except Exception as exc:
+        return False, f"Interpreter {interpreter} failed execution check: {exc}"
 
 
 # =============================================================================
@@ -214,59 +400,75 @@ def stage_release(
 ) -> Path:
     """Stage an immutable code release into <base_dir>/releases/<commit_sha_40>.
 
-    Atomic staging: writes to a temporary directory first, compiles all python files,
-    writes REVISION and requirements.sha256, and atomically renames the directory.
+    Atomic staging: extracts directly from the Git commit tree (git archive),
+    compiles all python files, writes REVISION and requirements.sha256,
+    verifies integrity, and atomically publishes the release.
     """
-    sha = target_sha or resolve_git_commit_sha(source_dir)
-    if not SHA_RE.match(sha):
-        raise ValueError(f"Invalid commit SHA: {sha}")
-
     releases_dir = base_dir / "releases"
     releases_dir.mkdir(parents=True, exist_ok=True)
-    target_dir = releases_dir / sha
 
-    # Idempotent staging: if directory exists and is valid, reuse it
-    if target_dir.is_dir() and not force:
-        rev_file = target_dir / "REVISION"
-        req_hash_file = target_dir / "requirements.sha256"
-        if rev_file.is_file() and rev_file.read_text(encoding="utf-8").strip() == sha and req_hash_file.is_file():
+    # 1. Resolve commit SHA
+    is_git = False
+    resolved_sha = target_sha or ""
+    try:
+        rev = target_sha or "HEAD"
+        proc = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{rev}^{{commit}}"],
+            cwd=str(source_dir),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        resolved_sha = proc.stdout.strip()
+        is_git = True
+    except Exception as exc:
+        if target_sha and SHA_RE.match(target_sha):
+            resolved_sha = target_sha
+        elif not resolved_sha:
+            raise RuntimeError(f"Unable to resolve git commit '{target_sha or 'HEAD'}' in {source_dir}: {exc}") from exc
+
+    if not SHA_RE.match(resolved_sha):
+        raise ValueError(f"Invalid full 40-character commit SHA: {resolved_sha}")
+
+    target_dir = releases_dir / resolved_sha
+
+    # 2. Protection check: never destroy an in-use or rollback-protected release
+    is_prot, prot_reason = is_release_protected(base_dir, resolved_sha)
+    if target_dir.is_dir():
+        ok, int_msg = verify_release_integrity(target_dir, resolved_sha)
+        if is_prot and force:
+            raise RuntimeError(f"Refusing to overwrite protected release '{resolved_sha[:8]}' even with --force: {prot_reason}")
+        if ok and not force:
             return target_dir
+        if is_prot:
+            if ok:
+                return target_dir
+            raise RuntimeError(f"Cannot overwrite protected release '{resolved_sha[:8]}': {prot_reason}")
 
-    tmp_stage_dir = releases_dir / f".tmp_{sha}_{os.getpid()}_{int(time.time() * 1000)}"
+    # 3. Stage into atomic temporary directory
+    tmp_stage_dir = releases_dir / f".tmp_{resolved_sha}_{os.getpid()}_{int(time.time() * 1000)}"
     if tmp_stage_dir.exists():
         shutil.rmtree(tmp_stage_dir, ignore_errors=True)
     tmp_stage_dir.mkdir(parents=True)
 
     try:
-        # Determine tracked files from git if in a git repository
-        git_tracked_files: list[str] = []
-        try:
-            proc = subprocess.run(
-                ["git", "ls-files", "-z"],
+        if is_git:
+            # Extract directly from git commit tree via git archive
+            archive_proc = subprocess.run(
+                ["git", "archive", resolved_sha],
                 cwd=str(source_dir),
                 capture_output=True,
                 check=True,
             )
-            raw = proc.stdout
-            git_tracked_files = [f for f in raw.decode("utf-8", errors="replace").split("\0") if f]
-        except Exception:
-            git_tracked_files = []
-
-        if git_tracked_files:
-            for rel_file in git_tracked_files:
-                src_path = source_dir / rel_file
-                if not src_path.is_file():
-                    continue
-                dst_path = tmp_stage_dir / rel_file
-                dst_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src_path, dst_path)
+            with tarfile.open(fileobj=io.BytesIO(archive_proc.stdout)) as tar:
+                if hasattr(tarfile, "data_filter"):
+                    tar.extractall(path=tmp_stage_dir, filter="data")
+                else:
+                    tar.extractall(path=tmp_stage_dir)
         else:
-            # Fallback: copy tree excluding git, cache, and tmp files
+            # Fallback for mock non-git tests: copy files
             for root, dirs, files in os.walk(source_dir):
-                dirs[:] = [
-                    d for d in dirs
-                    if not d.startswith((".", "__pycache__", ".venv", ".tmp"))
-                ]
+                dirs[:] = [d for d in dirs if not d.startswith((".", "__pycache__", ".venv", ".tmp"))]
                 for file in files:
                     if file.startswith((".", "._")):
                         continue
@@ -276,27 +478,31 @@ def stage_release(
                     dst_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src_path, dst_path)
 
-        # Write REVISION file containing full 40-char SHA
-        (tmp_stage_dir / "REVISION").write_text(f"{sha}\n", encoding="utf-8")
+        # Write REVISION
+        (tmp_stage_dir / "REVISION").write_text(f"{resolved_sha}\n", encoding="utf-8")
 
         # Write requirements and hash
-        req_src = source_dir / "requirements.txt"
-        if req_src.is_file():
-            shutil.copy2(req_src, tmp_stage_dir / "requirements.txt")
-            req_hash = hash_requirements(req_src)
+        req_file = tmp_stage_dir / "requirements.txt"
+        if req_file.is_file():
+            req_hash = hash_requirements(req_file)
             (tmp_stage_dir / "requirements.sha256").write_text(f"{req_hash}\n", encoding="utf-8")
         else:
             (tmp_stage_dir / "requirements.sha256").write_text("empty\n", encoding="utf-8")
 
         # Compile all python files to verify syntax integrity before publishing
         for py_file in tmp_stage_dir.rglob("*.py"):
-            if py_file.is_file() and not py_file.name.startswith("._"):
+            if py_file.is_file() and not py_file.name.startswith("._") and "__pycache__" not in str(py_file):
                 py_compile.compile(str(py_file), doraise=True)
 
         # Atomically publish the release directory
         if target_dir.exists():
             shutil.rmtree(target_dir, ignore_errors=True)
         os.replace(tmp_stage_dir, target_dir)
+
+        # Verify integrity of newly published release
+        ok, int_msg = verify_release_integrity(target_dir, resolved_sha)
+        if not ok:
+            raise RuntimeError(f"Release integrity validation failed after staging: {int_msg}")
 
         return target_dir
 
@@ -315,10 +521,7 @@ def atomic_symlink_switch(
     instance_name: str,
     target_release_dir: Path,
 ) -> Path | None:
-    """Atomically update <base_dir>/deployments/<instance_name> to point to target_release_dir.
-
-    Returns the previous target Path if one existed, or None.
-    """
+    """Atomically update <base_dir>/deployments/<instance_name> to point to target_release_dir."""
     deployments_dir = base_dir / "deployments"
     deployments_dir.mkdir(parents=True, exist_ok=True)
     deployment_link = deployments_dir / instance_name
@@ -345,14 +548,135 @@ def atomic_symlink_switch(
 
 
 # =============================================================================
-# Targeted Ghost Process Cleanup
+# Port Safety & Authoritative Process Ownership
 # =============================================================================
 
-def cleanup_instance_ghost_port(port: int | None, pm2_pids: set[int]) -> list[int]:
-    """Clean up any orphan/ghost process holding ONLY the instance's specific port.
+def verify_process_ownership(
+    pid: int,
+    instance_name: str,
+    base_dir: Path,
+    port: int,
+) -> bool:
+    """Authoritatively prove that PID is an orphaned child of instance_name."""
+    if pid <= 0 or pid == os.getpid():
+        return False
+    cmdline = ""
+    cwd_str = ""
+    # Check Linux /proc/<pid>
+    proc_dir = Path(f"/proc/{pid}")
+    if proc_dir.is_dir():
+        try:
+            cmdline = (proc_dir / "cmdline").read_bytes().decode("utf-8", errors="replace")
+        except OSError:
+            pass
+        try:
+            cwd_str = str((proc_dir / "cwd").resolve())
+        except OSError:
+            pass
+        try:
+            environ = (proc_dir / "environ").read_bytes().decode("utf-8", errors="replace")
+            if f"BOT_INSTANCE_ID={instance_name}" in environ or f"APP_PORT={port}" in environ:
+                return True
+        except OSError:
+            pass
+    else:
+        # macOS / BSD fallback via ps
+        try:
+            ps_proc = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
+            if ps_proc.returncode == 0:
+                cmdline = ps_proc.stdout.strip()
+        except Exception:
+            pass
 
-    NEVER executes broad range sweeps (like 8080-8100) and NEVER kills PM2 processes.
-    """
+    has_bot_cmd = ("main.py" in cmdline) or ("max_messenger_bot.app" in cmdline)
+    expected_dep = str((base_dir / "deployments" / instance_name).resolve()) if (base_dir / "deployments" / instance_name).exists() else ""
+    has_dep_cwd = (expected_dep and expected_dep in cwd_str) or f"deployments/{instance_name}" in cwd_str
+
+    return bool(has_bot_cmd and has_dep_cwd)
+
+
+def check_and_resolve_port_conflict(
+    port: int | None,
+    instance_name: str,
+    base_dir: Path,
+    pm2_snapshot: dict[str, Any],
+    registry: dict[str, Any],
+) -> tuple[bool, str, list[int]]:
+    """Check port availability with fail-closed semantics and authoritative process ownership."""
+    if not port or port <= 0:
+        return True, "no_port_configured", []
+
+    if not pm2_snapshot:
+        return False, "PM2 snapshot is unavailable; refusing to inspect ports.", []
+
+    listening_pids: list[int] = []
+    try:
+        proc = subprocess.run(["lsof", "-t", f"-i:{port}"], capture_output=True, text=True, check=False)
+        if proc.returncode == 0 and proc.stdout:
+            for raw in proc.stdout.splitlines():
+                raw = raw.strip()
+                if raw.isdigit():
+                    listening_pids.append(int(raw))
+    except (FileNotFoundError, PermissionError):
+        return True, "lsof_unavailable", []
+
+    if not listening_pids:
+        return True, "port_clear", []
+
+    managed_entries = {inst.get("pm2_name"): inst for inst in registry.get("instances", [])}
+    pm2_pid_map = {}
+    for name, p in pm2_snapshot.items():
+        info = inspect_runtime_process(p, base_dir)
+        if info.get("pid"):
+            pm2_pid_map[info["pid"]] = name
+
+    killed_pids: list[int] = []
+    for pid in listening_pids:
+        if pid == os.getpid():
+            continue
+        # If pid is in PM2:
+        if pid in pm2_pid_map:
+            owning_inst = pm2_pid_map[pid]
+            if owning_inst == instance_name:
+                # Current process of this instance; PM2 reload will handle cutover
+                continue
+            # Port collision with another PM2 instance!
+            return False, f"Port {port} is occupied by active PM2 instance '{owning_inst}' (PID {pid}). Aborting deploy.", []
+
+        # Check if it belongs to an unmanaged process
+        for p in pm2_snapshot.values():
+            if p.get("name") not in managed_entries and p.get("pid") == pid:
+                return False, f"Port {port} is occupied by protected unmanaged process '{p.get('name')}' (PID {pid}). Aborting deploy.", []
+
+        # Non-PM2 process: verify ownership
+        is_proven_orphan = verify_process_ownership(pid, instance_name, base_dir, port)
+        if not is_proven_orphan:
+            # FAIL CLOSED: Cannot kill unknown/foreign process
+            return False, f"Port {port} is bound by unknown foreign process PID {pid}. Ownership cannot be proven. Aborting deploy to prevent outage.", []
+
+        # Terminate proven orphan
+        try:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.3)
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            killed_pids.append(pid)
+        except OSError:
+            pass
+
+    return True, "port_ready", killed_pids
+
+
+def cleanup_instance_ghost_port(
+    port: int | None,
+    pm2_pids: set[int],
+    instance_name: str | None = None,
+    base_dir: Path = DEFAULT_BASE_DIR,
+) -> list[int]:
+    """Clean up orphan process on port; targets ONLY the instance's specific port."""
     if not port or port <= 0:
         return []
 
@@ -371,9 +695,11 @@ def cleanup_instance_ghost_port(port: int | None, pm2_pids: set[int]) -> list[in
                     continue
                 pid = int(raw_pid)
                 if pid not in pm2_pids and pid != os.getpid():
+                    if instance_name and not verify_process_ownership(pid, instance_name, base_dir, port):
+                        continue
                     try:
                         os.kill(pid, signal.SIGTERM)
-                        time.sleep(0.2)
+                        time.sleep(0.1)
                         if os.path.exists(f"/proc/{pid}"):
                             os.kill(pid, signal.SIGKILL)
                         killed_pids.append(pid)
@@ -390,7 +716,7 @@ def cleanup_instance_ghost_port(port: int | None, pm2_pids: set[int]) -> list[in
 # =============================================================================
 
 def get_pm2_cmd() -> list[str]:
-    """Return the PM2 executable command as a list (allowing test overrides via PM2_CMD)."""
+    """Return the PM2 executable command as a list."""
     raw = os.environ.get("PM2_CMD", "pm2")
     return shlex.split(raw)
 
@@ -416,11 +742,7 @@ def inspect_runtime_process(
     process: dict[str, Any],
     base_dir: Path = DEFAULT_BASE_DIR,
 ) -> dict[str, Any]:
-    """Inspect actual running process attributes, resolving cwd symlinks and REVISION.
-
-    Rather than trusting APP_REVISION from env, inspects /proc/<pid>/cwd (on Linux)
-    or pm_cwd/pm_exec_path, follows symlinks to the real release directory, and reads REVISION.
-    """
+    """Inspect actual running process attributes, resolving cwd symlinks and REVISION."""
     pm2_env = process.get("pm2_env") if isinstance(process.get("pm2_env"), dict) else {}
     pid = pm2_env.get("pid") or process.get("pid")
     status = pm2_env.get("status") or process.get("status") or "unknown"
@@ -432,7 +754,7 @@ def inspect_runtime_process(
     resolved_root: Path | None = None
     proc_cwd_link: Path | None = None
 
-    # Try Linux /proc/<pid>/cwd inspection first
+    # Linux /proc/<pid>/cwd inspection
     if pid and isinstance(pid, int):
         proc_cwd_path = Path(f"/proc/{pid}/cwd")
         if proc_cwd_path.exists():
@@ -464,7 +786,6 @@ def inspect_runtime_process(
             except OSError:
                 pass
 
-    # Determine deployment isolation mode
     mode = "unknown"
     resolved_str = str(resolved_root) if resolved_root else ""
     if "/releases/" in resolved_str:
@@ -504,8 +825,29 @@ def reload_pm2_instance(
     instance_name: str,
     pm2_config: Path = DEFAULT_ECOSYSTEM_PATH,
     runtime_env: Path | None = None,
+    restart: bool = False,
 ) -> tuple[bool, str]:
-    """Reload exactly ONE PM2 instance with --update-env without touching any other instance."""
+    """Reload exactly ONE PM2 instance with --update-env without touching any other instance.
+
+    If restart=True (e.g. migrating between legacy and isolated layouts where cwd/script changes),
+    clears the PM2 process descriptor first so PM2 re-evaluates the ecosystem config fresh.
+    """
+    env = os.environ.copy()
+    if runtime_env and runtime_env.is_file():
+        env["PROD_RUNTIME_ENV"] = str(runtime_env)
+
+    if restart:
+        try:
+            subprocess.run(
+                get_pm2_cmd() + ["delete", instance_name],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+        except Exception:
+            pass
+
     cmd = get_pm2_cmd() + [
         "startOrReload",
         str(pm2_config),
@@ -582,85 +924,139 @@ def deploy_canary(
     auto_rollback: bool = True,
     registry: dict[str, Any] | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
-    """Perform an isolated canary deployment for a single bot instance.
-
-    1. Ensures target release is staged into releases/<target_sha>.
-    2. Atomically switches deployments/<instance_name> to the new release.
-    3. Reloads ONLY this PM2 instance.
-    4. Validates health and runtime SHA.
-    5. If verification fails and auto_rollback=True, automatically rolls back to previous target.
-    """
+    """Perform an isolated canary deployment for a single bot instance."""
     reg = registry or load_registry()
     entry = get_instance_by_name(reg, instance_name)
     if not entry:
         return False, f"Instance '{instance_name}' not found in registry", {}
 
-    # 1. Stage the release
-    release_dir = stage_release(base_dir=base_dir, target_sha=target_sha)
+    if not entry.get("deploy_managed", True) or not entry.get("active", True):
+        return False, f"Instance '{instance_name}' is not deploy_managed or active", {}
 
-    # 2. Collect current state for potential rollback
-    deployment_link = base_dir / "deployments" / instance_name
-    previous_target = deployment_link.resolve() if deployment_link.is_symlink() or deployment_link.is_dir() else None
+    with lock_instance(base_dir, instance_name):
+        state = load_instance_state(base_dir, instance_name)
 
-    # Targeted ghost port check
-    port = entry.get("port")
-    snapshot_before = load_pm2_snapshot()
-    pm2_pids = {
-        inspect_runtime_process(p, base_dir)["pid"]
-        for p in snapshot_before.values()
-        if inspect_runtime_process(p, base_dir)["pid"]
-    }
-    cleaned_ghost_pids = cleanup_instance_ghost_port(port, pm2_pids)
+        # 1. Stage the release from Git commit tree
+        release_dir = stage_release(base_dir=base_dir, target_sha=target_sha)
 
-    # 3. Atomically switch the deployment symlink
-    atomic_symlink_switch(base_dir, instance_name, release_dir)
+        # 2. Check Python interpreter
+        interpreter = resolve_release_python_interpreter(release_dir, base_dir)
+        py_ok, py_msg = verify_python_interpreter(interpreter)
+        if not py_ok:
+            return False, f"Target python interpreter check failed: {py_msg}", {}
 
-    # 4. Reload PM2 ONLY for this instance
-    reload_ok, reload_msg = reload_pm2_instance(
-        instance_name=instance_name,
-        pm2_config=pm2_config,
-        runtime_env=runtime_env,
-    )
-    if not reload_ok:
-        if auto_rollback and previous_target:
-            atomic_symlink_switch(base_dir, instance_name, previous_target)
-            reload_pm2_instance(instance_name, pm2_config, runtime_env)
-        return False, f"PM2 reload failed: {reload_msg}", {"ghost_pids_killed": cleaned_ghost_pids}
+        # 3. Capture previous state
+        deployment_link = base_dir / "deployments" / instance_name
+        previous_target: Path | None = None
+        is_first_migration = False
+        if deployment_link.is_symlink() or deployment_link.is_dir():
+            try:
+                previous_target = deployment_link.resolve()
+            except OSError:
+                previous_target = None
+        else:
+            is_first_migration = True
 
-    # 5. Verify instance health
-    health_ok, errors = verify_instance_health(
-        instance_name=instance_name,
-        expected_sha=target_sha,
-        settle_seconds=settle_seconds,
-        base_dir=base_dir,
-    )
+        previous_sha = state.get("current_release_sha")
+        if not previous_sha and previous_target and (previous_target / "REVISION").is_file():
+            try:
+                previous_sha = (previous_target / "REVISION").read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
 
-    if not health_ok:
-        rollback_msg = ""
-        if auto_rollback:
-            if previous_target:
-                atomic_symlink_switch(base_dir, instance_name, previous_target)
-                reload_pm2_instance(instance_name, pm2_config, runtime_env)
-                rollback_msg = f" (auto-rolled back to {previous_target.name})"
-            else:
-                # If first migration, remove symlink to revert to legacy
+        # 4. Port safety check (fail-closed)
+        port = entry.get("port")
+        snapshot_before = load_pm2_snapshot()
+        if not snapshot_before:
+            return False, "PM2 snapshot unavailable; aborting deploy.", {}
+
+        port_ok, port_msg, cleaned_ghost_pids = check_and_resolve_port_conflict(
+            port=port,
+            instance_name=instance_name,
+            base_dir=base_dir,
+            pm2_snapshot=snapshot_before,
+            registry=reg,
+        )
+        if not port_ok:
+            return False, f"Port safety check failed: {port_msg}", {}
+
+        # 5. Atomically switch symlink
+        atomic_symlink_switch(base_dir, instance_name, release_dir)
+
+        # 6. Reload PM2
+        reload_ok, reload_msg = reload_pm2_instance(
+            instance_name=instance_name,
+            pm2_config=pm2_config,
+            runtime_env=runtime_env,
+            restart=is_first_migration,
+        )
+
+        deploy_failed = not reload_ok
+        fail_reason = f"PM2 reload failed: {reload_msg}" if deploy_failed else ""
+
+        if not deploy_failed:
+            # 7. Health verification
+            health_ok, errors = verify_instance_health(
+                instance_name=instance_name,
+                expected_sha=target_sha,
+                settle_seconds=settle_seconds,
+                base_dir=base_dir,
+            )
+            if not health_ok:
+                deploy_failed = True
+                fail_reason = f"Health check failed: {', '.join(errors)}"
+
+        if deploy_failed:
+            if not auto_rollback:
+                return False, fail_reason, {"ghost_pids_killed": cleaned_ghost_pids}
+
+            # EXECUTE STRICT AUTO-ROLLBACK
+            if is_first_migration or previous_target is None:
+                # Rollback to legacy
                 if deployment_link.is_symlink():
                     deployment_link.unlink()
-                reload_pm2_instance(instance_name, pm2_config, runtime_env)
-                rollback_msg = " (auto-rolled back to legacy newbots)"
-        return False, f"Health check failed: {', '.join(errors)}{rollback_msg}", {"errors": errors}
+                rb_ok, rb_reload_msg = reload_pm2_instance(instance_name, pm2_config, runtime_env, restart=True)
+                if not rb_ok:
+                    return False, f"CRITICAL_EMERGENCY: {fail_reason} AND rollback reload to legacy failed: {rb_reload_msg}", {}
+                rb_health, rb_errors = verify_instance_health(instance_name, expected_sha="", settle_seconds=settle_seconds, base_dir=base_dir)
+                if not rb_health:
+                    return False, f"CRITICAL_EMERGENCY: {fail_reason} AND legacy health check failed after rollback: {', '.join(rb_errors)}", {}
+                return False, f"{fail_reason} (auto-rolled back to legacy newbots successfully)", {"ghost_pids_killed": cleaned_ghost_pids}
+            else:
+                # Rollback to previous target
+                atomic_symlink_switch(base_dir, instance_name, previous_target)
+                rb_ok, rb_reload_msg = reload_pm2_instance(instance_name, pm2_config, runtime_env)
+                if not rb_ok:
+                    return False, f"CRITICAL_EMERGENCY: {fail_reason} AND rollback reload to {previous_sha[:8] if previous_sha else 'prev'} failed: {rb_reload_msg}", {}
+                rb_health, rb_errors = verify_instance_health(instance_name, expected_sha=previous_sha or "", settle_seconds=settle_seconds, base_dir=base_dir)
+                if not rb_health:
+                    return False, f"CRITICAL_EMERGENCY: {fail_reason} AND health check failed after rollback to {previous_sha[:8] if previous_sha else 'prev'}: {', '.join(rb_errors)}", {}
+                return False, f"{fail_reason} (auto-rolled back to {previous_sha[:8] if previous_sha else previous_target.name[:8]} successfully)", {"ghost_pids_killed": cleaned_ghost_pids}
 
-    # Fetch post-deploy runtime details
-    snapshot_after = load_pm2_snapshot()
-    post_info = inspect_runtime_process(snapshot_after.get(instance_name, {}), base_dir)
+        # 8. Success: Update state
+        state["previous_successful_release_sha"] = previous_sha
+        state["previous_successful_target_dir"] = str(previous_target) if previous_target else ("legacy" if is_first_migration else None)
+        state["current_release_sha"] = target_sha
+        state["current_target_dir"] = str(release_dir)
+        state["last_action"] = "deploy"
+        state["history"].append({
+            "action": "deploy",
+            "target_sha": target_sha,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "status": "success",
+        })
+        save_instance_state(base_dir, instance_name, state)
 
-    return True, f"Canary deploy of {instance_name} succeeded with SHA {target_sha[:8]}", {
-        "instance_name": instance_name,
-        "runtime_sha": post_info.get("resolved_sha"),
-        "pid": post_info.get("pid"),
-        "mode": post_info.get("mode"),
-        "ghost_pids_killed": cleaned_ghost_pids,
-    }
+        snapshot_after = load_pm2_snapshot()
+        post_info = inspect_runtime_process(snapshot_after.get(instance_name, {}), base_dir)
+
+        return True, f"Canary deploy of {instance_name} succeeded with SHA {target_sha[:8]}", {
+            "instance_name": instance_name,
+            "runtime_sha": post_info.get("resolved_sha"),
+            "pid": post_info.get("pid"),
+            "mode": post_info.get("mode"),
+            "ghost_pids_killed": cleaned_ghost_pids,
+        }
 
 
 def rollback_instance(
@@ -678,69 +1074,103 @@ def rollback_instance(
     if not entry:
         return False, f"Instance '{instance_name}' not found in registry", {}
 
-    deployment_link = base_dir / "deployments" / instance_name
-    releases_dir = base_dir / "releases"
+    with lock_instance(base_dir, instance_name):
+        state = load_instance_state(base_dir, instance_name)
+        deployment_link = base_dir / "deployments" / instance_name
+        releases_dir = base_dir / "releases"
 
-    target_release_dir: Path | None = None
+        target_release_dir: Path | None = None
+        resolved_target_sha: str | None = None
 
-    if target_sha:
-        target_release_dir = releases_dir / target_sha
-        if not target_release_dir.is_dir():
-            # Check for prefix match
-            candidates = [d for d in releases_dir.glob(f"{target_sha}*") if d.is_dir()]
-            if candidates:
-                target_release_dir = candidates[0]
+        if target_sha:
+            target_release_dir = releases_dir / target_sha
+            if not target_release_dir.is_dir():
+                candidates = [d for d in releases_dir.glob(f"{target_sha}*") if d.is_dir()]
+                if candidates:
+                    target_release_dir = candidates[0]
+                else:
+                    return False, f"Target release for SHA '{target_sha}' not found in {releases_dir}", {}
+            resolved_target_sha = target_release_dir.name
+        else:
+            # Use previous successful release of THIS instance
+            prev_sha = state.get("previous_successful_release_sha")
+            if prev_sha:
+                target_release_dir = releases_dir / prev_sha
+                if not target_release_dir.is_dir():
+                    return False, f"Recorded previous release '{prev_sha[:8]}' not found in {releases_dir}", {}
+                resolved_target_sha = prev_sha
             else:
-                return False, f"Target release for SHA '{target_sha}' not found in {releases_dir}", {}
-    else:
-        # If no target specified, select the latest release different from current
-        current_target = deployment_link.resolve() if deployment_link.is_symlink() else None
-        available = [
-            d for d in releases_dir.iterdir()
-            if d.is_dir() and not d.name.startswith(".") and (current_target is None or d != current_target)
-        ]
-        if not available:
-            return False, "No previous releases available in releases/ to roll back to", {}
-        # Sort by modification time descending
-        available.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-        target_release_dir = available[0]
+                prev_target = state.get("previous_successful_target_dir")
+                if prev_target == "legacy" or (not deployment_link.exists() and not state.get("current_release_sha")):
+                    if deployment_link.is_symlink():
+                        deployment_link.unlink()
+                    reload_ok, reload_msg = reload_pm2_instance(instance_name, pm2_config, runtime_env, restart=True)
+                    if not reload_ok:
+                        return False, f"PM2 reload failed during rollback to legacy: {reload_msg}", {}
+                    state["current_release_sha"] = None
+                    state["current_target_dir"] = "legacy"
+                    save_instance_state(base_dir, instance_name, state)
+                    return True, f"Rollback of {instance_name} succeeded to legacy newbots", {"mode": "legacy"}
+                return False, f"No previous successful release recorded for instance '{instance_name}'.", {}
 
-    expected_sha = ""
-    rev_file = target_release_dir / "REVISION"
-    if rev_file.is_file():
-        expected_sha = rev_file.read_text(encoding="utf-8").strip()
+        # Verify integrity of target release
+        ok, int_msg = verify_release_integrity(target_release_dir, resolved_target_sha)
+        if not ok:
+            return False, f"Integrity check failed for rollback target {resolved_target_sha[:8]}: {int_msg}", {}
 
-    # Atomically switch symlink
-    atomic_symlink_switch(base_dir, instance_name, target_release_dir)
+        # Verify interpreter
+        interpreter = resolve_release_python_interpreter(target_release_dir, base_dir)
+        py_ok, py_msg = verify_python_interpreter(interpreter)
+        if not py_ok:
+            return False, f"Rollback target python interpreter check failed: {py_msg}", {}
 
-    # Reload PM2 for this instance only
-    reload_ok, reload_msg = reload_pm2_instance(
-        instance_name=instance_name,
-        pm2_config=pm2_config,
-        runtime_env=runtime_env,
-    )
-    if not reload_ok:
-        return False, f"PM2 reload failed during rollback: {reload_msg}", {}
+        current_sha_before = state.get("current_release_sha")
 
-    # Verify health
-    health_ok, errors = verify_instance_health(
-        instance_name=instance_name,
-        expected_sha=expected_sha,
-        settle_seconds=settle_seconds,
-        base_dir=base_dir,
-    )
-    if not health_ok:
-        return False, f"Health check failed after rollback: {', '.join(errors)}", {"errors": errors}
+        # Atomically switch symlink
+        atomic_symlink_switch(base_dir, instance_name, target_release_dir)
 
-    snapshot = load_pm2_snapshot()
-    info = inspect_runtime_process(snapshot.get(instance_name, {}), base_dir)
+        # Reload PM2
+        reload_ok, reload_msg = reload_pm2_instance(
+            instance_name=instance_name,
+            pm2_config=pm2_config,
+            runtime_env=runtime_env,
+        )
+        if not reload_ok:
+            return False, f"PM2 reload failed during rollback: {reload_msg}", {}
 
-    return True, f"Rollback of {instance_name} succeeded to {target_release_dir.name[:8]}", {
-        "instance_name": instance_name,
-        "runtime_sha": info.get("resolved_sha"),
-        "pid": info.get("pid"),
-        "mode": info.get("mode"),
-    }
+        # Verify health
+        health_ok, errors = verify_instance_health(
+            instance_name=instance_name,
+            expected_sha=resolved_target_sha,
+            settle_seconds=settle_seconds,
+            base_dir=base_dir,
+        )
+        if not health_ok:
+            return False, f"Health check failed after rollback: {', '.join(errors)}", {"errors": errors}
+
+        # Update state
+        state["previous_successful_release_sha"] = current_sha_before
+        state["previous_successful_target_dir"] = str(deployment_link.resolve())
+        state["current_release_sha"] = resolved_target_sha
+        state["current_target_dir"] = str(target_release_dir)
+        state["last_action"] = "rollback"
+        state["history"].append({
+            "action": "rollback",
+            "target_sha": resolved_target_sha,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "status": "success",
+        })
+        save_instance_state(base_dir, instance_name, state)
+
+        snapshot = load_pm2_snapshot()
+        info = inspect_runtime_process(snapshot.get(instance_name, {}), base_dir)
+
+        return True, f"Rollback of {instance_name} succeeded to {resolved_target_sha[:8]}", {
+            "instance_name": instance_name,
+            "runtime_sha": info.get("resolved_sha"),
+            "pid": info.get("pid"),
+            "mode": info.get("mode"),
+        }
 
 
 # =============================================================================
@@ -752,41 +1182,51 @@ def prune_releases(
     keep: int = 5,
     dry_run: bool = False,
 ) -> tuple[list[str], list[str]]:
-    """Prune inactive releases, always protecting releases referenced by deployments/*.
-
-    Returns (pruned_shas, retained_shas).
-    """
+    """Prune inactive releases, strictly protecting active deployments AND instance rollback targets."""
     releases_dir = base_dir / "releases"
     deployments_dir = base_dir / "deployments"
     if not releases_dir.is_dir():
         return [], []
 
-    # 1. Identify all active releases directly referenced by any deployment symlink
-    active_release_dirs: set[Path] = set()
+    protected_shas: set[str] = set()
+
+    # 1. Active deployment symlinks
     if deployments_dir.is_dir():
         for link in deployments_dir.iterdir():
+            if link.name == STATE_DIR_NAME or link.name.startswith("."):
+                continue
             if link.is_symlink() or link.is_dir():
                 try:
-                    active_release_dirs.add(link.resolve())
+                    resolved = link.resolve()
+                    protected_shas.add(resolved.name)
                 except OSError:
                     pass
 
-    # 2. Collect all valid release directories
+    # 2. Instance state rollback targets and current SHAs
+    state_dir = deployments_dir / STATE_DIR_NAME
+    if state_dir.is_dir():
+        for st_file in state_dir.glob("*.json"):
+            try:
+                st = json.loads(st_file.read_text(encoding="utf-8"))
+                if st.get("current_release_sha"):
+                    protected_shas.add(st["current_release_sha"])
+                if st.get("previous_successful_release_sha"):
+                    protected_shas.add(st["previous_successful_release_sha"])
+            except Exception:
+                pass
+
     all_releases = [
         d for d in releases_dir.iterdir()
         if d.is_dir() and not d.name.startswith(".")
     ]
-    # Sort by mtime descending (newest first)
     all_releases.sort(key=lambda d: d.stat().st_mtime, reverse=True)
 
     retained: list[str] = []
     pruned: list[str] = []
 
-    keep_count = max(keep, len(active_release_dirs))
-
     for idx, rel in enumerate(all_releases):
-        is_active = rel in active_release_dirs
-        if is_active or idx < keep:
+        is_protected = (rel.name in protected_shas) or any(s.startswith(rel.name) or rel.name.startswith(s) for s in protected_shas)
+        if is_protected or idx < keep:
             retained.append(rel.name)
         else:
             if not dry_run:

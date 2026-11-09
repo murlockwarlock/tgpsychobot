@@ -152,6 +152,15 @@ if [[ -n "$PASSWORD" ]]; then
     SSH_CMD=(sshpass -e "${SSH_CMD[@]}")
 fi
 
+echo "Verifying that target instances are safe for legacy deploy..."
+"${SSH_CMD[@]}" "${USER_NAME}@${HOST}" \
+    "if [[ -f '${REMOTE_DIR}/scripts/verify_bot_instances.py' ]]; then \
+         '${REMOTE_PY}' '${REMOTE_DIR}/scripts/verify_bot_instances.py' \
+             --check-legacy-safety \
+             --base-dir '${PROD_BASE_DIR:-/root/telegram_bots}' \
+             --pm2-names '${PM2_NAMES}'; \
+     fi"
+
 tar czf - -- "${TRACKED_FILES[@]}" | \
 "${SSH_CMD[@]}" "${USER_NAME}@${HOST}" \
     "cd '${REMOTE_DIR}' && tar xzf -"

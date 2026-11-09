@@ -406,12 +406,18 @@ import sys
 raise RuntimeError("Fatal startup crash in bad release")
 """
 
+    req_content = "aiogram==3.1.1\n"
+    tmp_req_p = base_dir / "tmp_req.txt"
+    tmp_req_p.write_text(req_content, encoding="utf-8")
+    real_req_hash = rm.hash_requirements(tmp_req_p)
+    tmp_req_p.unlink()
+
     # Stage Release A
     rel_a = releases_dir / MOCK_SHA_A
     rel_a.mkdir()
     (rel_a / "REVISION").write_text(f"{MOCK_SHA_A}\n")
-    (rel_a / "requirements.txt").write_text("aiogram==3.1.1\n")
-    (rel_a / "requirements.sha256").write_text("hash_a\n")
+    (rel_a / "requirements.txt").write_text(req_content)
+    (rel_a / "requirements.sha256").write_text(f"{real_req_hash}\n")
     (rel_a / "main.py").write_text(worker_code)
     (rel_a / "max_messenger_bot").mkdir()
     (rel_a / "max_messenger_bot" / "__init__.py").write_text("")
@@ -421,8 +427,8 @@ raise RuntimeError("Fatal startup crash in bad release")
     rel_b = releases_dir / MOCK_SHA_B
     rel_b.mkdir()
     (rel_b / "REVISION").write_text(f"{MOCK_SHA_B}\n")
-    (rel_b / "requirements.txt").write_text("aiogram==3.1.1\n")
-    (rel_b / "requirements.sha256").write_text("hash_a\n")
+    (rel_b / "requirements.txt").write_text(req_content)
+    (rel_b / "requirements.sha256").write_text(f"{real_req_hash}\n")
     (rel_b / "main.py").write_text(worker_code)
     (rel_b / "max_messenger_bot").mkdir()
     (rel_b / "max_messenger_bot" / "__init__.py").write_text("")
@@ -432,8 +438,8 @@ raise RuntimeError("Fatal startup crash in bad release")
     rel_c = releases_dir / MOCK_SHA_C
     rel_c.mkdir()
     (rel_c / "REVISION").write_text(f"{MOCK_SHA_C}\n")
-    (rel_c / "requirements.txt").write_text("aiogram==3.1.1\n")
-    (rel_c / "requirements.sha256").write_text("hash_a\n")
+    (rel_c / "requirements.txt").write_text(req_content)
+    (rel_c / "requirements.sha256").write_text(f"{real_req_hash}\n")
     (rel_c / "main.py").write_text(crashing_worker_code)
 
     ecosystem_path = base_dir / "ecosystem.config.js"
@@ -535,7 +541,7 @@ def test_real_runtime_canary_deploy_isolation(runtime_harness, monkeypatch):
     )
 
     # Intercept reload_pm2_instance to update MockPm2Harness for the target instance
-    def mock_reload(instance_name, pm2_config=None, runtime_env=None):
+    def mock_reload(instance_name, pm2_config=None, runtime_env=None, **kwargs):
         target_link = base_dir / "deployments" / instance_name
         pm2.reload_process(
             instance_name,
@@ -590,7 +596,7 @@ def test_real_runtime_max_bot_module_execution(runtime_harness, monkeypatch):
         app_port=8099,
     )
 
-    def mock_reload(instance_name, pm2_config=None, runtime_env=None):
+    def mock_reload(instance_name, pm2_config=None, runtime_env=None, **kwargs):
         target_link = base_dir / "deployments" / instance_name
         pm2.reload_process(
             instance_name,
@@ -645,7 +651,7 @@ def test_real_runtime_shared_db_isolation(runtime_harness, monkeypatch):
         app_port=8099,
     )
 
-    def mock_reload(instance_name, pm2_config=None, runtime_env=None):
+    def mock_reload(instance_name, pm2_config=None, runtime_env=None, **kwargs):
         target_link = base_dir / "deployments" / instance_name
         if instance_name.startswith("max_"):
             pm2.reload_process(
@@ -710,7 +716,7 @@ def test_real_runtime_targeted_rollback(runtime_harness, monkeypatch):
         app_port=8083,
     )
 
-    def mock_reload(instance_name, pm2_config=None, runtime_env=None):
+    def mock_reload(instance_name, pm2_config=None, runtime_env=None, **kwargs):
         target_link = base_dir / "deployments" / instance_name
         pm2.reload_process(
             instance_name,
@@ -765,7 +771,7 @@ def test_failure_injection_startup_crash_triggers_automatic_rollback(runtime_har
         app_port=8083,
     )
 
-    def mock_reload(instance_name, pm2_config=None, runtime_env=None):
+    def mock_reload(instance_name, pm2_config=None, runtime_env=None, **kwargs):
         target_link = base_dir / "deployments" / instance_name
         pm2.reload_process(
             instance_name,

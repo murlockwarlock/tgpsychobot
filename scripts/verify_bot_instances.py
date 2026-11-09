@@ -750,6 +750,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--migration-aware", action="store_true")
     parser.add_argument("--cutover-pm2-name")
     parser.add_argument("--steady-state", action="store_true")
+    parser.add_argument("--check-legacy-safety", action="store_true", help="Ensure target instances are not migrated to isolated releases")
+    parser.add_argument("--base-dir", default="/root/telegram_bots", help="Base directory for bots")
     return parser
 
 
@@ -766,6 +768,26 @@ def main(argv: list[str] | None = None) -> int:
         print("registry=failed")
         print("errors=" + ",".join(count_errors))
         return 1
+    if args.check_legacy_safety:
+        base_dir = Path(args.base_dir)
+        deployments_dir = base_dir / "deployments"
+        selected_names = parse_names(args.pm2_names) if args.pm2_names else [i["pm2_name"] for i in managed_instances(registry)]
+        migrated: list[str] = []
+        if deployments_dir.is_dir():
+            for name in selected_names:
+                link = deployments_dir / name
+                if link.is_symlink() or link.is_dir():
+                    migrated.append(name)
+        if migrated:
+            print("legacy_deploy_safety=failed")
+            print(f"migrated_instances={','.join(migrated)}")
+            print(
+                f"error=Refusing legacy deploy: {len(migrated)} instance(s) migrated to isolated release management ({', '.join(migrated)}). "
+                f"Use 'scripts/release_manager.py deploy' instead."
+            )
+            return 1
+        print("legacy_deploy_safety=ok")
+        return 0
     if args.print_pm2_names or args.print_legacy_pm2_names:
         selected_names = parse_names(args.pm2_names) if args.pm2_names else None
         if args.print_legacy_pm2_names:

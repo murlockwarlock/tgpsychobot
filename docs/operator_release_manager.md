@@ -15,6 +15,12 @@ This guide describes how to operate the versioned, isolated release management s
 │       ├── requirements.sha256
 │       └── ...
 ├── deployments/
+│   ├── .state/                 # Per-instance deployment state metadata
+│   │   ├── tg_autobusbusbot_new.json
+│   │   └── ...
+│   ├── .locks/                 # Per-instance process locks (flock)
+│   │   ├── tg_autobusbusbot_new.lock
+│   │   └── ...
 │   ├── tg_autobusbusbot_new -> /root/telegram_bots/releases/<sha_A>
 │   ├── max_se13639182_bot_legacy -> /root/telegram_bots/releases/<sha_B>
 │   └── ...
@@ -77,7 +83,7 @@ python3 scripts/release_manager.py preflight --target-sha <commit_sha>
 
 ## 4. Canary Deployment (`deploy --canary`)
 
-Stages the immutable release into `releases/<commit_sha>`, atomically updates ONLY the targeted instance's symlink, checks for ghost processes holding only its configured port, and reloads only that instance via PM2 (`--only <name> --update-env`).
+Stages the immutable release directly from Git commit tree (`git archive <sha>`), verifies 40-char SHA integrity, updates ONLY the targeted instance's symlink atomically via `os.replace`, checks for port conflicts, and reloads only that instance via PM2 (`--only <name> --update-env`).
 
 ```bash
 python3 scripts/release_manager.py deploy \
@@ -86,17 +92,18 @@ python3 scripts/release_manager.py deploy \
     --settle-seconds 3
 ```
 
-- If post-reload healthcheck fails, the tool automatically rolls back the symlink and reloads the previous working version.
-- Other instances on the same host or sharing the same database remain completely unaffected.
+- **Per-Instance Locking**: An exclusive non-blocking lock (`deployments/.locks/<instance>.lock` via `fcntl.flock`) serializes deployments and rollbacks per instance. Concurrent operations on the same bot fail fast with `RuntimeError`.
+- **Fail-Safe Automatic Rollback**: If post-reload readiness check or runtime SHA verification fails, the release manager automatically rolls back the instance symlink and restarts the previously running version.
+- **Neighbor Isolation**: Other instances on the same host or sharing the same database remain completely unaffected.
 
 ---
 
 ## 5. Rollback of an Instance (`rollback`)
 
-Atomically points the instance's deployment symlink back to a previous release and reloads only that instance:
+Rollback is strictly deterministic and governed by the instance's history stored in `deployments/.state/<instance>.json`:
 
 ```bash
-# Roll back to the immediately preceding release
+# Roll back to the immediately preceding confirmed release recorded in instance state
 python3 scripts/release_manager.py rollback \
     --instance tg_autobusbusbot_new
 
@@ -106,9 +113,48 @@ python3 scripts/release_manager.py rollback \
     --target-sha <previous_sha>
 ```
 
+### Why Rollback Never Relies on Directory `mtime`:
+In a multi-tenant or multi-bot architecture, staging release C for Bot 1 updates timestamps or creates new directories in `/releases`. If Bot 2 (running release B) rolls back using directory modification times, it would incorrectly roll to release C or the newest staged release.
+Instead:
+- Every deployment updates `deployments/.state/<instance>.json`:
+  ```json
+  {
+    "instance_name": "tg_autobusbusbot_new",
+    "current_release_sha": "e56f707c22917aa2de86bc763ec0918681a5b845",
+    "previous_successful_release_sha": "6150e530aea37ac225babebd79c2702ae4fe83f8",
+    "mode": "isolated",
+    "updated_at": "2026-11-10T02:00:00Z"
+  }
+  ```
+- When `--target-sha` is not provided, the rollback command reads `previous_successful_release_sha` from the instance state.
+- If the bot was previously running in `legacy` mode (`newbots`), rolling back removes the symlink and restores legacy execution in PM2.
+
 ---
 
-## 6. Migrating a Legacy Instance (`migrate-instance`)
+## 6. Port Conflict & Process Ownership Verification (`verify_process_ownership`)
+
+Before reloading an instance, the release manager inspects the configured port:
+- If a process is listening on the port, the release manager checks whether the PID is managed by PM2.
+- If not managed by PM2, it checks **authoritative process ownership**:
+  - Checks `/proc/<pid>/cmdline` (or `ps -p <pid> -o command=`).
+  - Checks `/proc/<pid>/cwd` (or `lsof -p <pid>`).
+  - The process is identified as a stale ghost ONLY IF its cmdline and cwd match the instance's deployment or legacy directory and script (`main.py` or `-m max_messenger_bot.app`).
+- **Fail-Closed Semantics**: If the process belongs to another service (e.g. system daemon, unrelated bot, foreign service), it is **NEVER killed**. The release manager aborts with `RuntimeError` describing the foreign PID, process name, and user, requiring manual operator intervention.
+
+---
+
+## 7. Legacy Deploy Protection (`--check-legacy-safety`)
+
+To prevent accidental legacy deployments (`deploy_prod.sh`) from overwriting code or restarting bots that have already been migrated to isolated releases:
+
+1. `scripts/verify_bot_instances.py --check-legacy-safety --base-dir <root>`:
+   - Scans `deployments/*` for active isolated symlinks.
+   - If an operator tries to run `deploy_prod.sh --target <instance>` for an instance that is already migrated to isolated deployments, the command fails immediately with an error and instructions to use `scripts/release_manager.py deploy`.
+2. `deploy_prod.sh` includes an SSH preflight step that runs `--check-legacy-safety` before any tarball is transferred or extracted.
+
+---
+
+## 8. Migrating a Legacy Instance (`migrate-instance`)
 
 Transitions an unmigrated bot running from `/newbots` to the isolated layout:
 
@@ -118,16 +164,65 @@ python3 scripts/release_manager.py migrate-instance \
     --target-sha <commit_sha>
 ```
 
+When switching from legacy to isolated mode, the release manager performs a fresh PM2 cutover (`pm2 delete <instance>` followed by starting the instance from `ecosystem.config.js`) to guarantee PM2 evaluates the new cwd and interpreter without worker caching.
+
 ---
 
-## 7. Pruning Old Inactive Releases (`prune`)
+## 9. Pruning Old Inactive Releases (`prune`)
 
-Prunes unreferenced releases while protecting all releases currently pointed to by any `deployments/*` symlink:
+Prunes unreferenced releases while protecting:
+- All releases currently pointed to by any `deployments/<instance>` symlink.
+- All releases referenced as `previous_successful_release_sha` across all `deployments/.state/*.json` files.
+- Even if an operator runs `stage_release --force` or `prune --keep 0`, protected releases cannot be deleted.
 
 ```bash
 # Dry run to see what would be pruned
 python3 scripts/release_manager.py prune --keep 5 --dry-run
 
-# Prune keeping latest 5 releases plus all active releases
+# Prune keeping latest 5 releases plus all protected releases
 python3 scripts/release_manager.py prune --keep 5
 ```
+
+---
+
+## 10. Emergency Recovery & Manual Fallback
+
+In the event of an infrastructure or release manager failure:
+
+### A. Manual Rollback of an Isolated Bot
+If `release_manager.py` cannot be run:
+1. Re-point the instance symlink:
+   ```bash
+   ln -sfn /root/telegram_bots/releases/<previous_working_sha> /root/telegram_bots/deployments/<instance_name>
+   ```
+2. Restart the PM2 process:
+   ```bash
+   pm2 restart <instance_name> --update-env
+   ```
+
+### B. Fallback to Legacy Directory
+If a migrated bot needs to be urgently restored to the legacy `/newbots` directory:
+1. Remove the isolated deployment symlink:
+   ```bash
+   rm /root/telegram_bots/deployments/<instance_name>
+   ```
+2. Delete and recreate the PM2 process from `ecosystem.config.js`:
+   ```bash
+   pm2 delete <instance_name>
+   pm2 start /root/telegram_bots/ecosystem.config.js --only <instance_name> --update-env
+   ```
+3. Update or remove the state file:
+   ```bash
+   rm /root/telegram_bots/deployments/.state/<instance_name>.json
+   ```
+
+### C. Foreign Port Conflict Resolution
+If deployment aborts due to `PORT_CONFLICT: Port <port> is occupied by foreign process <pid> (<cmd>)`:
+1. Check who owns the port:
+   ```bash
+   lsof -i :<port>
+   ```
+2. If it is an orphaned test process or incorrect service, stop it explicitly.
+3. Re-run `release_manager.py deploy --canary <instance> --target-sha <sha>`.
+
+

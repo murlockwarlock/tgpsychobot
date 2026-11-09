@@ -355,15 +355,26 @@ apps.forEach(app => {
   const isIsolated = fs.existsSync(deploymentDir);
   const appRoot = isIsolated ? deploymentDir : (app.cwd || LEGACY_DIR);
 
+  // Dynamic Python interpreter resolution:
+  // Prefer release-specific isolated venv if available, otherwise fallback to REMOTE_PY.
+  let pythonInterpreter = REMOTE_PY;
+  const isolatedVenvPy = path.join(appRoot, "venv", "bin", "python");
+  const isolatedVenvPy3 = path.join(appRoot, "venv", "bin", "python3");
+  if (fs.existsSync(isolatedVenvPy)) {
+    pythonInterpreter = isolatedVenvPy;
+  } else if (fs.existsSync(isolatedVenvPy3)) {
+    pythonInterpreter = isolatedVenvPy3;
+  }
+
   if (app.name && app.name.startsWith("max_")) {
-    app.script = REMOTE_PY;
+    app.script = pythonInterpreter;
     app.args = "-m max_messenger_bot.app";
     app.interpreter = "none";
     app.cwd = appRoot;
   } else {
     app.script = path.join(appRoot, "main.py");
     app.cwd = appRoot;
-    app.interpreter = REMOTE_PY;
+    app.interpreter = pythonInterpreter;
   }
 
   app.env.APP_DIR = appRoot;
