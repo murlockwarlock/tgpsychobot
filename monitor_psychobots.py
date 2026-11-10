@@ -923,6 +923,28 @@ async def check_nl_infrastructure(http: aiohttp.ClientSession, proxy_url: str | 
     return issues
 
 
+def is_bot_blocked_or_suspended_log(text: str) -> bool:
+    """
+    True if the log line or exception text represents a normal user action:
+    the user blocked the bot in Telegram or chat was suspended/denied in MAX.
+    Specific to recipient block/suspend - other Forbidden errors remain unsuppressed.
+    """
+    if not text or not isinstance(text, str):
+        return False
+    lowered = text.lower()
+    # Telegram user-blocked indicators:
+    if "bot was blocked by the user" in lowered or "bot was blocked" in lowered or "bot_blocked" in lowered or "blocked by the user" in lowered:
+        return True
+    # MAX recipient suspended / denied indicators:
+    if "chat.denied" in lowered and ("suspended" in lowered or "dialog" in lowered):
+        return True
+    if "error.dialog.suspended" in lowered or "max_chat_suspended" in lowered:
+        return True
+    if "user.blocked" in lowered or "suspended recipient" in lowered:
+        return True
+    return False
+
+
 def extract_log_error_summaries(chunk: str) -> list[str]:
     lines = chunk.splitlines()
     summaries: list[str] = []
@@ -938,10 +960,12 @@ def extract_log_error_summaries(chunk: str) -> list[str]:
         if "Traceback (most recent call last):" in line:
             last_file_frame = ""
             exception_line = ""
+            tb_lines = [line]
             i += 1
             while i < n:
                 tb_raw = lines[i]
                 tb_line = tb_raw.strip()
+                tb_lines.append(tb_raw)
                 if not tb_line:
                     i += 1
                     continue
@@ -953,6 +977,9 @@ def extract_log_error_summaries(chunk: str) -> list[str]:
                     exception_line = tb_line
                     i += 1
                     break
+
+            if is_bot_blocked_or_suspended_log(exception_line) or any(is_bot_blocked_or_suspended_log(l) for l in tb_lines):
+                continue
 
             frame_info = ""
             if last_file_frame:
@@ -969,7 +996,8 @@ def extract_log_error_summaries(chunk: str) -> list[str]:
             continue
 
         if LOG_ERROR_RE.search(line):
-            summaries.append(line)
+            if not is_bot_blocked_or_suspended_log(line):
+                summaries.append(line)
         i += 1
 
     return summaries
@@ -1001,6 +1029,10 @@ def read_new_log_errors(app: dict, state: dict, include_existing: bool) -> list[
     offsets[key] = size
 
     matches = extract_log_error_summaries(chunk)
+    if not matches:
+        return []
+
+    matches = [line for line in matches if not is_bot_blocked_or_suspended_log(line)]
     if not matches:
         return []
 
@@ -1157,10 +1189,11 @@ def format_issues_alert(
         lines.append(f"• Статус прокси: {html.escape(proxy_status)}")
 
     for name, issues in all_issues:
+        filtered = [i for i in issues if not is_bot_blocked_or_suspended_log(i)]
         if is_shared_network_active:
-            display_issues = [i for i in issues if not is_telegram_network_issue(i)]
+            display_issues = [i for i in filtered if not is_telegram_network_issue(i)]
         else:
-            display_issues = list(issues)
+            display_issues = filtered
 
         if display_issues:
             lines.append(f"\n<b>{html.escape(name)}</b>")
@@ -1561,7 +1594,9 @@ async def run_check(
         remaining_issues = []
         for name, issues in all_issues:
             display_issues = [
-                i for i in issues if not (is_shared_network and is_telegram_network_issue(i))
+                i for i in issues
+                if not (is_shared_network and is_telegram_network_issue(i))
+                and not is_bot_blocked_or_suspended_log(i)
             ]
             if display_issues:
                 remaining_issues.append((name, display_issues))

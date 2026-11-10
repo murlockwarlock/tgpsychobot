@@ -30,6 +30,7 @@ from notification_transport import (
     NotificationDeliveryResult,
     build_robokassa_pending_keyboard,
     build_subscribe_keyboard,
+    is_bot_blocked_reason,
     send_notification_transport_result,
 )
 from translation_service import (
@@ -62,6 +63,7 @@ BACKOFF_DELAYS = [
 
 OUTBOX_DELIVERY_TIMEOUT_SECONDS = 150
 OUTBOX_LEASE_SECONDS = 300
+TERMINAL_ALERT_BACKOFF_SECONDS = [30, 60, 120, 300, 600]
 
 
 async def _prepare_outbox_payload(
@@ -520,6 +522,30 @@ async def dispatch_outbox_by_key(
                     last_err = failure_reason or "transport_delivery_terminal"
                 else:
                     last_err = "transport_delivery_timeout" if is_timeout else "transport_delivery_failed"
+
+                try:
+                    payload_data = json.loads(row.event_payload_json) if row.event_payload_json else {}
+                except Exception:
+                    payload_data = {}
+
+                is_blocked = is_bot_blocked_reason(failure_reason) or is_bot_blocked_reason(last_err)
+                already_alerted = (
+                    bool(payload_data.get("terminal_alert_sent"))
+                    or payload_data.get("terminal_alert_status") == "sent"
+                )
+                should_alert = (
+                    new_status == "failed_terminal"
+                    and row.attempts >= row.max_attempts
+                    and not is_blocked
+                    and not already_alerted
+                )
+                if should_alert:
+                    payload_data["terminal_alert_status"] = "pending"
+                    payload_data["terminal_alert_sent"] = False
+                elif is_blocked:
+                    payload_data["terminal_alert_status"] = "suppressed_blocked"
+                    payload_data["terminal_alert_sent"] = False
+
                 await session.execute(
                     update(PaymentNotificationOutbox)
                     .where(PaymentNotificationOutbox.id == row.id, PaymentNotificationOutbox.claim_token == token)
@@ -527,21 +553,36 @@ async def dispatch_outbox_by_key(
                         status=new_status,
                         claim_token=None,
                         lease_until=None,
-                        next_retry_at=now_done + backoff,
+                        next_retry_at=now_done if should_alert else (now_done + backoff),
                         last_error=last_err,
+                        event_payload_json=json.dumps(payload_data, ensure_ascii=False),
                         updated_at=now_done,
                     )
                 )
                 await session.commit()
                 if new_status == "failed_terminal":
-                    log.error(
-                        "OUTBOX_FAILED_TERMINAL | key=%s | recipient=%s | event=%s | attempts=%s",
-                        row.unique_key,
-                        row.recipient_id,
-                        row.event_type,
-                        row.attempts,
-                    )
-                    await _send_admin_terminal_failure_alert(bot, row)
+                    if is_blocked:
+                        log.info(
+                            "OUTBOX_BLOCKED_TERMINAL | key=%s | recipient=%s | event=%s | attempts=%s | reason=%s",
+                            row.unique_key,
+                            row.recipient_id,
+                            row.event_type,
+                            row.attempts,
+                            last_err,
+                        )
+                    else:
+                        log.error(
+                            "OUTBOX_FAILED_TERMINAL | key=%s | recipient=%s | event=%s | attempts=%s | reason=%s",
+                            row.unique_key,
+                            row.recipient_id,
+                            row.event_type,
+                            row.attempts,
+                            last_err,
+                        )
+                    if should_alert:
+                        row.last_error = last_err
+                        row.event_payload_json = json.dumps(payload_data, ensure_ascii=False)
+                        await _send_admin_terminal_failure_alert(bot, row, session_maker=sm)
                 else:
                     log.warning(
                         "OUTBOX_DELIVERY_RETRY_SCHEDULED | key=%s | attempts=%s | next_retry=%s | reason=%s",
@@ -556,6 +597,53 @@ async def dispatch_outbox_by_key(
         return False
 
 
+async def process_pending_terminal_failure_alerts(
+    bot: Bot | None,
+    batch_size: int = 50,
+    session_maker: Any | None = None,
+) -> int:
+    """
+    Scans for outbox records in failed_terminal that have a pending terminal failure alert,
+    and safely dispatches them via Autobus with atomic CAS claim.
+    Never resends messages to recipient users.
+    """
+    sm = session_maker or async_session_maker
+    now = datetime.utcnow()
+    delivered_alerts = 0
+
+    try:
+        async with sm() as session:
+            candidates = (
+                await session.execute(
+                    select(PaymentNotificationOutbox)
+                    .where(
+                        PaymentNotificationOutbox.status == "failed_terminal",
+                        PaymentNotificationOutbox.attempts >= PaymentNotificationOutbox.max_attempts,
+                        PaymentNotificationOutbox.next_retry_at <= now,
+                        or_(
+                            PaymentNotificationOutbox.claim_token.is_(None),
+                            PaymentNotificationOutbox.lease_until < now,
+                        ),
+                        or_(
+                            PaymentNotificationOutbox.event_payload_json.like('%"terminal_alert_status": "pending"%'),
+                            PaymentNotificationOutbox.event_payload_json.like('%"terminal_alert_status":"pending"%'),
+                        ),
+                    )
+                    .order_by(PaymentNotificationOutbox.next_retry_at.asc())
+                    .limit(batch_size)
+                )
+            ).scalars().all()
+
+        for row in candidates:
+            success = await _send_admin_terminal_failure_alert(bot, row, session_maker=sm)
+            if success:
+                delivered_alerts += 1
+    except Exception as e:
+        log.error("Error in process_pending_terminal_failure_alerts: %s", e, exc_info=e)
+
+    return delivered_alerts
+
+
 async def process_payment_notification_outbox(
     bot: Bot,
     deliver_func: Callable[..., Awaitable[bool | NotificationDeliveryResult]] = send_notification_transport_result,
@@ -566,6 +654,7 @@ async def process_payment_notification_outbox(
     Periodic background outbox worker.
     Scans for pending or expired-lease items, claims each using atomic CAS lease,
     delivers via deliver_func, and updates state.
+    Also retries pending terminal failure alerts without re-sending to user.
     Returns number of successfully delivered items.
     """
     delivered_count = 0
@@ -599,35 +688,212 @@ async def process_payment_notification_outbox(
             if success:
                 delivered_count += 1
 
+        # Safely retry any pending terminal failure alerts for failed_terminal records
+        await process_pending_terminal_failure_alerts(bot, batch_size=batch_size, session_maker=sm)
+
     except Exception as e:
         log.error("Error in process_payment_notification_outbox: %s", e, exc_info=e)
 
     return delivered_count
 
 
-async def _send_admin_terminal_failure_alert(bot: Bot, row: PaymentNotificationOutbox) -> None:
-    """Sends a bounded admin notification on terminal notification delivery failure."""
+async def _send_admin_terminal_failure_alert(
+    bot: Bot | None,
+    row: PaymentNotificationOutbox,
+    session_maker: Any | None = None,
+) -> bool:
+    """Sends a bounded admin notification on terminal notification delivery failure via Autobus.
+
+    Guarantees:
+    - Zero alerts if recipient user blocked the bot or reason is bot blocked.
+    - Zero alerts if attempts < max_attempts.
+    - Atomic CAS claim ensures no duplicate alerts across concurrent workers.
+    - Updates event_payload_json with terminal_alert_status='sent' and terminal_alert_sent=True
+      ONLY upon confirmed successful delivery via Autobus.
+    - If delivery fails or raises, terminal_alert_status remains 'pending' with retry backoff.
+    - Returns True if delivered, False otherwise.
+    """
+    row_id = getattr(row, "id", None)
+    unique_key = getattr(row, "unique_key", None)
+    claim_token = str(uuid.uuid4())
+    claimed = False
+    sm = session_maker or async_session_maker
+
     try:
-        async with async_session_maker() as session:
+        last_err = getattr(row, "last_error", None)
+        if is_bot_blocked_reason(last_err):
+            return False
+        attempts = getattr(row, "attempts", 0)
+        max_attempts = getattr(row, "max_attempts", 7)
+        if attempts < max_attempts:
+            return False
+
+        now = datetime.utcnow()
+        lease_duration = timedelta(seconds=OUTBOX_LEASE_SECONDS)
+
+        # Check SubscriptionConfig first
+        async with sm() as session:
             config = await session.get(SubscriptionConfig, 1)
             if not config or not config.notifications_enabled:
-                return
-            admin_ids = await get_all_admin_ids()
+                log.info("Admin notifications disabled via config, suppressing terminal alert for %s", unique_key or row_id)
+                return False
+
+        # Attempt atomic CAS claim on the row if row_id or unique_key is available
+        if row_id is not None or unique_key is not None:
+            async with sm() as session:
+                cond = [
+                    PaymentNotificationOutbox.status == "failed_terminal",
+                    PaymentNotificationOutbox.attempts >= PaymentNotificationOutbox.max_attempts,
+                    or_(
+                        PaymentNotificationOutbox.claim_token.is_(None),
+                        PaymentNotificationOutbox.lease_until < now,
+                    ),
+                    or_(
+                        PaymentNotificationOutbox.event_payload_json.like('%"terminal_alert_status": "pending"%'),
+                        PaymentNotificationOutbox.event_payload_json.like('%"terminal_alert_status":"pending"%'),
+                    ),
+                ]
+                if row_id is not None:
+                    cond.append(PaymentNotificationOutbox.id == row_id)
+                else:
+                    cond.append(PaymentNotificationOutbox.unique_key == unique_key)
+
+                stmt = (
+                    update(PaymentNotificationOutbox)
+                    .where(*cond)
+                    .values(
+                        claim_token=claim_token,
+                        lease_until=now + lease_duration,
+                        updated_at=now,
+                    )
+                )
+                res = await session.execute(stmt)
+                await session.commit()
+                if getattr(res, "rowcount", 0) == 1:
+                    claimed = True
+                else:
+                    log.info("Could not acquire terminal alert claim for %s (rowcount != 1)", unique_key or row_id)
+                    return False
+
+        # Load fresh row and payload under claim
+        target = row
+        payload_data: dict[str, Any] = {}
+        if claimed and (row_id is not None or unique_key is not None):
+            async with sm() as session:
+                fresh_row = await session.scalar(
+                    select(PaymentNotificationOutbox).where(
+                        (PaymentNotificationOutbox.id == row_id)
+                        if row_id is not None
+                        else (PaymentNotificationOutbox.unique_key == unique_key)
+                    )
+                )
+                if fresh_row:
+                    target = fresh_row
+                    if is_bot_blocked_reason(fresh_row.last_error):
+                        await session.execute(
+                            update(PaymentNotificationOutbox)
+                            .where(PaymentNotificationOutbox.id == fresh_row.id, PaymentNotificationOutbox.claim_token == claim_token)
+                            .values(claim_token=None, lease_until=None)
+                        )
+                        await session.commit()
+                        return False
+                    try:
+                        payload_data = json.loads(fresh_row.event_payload_json) if fresh_row.event_payload_json else {}
+                    except Exception:
+                        payload_data = {}
+                    if payload_data.get("terminal_alert_sent") or payload_data.get("terminal_alert_status") == "sent":
+                        await session.execute(
+                            update(PaymentNotificationOutbox)
+                            .where(PaymentNotificationOutbox.id == fresh_row.id, PaymentNotificationOutbox.claim_token == claim_token)
+                            .values(claim_token=None, lease_until=None)
+                        )
+                        await session.commit()
+                        return True
 
         alert_text = (
             f"🚨 СБОЙ ДОСТАВКИ УВЕДОМЛЕНИЯ (Outbox Terminal Failure)\n\n"
-            f"Событие: {row.event_type}\n"
-            f"Получатель: [id={row.recipient_id}]\n"
-            f"Провайдер: {row.provider}\n"
-            f"PayId: {row.payment_id or 'none'}\n"
-            f"Ключ: {row.unique_key}\n"
-            f"Число попыток: {row.attempts}/{row.max_attempts}\n"
+            f"Событие: {getattr(target, 'event_type', 'unknown')}\n"
+            f"Получатель: [id={getattr(target, 'recipient_id', 'unknown')}]\n"
+            f"Провайдер: {getattr(target, 'provider', 'unknown')}\n"
+            f"PayId: {getattr(target, 'payment_id', None) or 'none'}\n"
+            f"Ключ: {getattr(target, 'unique_key', unique_key or 'unknown')}\n"
+            f"Число попыток: {getattr(target, 'attempts', attempts)}/{getattr(target, 'max_attempts', max_attempts)}\n"
             f"Статус: failed_terminal (подписка и платеж не затронуты)"
         )
-        for admin_id in admin_ids:
+        from notification_routing import send_admin_notification, EventCategory
+        delivered = await send_admin_notification(
+            alert_text,
+            category=EventCategory.SYSTEM_DIAGNOSTIC,
+        )
+
+        now_done = datetime.utcnow()
+        if claimed and (row_id is not None or unique_key is not None):
+            async with sm() as session:
+                cond_update = [PaymentNotificationOutbox.claim_token == claim_token]
+                if row_id is not None:
+                    cond_update.append(PaymentNotificationOutbox.id == row_id)
+                else:
+                    cond_update.append(PaymentNotificationOutbox.unique_key == unique_key)
+
+                if delivered:
+                    payload_data["terminal_alert_status"] = "sent"
+                    payload_data["terminal_alert_sent"] = True
+                    payload_data["terminal_alert_delivered_at"] = now_done.isoformat()
+                    await session.execute(
+                        update(PaymentNotificationOutbox)
+                        .where(*cond_update)
+                        .values(
+                            claim_token=None,
+                            lease_until=None,
+                            event_payload_json=json.dumps(payload_data, ensure_ascii=False),
+                            updated_at=now_done,
+                        )
+                    )
+                    await session.commit()
+                    log.info("OUTBOX_TERMINAL_ALERT_DELIVERED | key=%s | recipient=%s", unique_key, getattr(target, "recipient_id", None))
+                else:
+                    alert_attempts = int(payload_data.get("terminal_alert_attempts", 0)) + 1
+                    payload_data["terminal_alert_attempts"] = alert_attempts
+                    payload_data["terminal_alert_status"] = "pending"
+                    payload_data["terminal_alert_sent"] = False
+                    alert_backoff = TERMINAL_ALERT_BACKOFF_SECONDS[min(alert_attempts - 1, len(TERMINAL_ALERT_BACKOFF_SECONDS) - 1)]
+                    next_retry = now_done + timedelta(seconds=alert_backoff)
+                    await session.execute(
+                        update(PaymentNotificationOutbox)
+                        .where(*cond_update)
+                        .values(
+                            claim_token=None,
+                            lease_until=None,
+                            next_retry_at=next_retry,
+                            event_payload_json=json.dumps(payload_data, ensure_ascii=False),
+                            updated_at=now_done,
+                        )
+                    )
+                    await session.commit()
+                    log.warning(
+                        "OUTBOX_TERMINAL_ALERT_RETRY_SCHEDULED | key=%s | alert_attempts=%s | next_retry=%s",
+                        unique_key,
+                        alert_attempts,
+                        next_retry,
+                    )
+
+        return bool(delivered)
+    except Exception as exc:
+        log.warning("Could not dispatch outbox terminal failure alert via Autobus: %s", exc)
+        if claimed and (row_id is not None or unique_key is not None):
             try:
-                await bot.send_message(admin_id, alert_text)
+                async with sm() as session:
+                    cond_rel = [PaymentNotificationOutbox.claim_token == claim_token]
+                    if row_id is not None:
+                        cond_rel.append(PaymentNotificationOutbox.id == row_id)
+                    else:
+                        cond_rel.append(PaymentNotificationOutbox.unique_key == unique_key)
+                    await session.execute(
+                        update(PaymentNotificationOutbox)
+                        .where(*cond_rel)
+                        .values(claim_token=None, lease_until=None)
+                    )
+                    await session.commit()
             except Exception:
                 pass
-    except Exception:
-        pass
+        return False
