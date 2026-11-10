@@ -103,7 +103,7 @@ def test_regression_port_cleanup_must_not_kill_foreign_process(tmp_path: Path):
         assert proc.poll() is None, f"Foreign process {proc.pid} was terminated!"
 
         # Also verify cleanup_instance_ghost_port with instance_name does not kill unverified foreign process
-        killed_ghost = rm.cleanup_instance_ghost_port(port=port, pm2_pids=set(), instance_name="tg_autobusbusbot_new")
+        killed_ghost = rm.cleanup_instance_ghost_port(port=port, pm2_pids=set(), instance_name="tg_autobusbusbot_new", base_dir=tmp_path)
         assert proc.pid not in killed_ghost
         assert proc.poll() is None
     finally:

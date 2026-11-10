@@ -785,8 +785,20 @@ def verify_process_ownership(
     has_instance_id = f"BOT_INSTANCE_ID={instance_name}" in environ_str or f"--name {instance_name}" in cmdline
 
     # 2. Cwd is strictly within this instance deployment or legacy directory
-    expected_dep = str((base_dir / "deployments" / instance_name).resolve()) if (base_dir / "deployments" / instance_name).exists() else ""
-    legacy_dir = str((base_dir / "newbots").resolve()) if (base_dir / "newbots").exists() else ""
+    dep_path = base_dir / "deployments" / instance_name
+    legacy_path = base_dir / "newbots"
+    expected_dep = ""
+    if safe_exists(dep_path):
+        try:
+            expected_dep = str(dep_path.resolve())
+        except (OSError, PermissionError):
+            pass
+    legacy_dir = ""
+    if safe_exists(legacy_path):
+        try:
+            legacy_dir = str(legacy_path.resolve())
+        except (OSError, PermissionError):
+            pass
 
     in_instance_dep = bool(expected_dep and (expected_dep == cwd_str or expected_dep in cwd_str or f"deployments/{instance_name}" in cwd_str))
     in_legacy_dir = bool(legacy_dir and (legacy_dir == cwd_str or legacy_dir in cwd_str))
