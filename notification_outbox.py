@@ -30,6 +30,7 @@ from notification_transport import (
     NotificationDeliveryResult,
     build_robokassa_pending_keyboard,
     build_subscribe_keyboard,
+    is_bot_blocked_reason,
     send_notification_transport_result,
 )
 from translation_service import (
@@ -520,6 +521,23 @@ async def dispatch_outbox_by_key(
                     last_err = failure_reason or "transport_delivery_terminal"
                 else:
                     last_err = "transport_delivery_timeout" if is_timeout else "transport_delivery_failed"
+
+                try:
+                    payload_data = json.loads(row.event_payload_json) if row.event_payload_json else {}
+                except Exception:
+                    payload_data = {}
+
+                is_blocked = is_bot_blocked_reason(failure_reason) or is_bot_blocked_reason(last_err)
+                already_alerted = bool(payload_data.get("terminal_alert_sent"))
+                should_alert = (
+                    new_status == "failed_terminal"
+                    and row.attempts >= row.max_attempts
+                    and not is_blocked
+                    and not already_alerted
+                )
+                if should_alert:
+                    payload_data["terminal_alert_sent"] = True
+
                 await session.execute(
                     update(PaymentNotificationOutbox)
                     .where(PaymentNotificationOutbox.id == row.id, PaymentNotificationOutbox.claim_token == token)
@@ -529,19 +547,34 @@ async def dispatch_outbox_by_key(
                         lease_until=None,
                         next_retry_at=now_done + backoff,
                         last_error=last_err,
+                        event_payload_json=json.dumps(payload_data, ensure_ascii=False),
                         updated_at=now_done,
                     )
                 )
                 await session.commit()
                 if new_status == "failed_terminal":
-                    log.error(
-                        "OUTBOX_FAILED_TERMINAL | key=%s | recipient=%s | event=%s | attempts=%s",
-                        row.unique_key,
-                        row.recipient_id,
-                        row.event_type,
-                        row.attempts,
-                    )
-                    await _send_admin_terminal_failure_alert(bot, row)
+                    if is_blocked:
+                        log.info(
+                            "OUTBOX_BLOCKED_TERMINAL | key=%s | recipient=%s | event=%s | attempts=%s | reason=%s",
+                            row.unique_key,
+                            row.recipient_id,
+                            row.event_type,
+                            row.attempts,
+                            last_err,
+                        )
+                    else:
+                        log.error(
+                            "OUTBOX_FAILED_TERMINAL | key=%s | recipient=%s | event=%s | attempts=%s | reason=%s",
+                            row.unique_key,
+                            row.recipient_id,
+                            row.event_type,
+                            row.attempts,
+                            last_err,
+                        )
+                    if should_alert:
+                        row.last_error = last_err
+                        row.event_payload_json = json.dumps(payload_data, ensure_ascii=False)
+                        await _send_admin_terminal_failure_alert(bot, row)
                 else:
                     log.warning(
                         "OUTBOX_DELIVERY_RETRY_SCHEDULED | key=%s | attempts=%s | next_retry=%s | reason=%s",
@@ -605,14 +638,18 @@ async def process_payment_notification_outbox(
     return delivered_count
 
 
-async def _send_admin_terminal_failure_alert(bot: Bot, row: PaymentNotificationOutbox) -> None:
-    """Sends a bounded admin notification on terminal notification delivery failure."""
+async def _send_admin_terminal_failure_alert(bot: Bot | None, row: PaymentNotificationOutbox) -> None:
+    """Sends a bounded admin notification on terminal notification delivery failure via Autobus."""
     try:
+        if is_bot_blocked_reason(getattr(row, "last_error", None)):
+            return
+        if getattr(row, "attempts", 0) < getattr(row, "max_attempts", 7):
+            return
+
         async with async_session_maker() as session:
             config = await session.get(SubscriptionConfig, 1)
             if not config or not config.notifications_enabled:
                 return
-            admin_ids = await get_all_admin_ids()
 
         alert_text = (
             f"🚨 СБОЙ ДОСТАВКИ УВЕДОМЛЕНИЯ (Outbox Terminal Failure)\n\n"
@@ -624,10 +661,10 @@ async def _send_admin_terminal_failure_alert(bot: Bot, row: PaymentNotificationO
             f"Число попыток: {row.attempts}/{row.max_attempts}\n"
             f"Статус: failed_terminal (подписка и платеж не затронуты)"
         )
-        for admin_id in admin_ids:
-            try:
-                await bot.send_message(admin_id, alert_text)
-            except Exception:
-                pass
-    except Exception:
-        pass
+        from notification_routing import send_admin_notification, EventCategory
+        await send_admin_notification(
+            alert_text,
+            category=EventCategory.SYSTEM_DIAGNOSTIC,
+        )
+    except Exception as exc:
+        log.warning("Could not dispatch outbox terminal failure alert via Autobus: %s", exc)

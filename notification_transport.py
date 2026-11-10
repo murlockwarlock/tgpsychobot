@@ -23,6 +23,24 @@ class NotificationDeliveryResult:
     error_code: str | None = None
 
 
+def is_bot_blocked_reason(reason: str | None) -> bool:
+    """
+    Checks whether the delivery failure reason indicates that the user blocked the bot
+    or the recipient chat was suspended/denied.
+    Specific to recipient block/suspend - other Forbidden errors remain unsuppressed.
+    """
+    if not reason:
+        return False
+    r = str(reason).lower()
+    if "bot was blocked" in r or "bot_blocked" in r or "blocked by the user" in r:
+        return True
+    if "max_chat_suspended" in r or "chat.denied" in r or "error.dialog.suspended" in r:
+        return True
+    if "user.blocked" in r or "suspended recipient" in r or "dialog.suspended" in r:
+        return True
+    return False
+
+
 def clean_html_for_max(text: str) -> str:
     """Strips HTML tags like <b>, </b>, <i>, etc. for MAX messenger text."""
     return re.sub(r"<[^>]+>", "", text)
@@ -86,6 +104,16 @@ async def send_notification_transport_result(
             )
             return NotificationDeliveryResult(delivered=True)
         except Exception as e:
+            err_text = f"{str(e)} {getattr(e, 'message', '')}".lower()
+            if "bot was blocked" in err_text or "blocked by the user" in err_text:
+                log.warning("Telegram notification delivery blocked by user recipient_id=%s: %s", recipient_id, e)
+                return NotificationDeliveryResult(
+                    delivered=False,
+                    retryable=False,
+                    reason="telegram_bot_blocked",
+                    status=403,
+                    error_code="bot_blocked",
+                )
             log.error("Failed to send Telegram notification to %s: %s", recipient_id, e)
             return NotificationDeliveryResult(
                 delivered=False,
@@ -128,7 +156,15 @@ async def send_notification_transport_result(
                 await client.send_message(user_id=max_api_user_id, text=clean_text, attachments=attachments)
                 return NotificationDeliveryResult(delivered=True)
         except MaxApiError as e:
-            if e.is_suspended_recipient:
+            err_msg = f"{str(e)} {getattr(e, 'error_code', '')}".lower()
+            is_blocked = (
+                getattr(e, "is_suspended_recipient", False)
+                or getattr(e, "error_code", None) in ("chat.denied", "user.blocked", "blocked")
+                or "error.dialog.suspended" in err_msg
+                or "chat.denied" in err_msg
+                or (getattr(e, "status", None) == 403 and "blocked" in err_msg)
+            )
+            if is_blocked:
                 log.warning(
                     "MAX notification delivery terminal for suspended recipient recipient_id=%s status=%s code=%s",
                     recipient_id,
