@@ -277,8 +277,24 @@ apps.forEach(app => {{
 
   let pythonInterpreter = REMOTE_PY;
   const isolatedVenvPy = path.join(appRoot, 'venv', 'bin', 'python');
+  const reqHashFile = path.join(appRoot, 'requirements.sha256');
+  let hashVenvPy = null;
+  if (fs.existsSync(reqHashFile)) {{
+    try {{
+      const h = fs.readFileSync(reqHashFile, 'utf-8').trim();
+      if (h) {{
+        const cand = path.join(BASE_BOTS_DIR, 'venvs', h, 'bin', 'python');
+        if (fs.existsSync(cand)) {{
+          hashVenvPy = cand;
+        }}
+      }}
+    }} catch (_) {{}}
+  }}
+
   if (fs.existsSync(isolatedVenvPy)) {{
     pythonInterpreter = isolatedVenvPy;
+  }} else if (hashVenvPy) {{
+    pythonInterpreter = hashVenvPy;
   }}
 
   if (app.name && app.name.startsWith('max_')) {{
@@ -658,4 +674,66 @@ def test_real_pm2_shared_database_instances_are_not_disturbed(real_pm2_harness: 
     assert snap_2["tg_bot_beta"]["pid"] == pid_beta, "Bot Beta sharing database must not be restarted!"
     info_beta = rm.inspect_runtime_process(snap_2["tg_bot_beta"], base_dir)
     assert info_beta["resolved_sha"] == sha1
+
+
+def test_real_pm2_incompatible_virtualenv_isolation(real_pm2_harness: dict[str, Any], monkeypatch):
+    """Test real PM2 running two bots with distinct hash-addressed virtual environments."""
+    h = real_pm2_harness
+    pm2_bin = h["pm2_bin"]
+    pm2_env = h["pm2_env"]
+    base_dir = h["base_dir"]
+    ecosystem_path = h["ecosystem_path"]
+    repo_dir = h["repo_dir"]
+    registry = h["registry"]
+    sha1 = h["sha1"]
+    sha2 = h["sha2"]
+
+    monkeypatch.setenv("PM2_HOME", str(h["pm2_home"]))
+    monkeypatch.setenv("PM2_CMD", pm2_bin)
+    monkeypatch.setenv("PROD_BASE_DIR", str(base_dir))
+    monkeypatch.setenv("PROD_RUNTIME_ENV", str(h["runtime_env_file"]))
+
+    # Stage Release 1 and Release 2
+    rel1_dir = rm.stage_release(base_dir=base_dir, target_sha=sha1, source_dir=repo_dir)
+    rel2_dir = rm.stage_release(base_dir=base_dir, target_sha=sha2, source_dir=repo_dir)
+
+    req_hash_1 = (rel1_dir / "requirements.sha256").read_text(encoding="utf-8").strip()
+    req_hash_2 = (rel2_dir / "requirements.sha256").read_text(encoding="utf-8").strip()
+
+    # Create distinct hash-addressed virtualenvs
+    venv1_py = base_dir / "venvs" / req_hash_1 / "bin" / "python"
+    venv1_py.parent.mkdir(parents=True, exist_ok=True)
+    venv1_py.write_text(f"#!/bin/sh\nexport RUNTIME_VENV_HASH='{req_hash_1}'\nexec '{sys.executable}' \"$@\"\n", encoding="utf-8")
+    venv1_py.chmod(0o755)
+
+    venv2_py = base_dir / "venvs" / req_hash_2 / "bin" / "python"
+    venv2_py.parent.mkdir(parents=True, exist_ok=True)
+    venv2_py.write_text(f"#!/bin/sh\nexport RUNTIME_VENV_HASH='{req_hash_2}'\nexec '{sys.executable}' \"$@\"\n", encoding="utf-8")
+    venv2_py.chmod(0o755)
+
+    # 1. Verify resolution in release manager
+    resolved_1 = rm.resolve_release_python_interpreter(rel1_dir, base_dir)
+    resolved_2 = rm.resolve_release_python_interpreter(rel2_dir, base_dir)
+    assert resolved_1 == venv1_py
+    assert resolved_2 == venv2_py
+
+    # 2. Deploy Bot Alpha on Release 1 and Bot Beta on Release 2
+    rm.atomic_symlink_switch(base_dir, "tg_bot_alpha", rel1_dir)
+    rm.atomic_symlink_switch(base_dir, "tg_bot_beta", rel2_dir)
+
+    subprocess.run([pm2_bin, "start", str(ecosystem_path)], env=pm2_env, capture_output=True, check=True)
+    time.sleep(2.0)
+
+    snap = rm.load_pm2_snapshot()
+    info_alpha = rm.inspect_runtime_process(snap["tg_bot_alpha"], base_dir)
+    info_beta = rm.inspect_runtime_process(snap["tg_bot_beta"], base_dir)
+    assert info_alpha["status"] == "online"
+    assert info_beta["status"] == "online"
+
+    # Verify PM2 assigned the distinct interpreter to each process
+    alpha_interp = snap["tg_bot_alpha"]["pm2_env"].get("exec_interpreter")
+    beta_interp = snap["tg_bot_beta"]["pm2_env"].get("exec_interpreter")
+    assert alpha_interp == str(venv1_py)
+    assert beta_interp == str(venv2_py)
+
 

@@ -356,14 +356,40 @@ apps.forEach(app => {
   const appRoot = isIsolated ? deploymentDir : (app.cwd || LEGACY_DIR);
 
   // Dynamic Python interpreter resolution:
-  // Prefer release-specific isolated venv if available, otherwise fallback to REMOTE_PY.
+  // 1. Release-specific isolated venv (<appRoot>/venv/bin/python)
+  // 2. Hash-addressed shared venv (<base_dir>/venvs/<hash>/bin/python)
+  // 3. Base fleet venv (<base_dir>/venv/bin/python)
+  // 4. REMOTE_PY
   let pythonInterpreter = REMOTE_PY;
   const isolatedVenvPy = path.join(appRoot, "venv", "bin", "python");
   const isolatedVenvPy3 = path.join(appRoot, "venv", "bin", "python3");
+  const hashFile = path.join(appRoot, "requirements.sha256");
+
   if (fs.existsSync(isolatedVenvPy)) {
     pythonInterpreter = isolatedVenvPy;
   } else if (fs.existsSync(isolatedVenvPy3)) {
     pythonInterpreter = isolatedVenvPy3;
+  } else if (fs.existsSync(hashFile)) {
+    try {
+      const reqHash = fs.readFileSync(hashFile, "utf-8").trim();
+      const hashVenvPy = path.join(BASE_BOTS_DIR, "venvs", reqHash, "bin", "python");
+      const hashVenvPy3 = path.join(BASE_BOTS_DIR, "venvs", reqHash, "bin", "python3");
+      if (fs.existsSync(hashVenvPy)) {
+        pythonInterpreter = hashVenvPy;
+      } else if (fs.existsSync(hashVenvPy3)) {
+        pythonInterpreter = hashVenvPy3;
+      }
+    } catch (_) {}
+  }
+
+  if (pythonInterpreter === REMOTE_PY) {
+    const baseVenvPy = path.join(BASE_BOTS_DIR, "venv", "bin", "python");
+    const baseVenvPy3 = path.join(BASE_BOTS_DIR, "venv", "bin", "python3");
+    if (fs.existsSync(baseVenvPy)) {
+      pythonInterpreter = baseVenvPy;
+    } else if (fs.existsSync(baseVenvPy3)) {
+      pythonInterpreter = baseVenvPy3;
+    }
   }
 
   if (app.name && app.name.startsWith("max_")) {

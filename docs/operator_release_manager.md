@@ -9,20 +9,27 @@ This guide describes how to operate the versioned, isolated release management s
 ```text
 /root/telegram_bots/
 ├── releases/
+│   ├── .staging.lock           # Concurrency staging lock (flock)
+│   ├── .prune.lock             # Concurrency release pruning lock (flock)
 │   └── <commit_sha_40>/        # Immutable release tree
 │       ├── REVISION            # 40-character commit SHA
 │       ├── requirements.txt
 │       ├── requirements.sha256
+│       ├── MANIFEST.sha256     # Cryptographic SHA256 manifest of all staged files
 │       └── ...
 ├── deployments/
-│   ├── .state/                 # Per-instance deployment state metadata
+│   ├── .state/                 # Per-instance deployment state metadata (fail-closed if corrupted)
 │   │   ├── tg_autobusbusbot_new.json
 │   │   └── ...
-│   ├── .locks/                 # Per-instance process locks (flock)
+│   ├── .locks/                 # Per-instance deployment & rollback locks (flock)
 │   │   ├── tg_autobusbusbot_new.lock
 │   │   └── ...
 │   ├── tg_autobusbusbot_new -> /root/telegram_bots/releases/<sha_A>
 │   ├── max_se13639182_bot_legacy -> /root/telegram_bots/releases/<sha_B>
+│   └── ...
+├── venvs/
+│   ├── <requirements_hash>/    # Hash-addressed isolated virtual environments
+│   │   └── bin/python
 │   └── ...
 ├── shared/
 │   ├── runtime.env
@@ -34,6 +41,8 @@ This guide describes how to operate the versioned, isolated release management s
 - Each migrated instance points via `/root/telegram_bots/deployments/<instance_name>` directly to its immutable release in `releases/<sha>`.
 - Unmigrated instances continue running out of `/root/telegram_bots/newbots`.
 - Unmanaged processes (`vitaliy_bot`, `darimiru_bot`, etc.) are protected and never touched.
+- Release directories are cryptographically verified against `MANIFEST.sha256` to detect post-staging file modifications or unauthorized file additions.
+- Python dependencies are isolated per requirements hash in `/root/telegram_bots/venvs/<hash>/bin/python`, resolved consistently across `ecosystem.config.js` and `release_manager.py`.
 
 ---
 
@@ -83,7 +92,7 @@ python3 scripts/release_manager.py preflight --target-sha <commit_sha>
 
 ## 4. Canary Deployment (`deploy --canary`)
 
-Stages the immutable release directly from Git commit tree (`git archive <sha>`), verifies 40-char SHA integrity, updates ONLY the targeted instance's symlink atomically via `os.replace`, checks for port conflicts, and reloads only that instance via PM2 (`--only <name> --update-env`).
+Stages the immutable release directly from Git commit tree (`git archive <sha>`), verifies 40-char SHA integrity and `MANIFEST.sha256`, updates ONLY the targeted instance's symlink atomically via `os.replace`, checks for port conflicts, and reloads only that instance via PM2 (`--only <name> --update-env`).
 
 ```bash
 python3 scripts/release_manager.py deploy \
@@ -92,8 +101,13 @@ python3 scripts/release_manager.py deploy \
     --settle-seconds 3
 ```
 
-- **Per-Instance Locking**: An exclusive non-blocking lock (`deployments/.locks/<instance>.lock` via `fcntl.flock`) serializes deployments and rollbacks per instance. Concurrent operations on the same bot fail fast with `RuntimeError`.
-- **Fail-Safe Automatic Rollback**: If post-reload readiness check or runtime SHA verification fails, the release manager automatically rolls back the instance symlink and restarts the previously running version.
+- **Per-Instance Locking**: An exclusive non-blocking lock (`deployments/.locks/<instance>.lock` via `fcntl.flock`) serializes deployments and rollbacks per instance. Concurrent operations on the same bot fail fast with `RuntimeError`. Global operations (staging, pruning) use dedicated flock files (`releases/.staging.lock`, `releases/.prune.lock`).
+- **Deep Readiness Verification**:
+  - Probes the configured application port (`APP_PORT` / `MAX_APP_PORT`) via TCP `socket.create_connection` with a 3.0s retry window.
+  - Verifies that PM2 status is `online` and PID is alive.
+  - Verifies `pm2_env.unstable_restarts == 0`.
+  - Scans recent PM2 error logs for fatal exceptions (`ModuleNotFoundError`, `ImportError`, `Address already in use`, fatal tracebacks), while safely distinguishing normal graceful shutdown tracebacks (`KeyboardInterrupt`, `SystemExit`).
+- **Fail-Safe Automatic Rollback**: If post-reload readiness check or runtime SHA verification fails, the release manager automatically reverts the instance symlink, restores previous state, and restarts the previously running version. If a rollback itself were to fail, the symlink is reverted to the pre-rollback state and an emergency diagnostic is logged.
 - **Neighbor Isolation**: Other instances on the same host or sharing the same database remain completely unaffected.
 
 ---
@@ -122,35 +136,42 @@ Instead:
     "instance_name": "tg_autobusbusbot_new",
     "current_release_sha": "e56f707c22917aa2de86bc763ec0918681a5b845",
     "previous_successful_release_sha": "6150e530aea37ac225babebd79c2702ae4fe83f8",
+    "previous_successful_target_dir": "/root/telegram_bots/releases/6150e530aea37ac225babebd79c2702ae4fe83f8",
     "mode": "isolated",
     "updated_at": "2026-11-10T02:00:00Z"
   }
   ```
 - When `--target-sha` is not provided, the rollback command reads `previous_successful_release_sha` from the instance state.
-- If the bot was previously running in `legacy` mode (`newbots`), rolling back removes the symlink and restores legacy execution in PM2.
+- If the state file is corrupted or unparsable, the release manager fails closed with `RuntimeError` rather than silently discarding history.
+- If the bot was previously running in `legacy` mode (`newbots`), rolling back removes the symlink, restores legacy execution in PM2, and health-checks the restored legacy process.
 
 ---
 
 ## 6. Port Conflict & Process Ownership Verification (`verify_process_ownership`)
 
 Before reloading an instance, the release manager inspects the configured port:
+- **Fail-Closed Inspection Tools**: Checks strictly TCP LISTEN sockets using `lsof -sTCP:LISTEN`, `ss -ltnp`, or `netstat -ltnp`. If all socket inspection tools are missing, the system fails closed with `RuntimeError`.
 - If a process is listening on the port, the release manager checks whether the PID is managed by PM2.
 - If not managed by PM2, it checks **authoritative process ownership**:
   - Checks `/proc/<pid>/cmdline` (or `ps -p <pid> -o command=`).
   - Checks `/proc/<pid>/cwd` (or `lsof -p <pid>`).
   - The process is identified as a stale ghost ONLY IF its cmdline and cwd match the instance's deployment or legacy directory and script (`main.py` or `-m max_messenger_bot.app`).
+  - **APP_PORT environment alone is NEVER accepted as proof of ownership**, preventing accidental killing of foreign processes that happen to use the same port number.
 - **Fail-Closed Semantics**: If the process belongs to another service (e.g. system daemon, unrelated bot, foreign service), it is **NEVER killed**. The release manager aborts with `RuntimeError` describing the foreign PID, process name, and user, requiring manual operator intervention.
 
 ---
 
-## 7. Legacy Deploy Protection (`--check-legacy-safety`)
+## 7. Legacy Deploy Protection & Bootstrap Safety (`--check-legacy-safety`)
 
 To prevent accidental legacy deployments (`deploy_prod.sh`) from overwriting code or restarting bots that have already been migrated to isolated releases:
 
 1. `scripts/verify_bot_instances.py --check-legacy-safety --base-dir <root>`:
    - Scans `deployments/*` for active isolated symlinks.
    - If an operator tries to run `deploy_prod.sh --target <instance>` for an instance that is already migrated to isolated deployments, the command fails immediately with an error and instructions to use `scripts/release_manager.py deploy`.
-2. `deploy_prod.sh` includes an SSH preflight step that runs `--check-legacy-safety` before any tarball is transferred or extracted.
+2. **Safe Initial Deploy Bootstrap**:
+   - During the first deployment from old `main` to a server where `--check-legacy-safety` is not yet available in the remote script, `deploy_prod.sh` detects this via `--help`.
+   - Instead of bypassing safety or crashing, it executes a remote inline Python check inspecting whether `/root/telegram_bots/deployments` exists and contains migrated bots.
+   - If no instances are migrated, the initial bootstrap deployment is permitted. If any instances are already migrated, legacy deployment is strictly refused.
 
 ---
 

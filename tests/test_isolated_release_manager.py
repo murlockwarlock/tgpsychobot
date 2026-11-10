@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -55,22 +56,29 @@ def test_stage_release_creates_immutable_directory_and_hash(tmp_path: Path):
     (source_dir / "main.py").write_text("print('hello telegram')\n", encoding="utf-8")
     (source_dir / "requirements.txt").write_text("aiogram==3.1.1\nsqlalchemy>=2.0.0\n", encoding="utf-8")
 
+    subprocess.run(["git", "init"], cwd=str(source_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(source_dir), check=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(source_dir), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(source_dir), check=True)
+    subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(source_dir), check=True)
+    commit_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(source_dir), check=True, capture_output=True, text=True).stdout.strip()
+
     staged_dir = rm.stage_release(
         base_dir=base_dir,
-        target_sha=MOCK_SHA_A,
+        target_sha=commit_sha,
         source_dir=source_dir,
     )
 
     assert staged_dir.is_dir()
-    assert staged_dir.name == MOCK_SHA_A
-    assert (staged_dir / "REVISION").read_text(encoding="utf-8").strip() == MOCK_SHA_A
+    assert staged_dir.name == commit_sha
+    assert (staged_dir / "REVISION").read_text(encoding="utf-8").strip() == commit_sha
     assert (staged_dir / "main.py").is_file()
     assert (staged_dir / "requirements.sha256").is_file()
 
     # Verify idempotency
     staged_again = rm.stage_release(
         base_dir=base_dir,
-        target_sha=MOCK_SHA_A,
+        target_sha=commit_sha,
         source_dir=source_dir,
     )
     assert staged_again == staged_dir
@@ -137,7 +145,7 @@ def test_audit_dependency_compatibility_matching_hashes(tmp_path: Path):
     rm.atomic_symlink_switch(base_dir, "tg_bot2", rel_dir)
 
     ok, msg, details = rm.audit_dependency_compatibility(base_dir, req_path, reg)
-    assert ok is True
+    assert ok is True, f"deploy_canary failed: {msg}, details: {details}"
     assert msg == "dependencies_strictly_compatible"
 
 
@@ -189,7 +197,7 @@ def test_audit_dependency_compatibility_with_isolated_venv(tmp_path: Path):
     (target_venv / "python").write_text("#!/bin/sh\n", encoding="utf-8")
 
     ok, msg, details = rm.audit_dependency_compatibility(base_dir, req_path, reg)
-    assert ok is True
+    assert ok is True, f"deploy_canary failed: {msg}, details: {details}"
     assert msg == "isolated_virtualenv_available"
 
 
@@ -199,7 +207,7 @@ def test_audit_schema_compatibility_guard(tmp_path: Path):
 
     # Clean repo without migrations directory passes
     ok, msg = rm.audit_schema_compatibility(repo_root)
-    assert ok is True
+    assert ok is True, f"deploy_canary failed: {msg}, details: {details}"
 
     # Repo with unapplied SQL migrations fails closed (PR A requirement)
     migrations_dir = repo_root / "migrations"
@@ -324,9 +332,12 @@ class MockPm2Harness:
         """Reload a single process with new directory/script without touching others."""
         old_meta = self.metadata.get(name, {})
         restarts = old_meta.get("restart_time", 0) + 1
+        combined_env = dict(old_meta.get("env", {}))
+        if env:
+            combined_env.update(env)
         self.stop_process(name)
 
-        pid = self.start_process(name, new_script, new_cwd, args=args, env=env)
+        pid = self.start_process(name, new_script, new_cwd, args=args, env=combined_env)
         self.metadata[name]["restart_time"] = restarts
         self._save_state()
         return pid
@@ -375,30 +386,55 @@ def runtime_harness(tmp_path: Path, monkeypatch):
 
     # Create dummy worker scripts
     worker_code = """
-import os, sys, time, signal
+import http.server, os, signal, sys, time
 
-def handle_sig(sig, frame):
-    sys.exit(0)
+class ReusableServer(http.server.HTTPServer):
+    allow_reuse_address = True
 
-signal.signal(signal.SIGTERM, handle_sig)
-signal.signal(signal.SIGINT, handle_sig)
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'ok')
+    def log_message(self, *args):
+        pass
 
-# Loop and stay alive
-while True:
-    time.sleep(0.1)
+signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+
+port = int(os.environ.get('APP_PORT') or os.environ.get('MAX_APP_PORT') or '0')
+if port > 0:
+    server = ReusableServer(('127.0.0.1', port), Handler)
+    server.serve_forever()
+else:
+    while True:
+        time.sleep(0.1)
 """
 
     max_app_code = """
-import os, sys, time, signal
+import http.server, os, signal, sys, time
 
-def handle_sig(sig, frame):
-    sys.exit(0)
+class ReusableServer(http.server.HTTPServer):
+    allow_reuse_address = True
 
-signal.signal(signal.SIGTERM, handle_sig)
-signal.signal(signal.SIGINT, handle_sig)
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'max_ok')
+    def log_message(self, *args):
+        pass
 
-while True:
-    time.sleep(0.1)
+signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+
+port = int(os.environ.get('MAX_APP_PORT') or os.environ.get('APP_PORT') or '0')
+if port > 0:
+    server = ReusableServer(('127.0.0.1', port), Handler)
+    server.serve_forever()
+else:
+    while True:
+        time.sleep(0.1)
 """
 
     crashing_worker_code = """
@@ -422,6 +458,7 @@ raise RuntimeError("Fatal startup crash in bad release")
     (rel_a / "max_messenger_bot").mkdir()
     (rel_a / "max_messenger_bot" / "__init__.py").write_text("")
     (rel_a / "max_messenger_bot" / "app.py").write_text(max_app_code)
+    rm.write_release_manifest(rel_a)
 
     # Stage Release B
     rel_b = releases_dir / MOCK_SHA_B
@@ -433,6 +470,7 @@ raise RuntimeError("Fatal startup crash in bad release")
     (rel_b / "max_messenger_bot").mkdir()
     (rel_b / "max_messenger_bot" / "__init__.py").write_text("")
     (rel_b / "max_messenger_bot" / "app.py").write_text(max_app_code)
+    rm.write_release_manifest(rel_b)
 
     # Stage Crashing Release C
     rel_c = releases_dir / MOCK_SHA_C
@@ -441,6 +479,7 @@ raise RuntimeError("Fatal startup crash in bad release")
     (rel_c / "requirements.txt").write_text(req_content)
     (rel_c / "requirements.sha256").write_text(f"{real_req_hash}\n")
     (rel_c / "main.py").write_text(crashing_worker_code)
+    rm.write_release_manifest(rel_c)
 
     ecosystem_path = base_dir / "ecosystem.config.js"
     ecosystem_path.write_text("// Mock ecosystem\n", encoding="utf-8")
@@ -560,7 +599,7 @@ def test_real_runtime_canary_deploy_isolation(runtime_harness, monkeypatch):
         settle_seconds=0.1,
     )
 
-    assert ok is True
+    assert ok is True, f"deploy_canary failed: {msg}, details: {details}"
 
     # 1. Verify Bot 1 was updated to Release B and has a new PID
     snapshot = pm2.metadata
@@ -617,7 +656,7 @@ def test_real_runtime_max_bot_module_execution(runtime_harness, monkeypatch):
         settle_seconds=0.1,
     )
 
-    assert ok is True
+    assert ok is True, f"deploy_canary failed: {msg}, details: {details}"
     info = rm.inspect_runtime_process(pm2.metadata["max_se13639182_bot_legacy"], base_dir)
     assert info["resolved_sha"] == MOCK_SHA_B
     assert info["pid"] != pid_before
@@ -651,6 +690,23 @@ def test_real_runtime_shared_db_isolation(runtime_harness, monkeypatch):
         app_port=8099,
     )
 
+    time.sleep(0.5)
+    proc = pm2.processes["max_se13639182_bot_legacy"]
+    print("INITIAL PROC POLL:", proc.poll())
+    try:
+        import fcntl
+        fcntl.fcntl(proc.stderr.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
+        raw_err = os.read(proc.stderr.fileno(), 4096)
+        print("STDERR READ:", raw_err.decode(errors='replace'))
+    except Exception as e:
+        print("COULD NOT READ STDERR:", e)
+    ps_out = subprocess.run(["ps", "-fp", str(proc.pid)], capture_output=True, text=True)
+    print("PS:", ps_out.stdout)
+    lsof_out = subprocess.run(["lsof", "-p", str(proc.pid)], capture_output=True, text=True)
+    print("LSOF:\n", lsof_out.stdout)
+    with socket.create_connection(("127.0.0.1", 8099), timeout=2.0) as s:
+        pass
+
     def mock_reload(instance_name, pm2_config=None, runtime_env=None, **kwargs):
         target_link = base_dir / "deployments" / instance_name
         if instance_name.startswith("max_"):
@@ -680,7 +736,7 @@ def test_real_runtime_shared_db_isolation(runtime_harness, monkeypatch):
         settle_seconds=0.1,
     )
 
-    assert ok is True
+    assert ok is True, f"deploy_canary failed: {msg}, details: {details}"
 
     # Telegram bot was updated
     info_tg = rm.inspect_runtime_process(pm2.metadata["tg_veraveda777_bot_legacy"], base_dir)
@@ -735,7 +791,7 @@ def test_real_runtime_targeted_rollback(runtime_harness, monkeypatch):
         settle_seconds=0.1,
     )
 
-    assert ok is True
+    assert ok is True, f"deploy_canary failed: {msg}, details: {details}"
 
     # Bot 1 is now running Release A
     info1 = rm.inspect_runtime_process(pm2.metadata["tg_autobusbusbot_new"], base_dir)
@@ -860,23 +916,23 @@ def test_ghost_port_cleanup_targets_only_configured_port(monkeypatch):
     monkeypatch.setattr(os.path, "exists", lambda p: False)
 
     def mock_subprocess_run(cmd, *args, **kwargs):
-        # cmd is ['lsof', '-t', '-i:8081']
-        port_arg = cmd[2]
-        if port_arg == "-i:8081":
+        cmd_str = " ".join(str(c) for c in cmd)
+        if "8081" in cmd_str:
             # Simulate PID 9999 (orphan) and PID 101 (PM2 managed)
             return subprocess.CompletedProcess(cmd, returncode=0, stdout="9999\n101\n")
-        elif port_arg == "-i:8083":
+        elif "8083" in cmd_str:
             # Simulate PID 8888 on another bot's port
             return subprocess.CompletedProcess(cmd, returncode=0, stdout="8888\n")
         return subprocess.CompletedProcess(cmd, returncode=0, stdout="")
 
     monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+    monkeypatch.setattr(rm, "verify_process_ownership", lambda pid, inst, base, port=None: pid == 9999)
 
     # 101 is an active PM2 PID
     pm2_pids = {101, 102}
 
     # Clean port 8081
-    res = rm.cleanup_instance_ghost_port(8081, pm2_pids)
+    res = rm.cleanup_instance_ghost_port(8081, pm2_pids, instance_name="tg_autobusbusbot_new")
 
     # Only 9999 should be killed; 101 is managed so never killed; 8888 on port 8083 is untouched!
     assert res == [9999]
@@ -898,11 +954,12 @@ def test_cli_subcommands(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(sys, "argv", test_args)
     assert rm.main() == 0
 
-    # Stage
-    test_args = ["release_manager.py", "--base-dir", str(base_dir), "stage", "--target-sha", MOCK_SHA_A]
+    # Stage using real HEAD commit
+    head_sha = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    test_args = ["release_manager.py", "--base-dir", str(base_dir), "stage", "--target-sha", head_sha]
     monkeypatch.setattr(sys, "argv", test_args)
     assert rm.main() == 0
-    assert (base_dir / "releases" / MOCK_SHA_A).is_dir()
+    assert (base_dir / "releases" / head_sha).is_dir()
 
     # Status
     test_args = ["release_manager.py", "--base-dir", str(base_dir), "status", "--json"]

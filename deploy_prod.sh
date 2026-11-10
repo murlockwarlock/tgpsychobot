@@ -154,11 +154,28 @@ fi
 
 echo "Verifying that target instances are safe for legacy deploy..."
 "${SSH_CMD[@]}" "${USER_NAME}@${HOST}" \
-    "if [[ -f '${REMOTE_DIR}/scripts/verify_bot_instances.py' ]]; then \
+    "if [[ -f '${REMOTE_DIR}/scripts/verify_bot_instances.py' ]] && \
+        '${REMOTE_PY}' '${REMOTE_DIR}/scripts/verify_bot_instances.py' --help 2>&1 | grep -q -- '--check-legacy-safety'; then \
          '${REMOTE_PY}' '${REMOTE_DIR}/scripts/verify_bot_instances.py' \
              --check-legacy-safety \
              --base-dir '${PROD_BASE_DIR:-/root/telegram_bots}' \
              --pm2-names '${PM2_NAMES}'; \
+     else \
+         '${REMOTE_PY}' -c \"
+import sys
+from pathlib import Path
+base_dir = Path('${PROD_BASE_DIR:-/root/telegram_bots}')
+deployments_dir = base_dir / 'deployments'
+names_arg = '${PM2_NAMES}'
+names = [n.strip() for n in names_arg.split(',') if n.strip()] if names_arg else []
+if not deployments_dir.is_dir():
+    sys.exit(0)
+migrated = [n for n in names if (deployments_dir / n).is_symlink() or (deployments_dir / n).is_dir()]
+if migrated:
+    print(f'error=Refusing legacy deploy: {len(migrated)} instance(s) migrated to isolated release management ({', '.join(migrated)}). Use scripts/release_manager.py deploy instead.', file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+\"; \
      fi"
 
 tar czf - -- "${TRACKED_FILES[@]}" | \

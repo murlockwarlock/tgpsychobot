@@ -31,6 +31,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tarfile
@@ -173,16 +174,81 @@ def lock_instance(base_dir: Path, instance_name: str, timeout_seconds: float = 1
         os.close(fd)
 
 
+@contextmanager
+def lock_staging(base_dir: Path, timeout_seconds: float = 30.0):
+    """File lock to serialize release staging operations."""
+    releases_dir = base_dir / "releases"
+    releases_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = releases_dir / ".staging.lock"
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    start_time = time.time()
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, OSError):
+                if time.time() - start_time > timeout_seconds:
+                    raise TimeoutError(f"Unable to acquire staging lock after {timeout_seconds}s")
+                time.sleep(0.1)
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+
+
+@contextmanager
+def lock_pruning(base_dir: Path, timeout_seconds: float = 30.0):
+    """File lock to serialize release pruning operations."""
+    releases_dir = base_dir / "releases"
+    releases_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = releases_dir / ".prune.lock"
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    start_time = time.time()
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, OSError):
+                if time.time() - start_time > timeout_seconds:
+                    raise TimeoutError(f"Unable to acquire pruning lock after {timeout_seconds}s")
+                time.sleep(0.1)
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+
+
 def load_instance_state(base_dir: Path, instance_name: str) -> dict[str, Any]:
-    """Load the state history of a single bot instance."""
+    """Load the state history of a single bot instance.
+    
+    Fails closed if the state file exists but is corrupted, preventing history loss.
+    """
     path = get_instance_state_path(base_dir, instance_name)
     if path.is_file():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 return data
-        except Exception:
-            pass
+            raise ValueError(f"State file {path} content is not a JSON object")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Corrupted state file detected for instance '{instance_name}': {path}. Error: {exc}. "
+                f"Aborting operation to prevent silent loss of rollback history. Manual operator inspection required."
+            ) from exc
 
     # Initialize from current deployment link if no state file exists
     dep_link = base_dir / "deployments" / instance_name
@@ -254,8 +320,31 @@ def is_release_protected(base_dir: Path, sha: str) -> tuple[bool, str]:
     return False, ""
 
 
+def generate_release_manifest(release_dir: Path) -> dict[str, str]:
+    """Generate SHA-256 checksums for all source and configuration files in a release."""
+    manifest: dict[str, str] = {}
+    for p in sorted(release_dir.rglob("*")):
+        if p.is_file():
+            if p.name in {"MANIFEST.sha256", "REVISION", ".staging.lock", ".prune.lock"}:
+                continue
+            if p.name.startswith("._") or p.name.startswith(".tmp") or p.name.endswith(".tmp") or "__pycache__" in p.parts:
+                continue
+            rel = str(p.relative_to(release_dir))
+            manifest[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return manifest
+
+
+def write_release_manifest(release_dir: Path) -> Path:
+    """Compute and write MANIFEST.sha256 in the release directory."""
+    manifest = generate_release_manifest(release_dir)
+    manifest_file = release_dir / "MANIFEST.sha256"
+    lines = [f"{h}  {path}\n" for path, h in manifest.items()]
+    manifest_file.write_text("".join(lines), encoding="utf-8")
+    return manifest_file
+
+
 def verify_release_integrity(release_dir: Path, expected_sha: str) -> tuple[bool, str]:
-    """Verify release directory integrity: REVISION, requirements.sha256, and python bytecode compile."""
+    """Verify release directory integrity: REVISION, requirements.sha256, MANIFEST.sha256, and python bytecode compile."""
     if not release_dir.is_dir():
         return False, f"Directory does not exist: {release_dir}"
     rev_file = release_dir / "REVISION"
@@ -273,6 +362,32 @@ def verify_release_integrity(release_dir: Path, expected_sha: str) -> tuple[bool
         actual_hash = hash_file.read_text(encoding="utf-8").strip()
         if actual_hash != expected_hash:
             return False, f"requirements.sha256 mismatch: expected {expected_hash[:8]}, got {actual_hash[:8]}"
+
+    # Manifest verification (tampering check)
+    manifest_file = release_dir / "MANIFEST.sha256"
+    if manifest_file.is_file():
+        recorded_manifest: dict[str, str] = {}
+        for line in manifest_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("  ", 1)
+            if len(parts) == 2:
+                recorded_manifest[parts[1]] = parts[0]
+        # Check all recorded files
+        for rel_path, expected_h in recorded_manifest.items():
+            f = release_dir / rel_path
+            if not f.is_file():
+                return False, f"Integrity failed: file '{rel_path}' recorded in MANIFEST.sha256 is missing"
+            actual_h = hashlib.sha256(f.read_bytes()).hexdigest()
+            if actual_h != expected_h:
+                return False, f"Integrity failed: file '{rel_path}' has been tampered with (expected {expected_h[:8]}, got {actual_h[:8]})"
+        # Check for unrecorded files added post-staging
+        current_manifest = generate_release_manifest(release_dir)
+        extra_files = set(current_manifest.keys()) - set(recorded_manifest.keys())
+        if extra_files:
+            return False, f"Integrity failed: unverified file(s) added post-staging: {', '.join(sorted(extra_files))}"
+
     # Syntax validation
     for py_file in release_dir.rglob("*.py"):
         if py_file.is_file() and not py_file.name.startswith("._") and "__pycache__" not in str(py_file):
@@ -364,20 +479,34 @@ def audit_dependency_compatibility(
 
 
 def resolve_release_python_interpreter(release_dir: Path, base_dir: Path) -> Path:
-    """Determine the appropriate Python interpreter for the release."""
-    # 1. Release-specific venv
+    """Determine the appropriate Python interpreter for the release with unified priority."""
+    # 1. Release-specific dedicated venv
     for sub in ["venv/bin/python", "venv/bin/python3"]:
         candidate = release_dir / sub
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate
 
-    # 2. Base venv
+    # 2. Hash-addressed shared venv (matches audit_dependency_compatibility and ecosystem.config.js)
+    req_hash = ""
+    hash_file = release_dir / "requirements.sha256"
+    if hash_file.is_file():
+        req_hash = hash_file.read_text(encoding="utf-8").strip()
+    elif (release_dir / "requirements.txt").is_file():
+        req_hash = hash_requirements(release_dir / "requirements.txt")
+
+    if req_hash and req_hash != "empty":
+        for sub in ["bin/python", "bin/python3"]:
+            candidate = base_dir / "venvs" / req_hash / sub
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+
+    # 3. Base fleet venv
     for sub in ["venv/bin/python", "venv/bin/python3"]:
         candidate = base_dir / sub
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate
 
-    # 3. Environment or system python
+    # 4. Environment or system python
     env_py = os.environ.get("PROD_REMOTE_PY")
     if env_py and safe_is_file(env_py):
         return Path(env_py)
@@ -429,120 +558,137 @@ def stage_release(
     base_dir: Path = DEFAULT_BASE_DIR,
     target_sha: str | None = None,
     source_dir: Path = REPO_ROOT,
+    archive_path: Path | None = None,
     force: bool = False,
 ) -> Path:
     """Stage an immutable code release into <base_dir>/releases/<commit_sha_40>.
 
-    Atomic staging: extracts directly from the Git commit tree (git archive),
-    compiles all python files, writes REVISION and requirements.sha256,
-    verifies integrity, and atomically publishes the release.
+    Atomic staging: extracts directly from the Git commit tree (git archive)
+    or a verified release archive artifact, compiles all python files, writes REVISION,
+    requirements.sha256, and MANIFEST.sha256, verifies full manifest integrity,
+    and atomically publishes the release under an exclusive staging lock.
     """
-    releases_dir = base_dir / "releases"
-    releases_dir.mkdir(parents=True, exist_ok=True)
+    with lock_staging(base_dir):
+        releases_dir = base_dir / "releases"
+        releases_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Resolve commit SHA
-    is_git = False
-    resolved_sha = target_sha or ""
-    try:
-        rev = target_sha or "HEAD"
-        proc = subprocess.run(
-            ["git", "rev-parse", "--verify", f"{rev}^{{commit}}"],
-            cwd=str(source_dir),
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        resolved_sha = proc.stdout.strip()
-        is_git = True
-    except Exception as exc:
-        if target_sha and SHA_RE.match(target_sha):
-            resolved_sha = target_sha
-        elif not resolved_sha:
-            raise RuntimeError(f"Unable to resolve git commit '{target_sha or 'HEAD'}' in {source_dir}: {exc}") from exc
-
-    if not SHA_RE.match(resolved_sha):
-        raise ValueError(f"Invalid full 40-character commit SHA: {resolved_sha}")
-
-    target_dir = releases_dir / resolved_sha
-
-    # 2. Protection check: never destroy an in-use or rollback-protected release
-    is_prot, prot_reason = is_release_protected(base_dir, resolved_sha)
-    if target_dir.is_dir():
-        ok, int_msg = verify_release_integrity(target_dir, resolved_sha)
-        if is_prot and force:
-            raise RuntimeError(f"Refusing to overwrite protected release '{resolved_sha[:8]}' even with --force: {prot_reason}")
-        if ok and not force:
-            return target_dir
-        if is_prot:
-            if ok:
-                return target_dir
-            raise RuntimeError(f"Cannot overwrite protected release '{resolved_sha[:8]}': {prot_reason}")
-
-    # 3. Stage into atomic temporary directory
-    tmp_stage_dir = releases_dir / f".tmp_{resolved_sha}_{os.getpid()}_{int(time.time() * 1000)}"
-    if tmp_stage_dir.exists():
-        shutil.rmtree(tmp_stage_dir, ignore_errors=True)
-    tmp_stage_dir.mkdir(parents=True)
-
-    try:
-        if is_git:
-            # Extract directly from git commit tree via git archive
-            archive_proc = subprocess.run(
-                ["git", "archive", resolved_sha],
+        # 1. Resolve commit SHA
+        is_git = False
+        resolved_sha = target_sha or ""
+        try:
+            rev = target_sha or "HEAD"
+            proc = subprocess.run(
+                ["git", "rev-parse", "--verify", f"{rev}^{{commit}}"],
                 cwd=str(source_dir),
                 capture_output=True,
+                text=True,
                 check=True,
             )
-            with tarfile.open(fileobj=io.BytesIO(archive_proc.stdout)) as tar:
-                if hasattr(tarfile, "data_filter"):
-                    tar.extractall(path=tmp_stage_dir, filter="data")
-                else:
-                    tar.extractall(path=tmp_stage_dir)
-        else:
-            # Fallback for mock non-git tests: copy files
-            for root, dirs, files in os.walk(source_dir):
-                dirs[:] = [d for d in dirs if not d.startswith((".", "__pycache__", ".venv", ".tmp"))]
-                for file in files:
-                    if file.startswith((".", "._")):
-                        continue
-                    src_path = Path(root) / file
-                    rel_path = src_path.relative_to(source_dir)
-                    dst_path = tmp_stage_dir / rel_path
-                    dst_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src_path, dst_path)
+            resolved_sha = proc.stdout.strip()
+            is_git = True
+        except Exception as exc:
+            if target_sha and SHA_RE.match(target_sha):
+                resolved_sha = target_sha
+            elif not resolved_sha:
+                raise RuntimeError(f"Unable to resolve git commit '{target_sha or 'HEAD'}' in {source_dir}: {exc}") from exc
 
-        # Write REVISION
-        (tmp_stage_dir / "REVISION").write_text(f"{resolved_sha}\n", encoding="utf-8")
+        if not SHA_RE.match(resolved_sha):
+            raise ValueError(f"Invalid full 40-character commit SHA: {resolved_sha}")
 
-        # Write requirements and hash
-        req_file = tmp_stage_dir / "requirements.txt"
-        if req_file.is_file():
-            req_hash = hash_requirements(req_file)
-            (tmp_stage_dir / "requirements.sha256").write_text(f"{req_hash}\n", encoding="utf-8")
-        else:
-            (tmp_stage_dir / "requirements.sha256").write_text("empty\n", encoding="utf-8")
+        target_dir = releases_dir / resolved_sha
 
-        # Compile all python files to verify syntax integrity before publishing
-        for py_file in tmp_stage_dir.rglob("*.py"):
-            if py_file.is_file() and not py_file.name.startswith("._") and "__pycache__" not in str(py_file):
-                py_compile.compile(str(py_file), doraise=True)
+        # 2. Protection check: never destroy an in-use or rollback-protected release
+        is_prot, prot_reason = is_release_protected(base_dir, resolved_sha)
+        if target_dir.is_dir():
+            ok, int_msg = verify_release_integrity(target_dir, resolved_sha)
+            if is_prot and force:
+                raise RuntimeError(f"Refusing to overwrite protected release '{resolved_sha[:8]}' even with --force: {prot_reason}")
+            if ok and not force:
+                return target_dir
+            if is_prot:
+                if ok:
+                    return target_dir
+                raise RuntimeError(f"Cannot overwrite protected release '{resolved_sha[:8]}': {prot_reason}")
 
-        # Atomically publish the release directory
-        if target_dir.exists():
-            shutil.rmtree(target_dir, ignore_errors=True)
-        os.replace(tmp_stage_dir, target_dir)
-
-        # Verify integrity of newly published release
-        ok, int_msg = verify_release_integrity(target_dir, resolved_sha)
-        if not ok:
-            raise RuntimeError(f"Release integrity validation failed after staging: {int_msg}")
-
-        return target_dir
-
-    except Exception:
+        # 3. Stage into atomic temporary directory
+        tmp_stage_dir = releases_dir / f".tmp_{resolved_sha}_{os.getpid()}_{int(time.time() * 1000)}"
         if tmp_stage_dir.exists():
             shutil.rmtree(tmp_stage_dir, ignore_errors=True)
-        raise
+        tmp_stage_dir.mkdir(parents=True)
+
+        try:
+            if is_git:
+                # Extract directly from git commit tree via git archive
+                archive_proc = subprocess.run(
+                    ["git", "archive", resolved_sha],
+                    cwd=str(source_dir),
+                    capture_output=True,
+                    check=True,
+                )
+                with tarfile.open(fileobj=io.BytesIO(archive_proc.stdout)) as tar:
+                    if hasattr(tarfile, "data_filter"):
+                        tar.extractall(path=tmp_stage_dir, filter="data")
+                    else:
+                        tar.extractall(path=tmp_stage_dir)
+            else:
+                # Non-git source: require an explicit verified release archive
+                cand_archives = []
+                if archive_path:
+                    cand_archives.append(Path(archive_path))
+                cand_archives.extend([
+                    source_dir / f"release_{resolved_sha}.tar.gz",
+                    source_dir / f"{resolved_sha}.tar.gz",
+                    source_dir / "release.tar.gz",
+                ])
+                chosen_archive = next((a for a in cand_archives if a.is_file()), None)
+                if chosen_archive:
+                    with tarfile.open(str(chosen_archive), "r:*") as tar:
+                        if hasattr(tarfile, "data_filter"):
+                            tar.extractall(path=tmp_stage_dir, filter="data")
+                        else:
+                            tar.extractall(path=tmp_stage_dir)
+                else:
+                    # STRICT FAIL-CLOSED: Refuse to stamp arbitrary disk files with an unverified SHA
+                    raise RuntimeError(
+                        f"Cannot stage release '{resolved_sha}': source '{source_dir}' is not a Git repository "
+                        f"and no verified release archive was provided."
+                    )
+
+            # Write REVISION
+            (tmp_stage_dir / "REVISION").write_text(f"{resolved_sha}\n", encoding="utf-8")
+
+            # Write requirements and hash
+            req_file = tmp_stage_dir / "requirements.txt"
+            if req_file.is_file():
+                req_hash = hash_requirements(req_file)
+                (tmp_stage_dir / "requirements.sha256").write_text(f"{req_hash}\n", encoding="utf-8")
+            else:
+                (tmp_stage_dir / "requirements.sha256").write_text("empty\n", encoding="utf-8")
+
+            # Compile all python files to verify syntax integrity before publishing
+            for py_file in tmp_stage_dir.rglob("*.py"):
+                if py_file.is_file() and not py_file.name.startswith("._") and "__pycache__" not in str(py_file):
+                    py_compile.compile(str(py_file), doraise=True)
+
+            # Generate and write full cryptographic manifest
+            write_release_manifest(tmp_stage_dir)
+
+            # Atomically publish the release directory
+            if target_dir.exists():
+                shutil.rmtree(target_dir, ignore_errors=True)
+            os.replace(tmp_stage_dir, target_dir)
+
+            # Verify integrity of newly published release
+            ok, int_msg = verify_release_integrity(target_dir, resolved_sha)
+            if not ok:
+                raise RuntimeError(f"Release integrity validation failed after staging: {int_msg}")
+
+            return target_dir
+
+        except Exception:
+            if tmp_stage_dir.exists():
+                shutil.rmtree(tmp_stage_dir, ignore_errors=True)
+            raise
 
 
 # =============================================================================
@@ -590,11 +736,17 @@ def verify_process_ownership(
     base_dir: Path,
     port: int,
 ) -> bool:
-    """Authoritatively prove that PID is an orphaned child of instance_name."""
+    """Authoritatively prove that PID is an orphaned process of instance_name.
+    
+    Never assumes matching APP_PORT alone proves ownership. Requires matching entrypoint
+    and working directory within the instance's deployment or legacy directory.
+    """
     if pid <= 0 or pid == os.getpid():
         return False
     cmdline = ""
     cwd_str = ""
+    environ_str = ""
+
     # Check Linux /proc/<pid>
     proc_dir = Path(f"/proc/{pid}")
     if proc_dir.is_dir():
@@ -607,25 +759,108 @@ def verify_process_ownership(
         except OSError:
             pass
         try:
-            environ = (proc_dir / "environ").read_bytes().decode("utf-8", errors="replace")
-            if f"BOT_INSTANCE_ID={instance_name}" in environ or f"APP_PORT={port}" in environ:
-                return True
+            environ_str = (proc_dir / "environ").read_bytes().decode("utf-8", errors="replace")
         except OSError:
             pass
     else:
-        # macOS / BSD fallback via ps
+        # macOS / BSD fallback via ps and lsof
         try:
             ps_proc = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
             if ps_proc.returncode == 0:
                 cmdline = ps_proc.stdout.strip()
         except Exception:
             pass
+        try:
+            lsof_cwd = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], capture_output=True, text=True)
+            if lsof_cwd.returncode == 0:
+                for l in lsof_cwd.stdout.splitlines():
+                    if l.startswith("n"):
+                        cwd_str = l[1:]
+        except Exception:
+            pass
 
-    has_bot_cmd = ("main.py" in cmdline) or ("max_messenger_bot.app" in cmdline)
+    # Strictly verify:
+    # 1. Entrypoint matches this bot runner
+    has_bot_entrypoint = ("main.py" in cmdline) or ("max_messenger_bot.app" in cmdline)
+    has_instance_id = f"BOT_INSTANCE_ID={instance_name}" in environ_str or f"--name {instance_name}" in cmdline
+
+    # 2. Cwd is strictly within this instance deployment or legacy directory
     expected_dep = str((base_dir / "deployments" / instance_name).resolve()) if (base_dir / "deployments" / instance_name).exists() else ""
-    has_dep_cwd = (expected_dep and expected_dep in cwd_str) or f"deployments/{instance_name}" in cwd_str
+    legacy_dir = str((base_dir / "newbots").resolve()) if (base_dir / "newbots").exists() else ""
 
-    return bool(has_bot_cmd and has_dep_cwd)
+    in_instance_dep = bool(expected_dep and (expected_dep == cwd_str or expected_dep in cwd_str or f"deployments/{instance_name}" in cwd_str))
+    in_legacy_dir = bool(legacy_dir and (legacy_dir == cwd_str or legacy_dir in cwd_str))
+
+    # CRITICAL: Never accept matching APP_PORT alone as proof of ownership!
+    if has_instance_id and (in_instance_dep or in_legacy_dir):
+        return True
+
+    if has_bot_entrypoint and in_instance_dep:
+        return True
+
+    return False
+
+
+def get_listening_pids(port: int) -> tuple[bool, list[int], str]:
+    """Query strictly TCP listening sockets on port.
+    
+    Returns (success, pids, tool_used). If no tool is available, success=False (fail-closed).
+    """
+    # 1. Try lsof strictly querying LISTEN sockets:
+    try:
+        proc = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0 or (proc.returncode == 1 and not proc.stdout.strip()):
+            pids = []
+            for raw in proc.stdout.splitlines():
+                raw = raw.strip()
+                if raw.isdigit():
+                    pids.append(int(raw))
+            return True, pids, "lsof"
+    except (FileNotFoundError, PermissionError):
+        pass
+
+    # 2. Try ss querying LISTEN sockets:
+    try:
+        proc = subprocess.run(
+            ["ss", "-ltnp", f"sport = :{port}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            pids = []
+            for raw in re.findall(r"pid=(\d+)", proc.stdout):
+                pids.append(int(raw))
+            return True, pids, "ss"
+    except (FileNotFoundError, PermissionError):
+        pass
+
+    # 3. Try netstat querying LISTEN sockets:
+    try:
+        proc = subprocess.run(
+            ["netstat", "-ltnp"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            pids = []
+            for line in proc.stdout.splitlines():
+                if f":{port} " in line and "LISTEN" in line:
+                    m = re.search(r"(\d+)/", line)
+                    if m:
+                        pids.append(int(m.group(1)))
+            return True, pids, "netstat"
+    except (FileNotFoundError, PermissionError):
+        pass
+
+    # No port inspection tool succeeded: FAIL CLOSED
+    return False, [], "none"
 
 
 def check_and_resolve_port_conflict(
@@ -642,16 +877,10 @@ def check_and_resolve_port_conflict(
     if not pm2_snapshot:
         return False, "PM2 snapshot is unavailable; refusing to inspect ports.", []
 
-    listening_pids: list[int] = []
-    try:
-        proc = subprocess.run(["lsof", "-t", f"-i:{port}"], capture_output=True, text=True, check=False)
-        if proc.returncode == 0 and proc.stdout:
-            for raw in proc.stdout.splitlines():
-                raw = raw.strip()
-                if raw.isdigit():
-                    listening_pids.append(int(raw))
-    except (FileNotFoundError, PermissionError):
-        return True, "lsof_unavailable", []
+    ok, listening_pids, tool_used = get_listening_pids(port)
+    if not ok:
+        # STRICT FAIL-CLOSED: Refuse to continue if port inspection tools are missing or broken
+        return False, f"port_check_unavailable: No port inspection tool (lsof, ss, netstat) available. Failing closed for safety.", []
 
     if not listening_pids:
         return True, "port_clear", []
@@ -709,37 +938,30 @@ def cleanup_instance_ghost_port(
     instance_name: str | None = None,
     base_dir: Path = DEFAULT_BASE_DIR,
 ) -> list[int]:
-    """Clean up orphan process on port; targets ONLY the instance's specific port."""
-    if not port or port <= 0:
+    """Clean up orphan process on port; strictly verifies ownership and NEVER kills foreign processes."""
+    if not port or port <= 0 or not instance_name:
         return []
 
     killed_pids: list[int] = []
-    try:
-        proc = subprocess.run(
-            ["lsof", "-t", f"-i:{port}"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if proc.returncode == 0 and proc.stdout:
-            for raw_pid in proc.stdout.splitlines():
-                raw_pid = raw_pid.strip()
-                if not raw_pid.isdigit():
-                    continue
-                pid = int(raw_pid)
-                if pid not in pm2_pids and pid != os.getpid():
-                    if instance_name and not verify_process_ownership(pid, instance_name, base_dir, port):
-                        continue
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                        time.sleep(0.1)
-                        if os.path.exists(f"/proc/{pid}"):
-                            os.kill(pid, signal.SIGKILL)
-                        killed_pids.append(pid)
-                    except OSError:
-                        pass
-    except (FileNotFoundError, PermissionError):
-        pass
+    ok, listening_pids, _ = get_listening_pids(port)
+    if not ok or not listening_pids:
+        return []
+
+    for pid in listening_pids:
+        if pid not in pm2_pids and pid != os.getpid():
+            if not verify_process_ownership(pid, instance_name, base_dir, port):
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(0.1)
+                try:
+                    os.kill(pid, 0)
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                killed_pids.append(pid)
+            except OSError:
+                pass
 
     return killed_pids
 
@@ -881,6 +1103,17 @@ def reload_pm2_instance(
         except Exception:
             pass
 
+    # Truncate / flush previous logs for target instance to prevent stale crash logs
+    try:
+        subprocess.run(
+            get_pm2_cmd() + ["flush", instance_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        pass
+
     cmd = get_pm2_cmd() + [
         "startOrReload",
         str(pm2_config),
@@ -909,11 +1142,20 @@ def reload_pm2_instance(
 
 def verify_instance_health(
     instance_name: str,
-    expected_sha: str,
+    expected_sha: str = "",
     settle_seconds: float = 3.0,
     base_dir: Path = DEFAULT_BASE_DIR,
+    registry: dict[str, Any] | None = None,
+    check_readiness: bool = True,
 ) -> tuple[bool, list[str]]:
-    """Verify that an instance is healthy, online, and running the expected SHA."""
+    """Verify that an instance is healthy, online, and running the expected SHA.
+
+    Performs deep readiness verification:
+    - PM2 status is 'online' and process PID is alive.
+    - Process has not suffered unstable restarts.
+    - Configured application port is actively listening and responsive to TCP connections.
+    - PM2 error logs do not contain fatal unhandled crash tracebacks.
+    """
     if settle_seconds > 0:
         time.sleep(settle_seconds)
 
@@ -926,6 +1168,7 @@ def verify_instance_health(
         return False, errors
 
     info = inspect_runtime_process(proc, base_dir=base_dir)
+    pm2_env = proc.get("pm2_env") if isinstance(proc.get("pm2_env"), dict) else {}
 
     if info["status"] != "online":
         errors.append(f"process_not_online:{instance_name}:{info['status']}")
@@ -933,12 +1176,82 @@ def verify_instance_health(
     if not info["is_alive"]:
         errors.append(f"process_pid_dead:{instance_name}:{info['pid']}")
 
+    if pm2_env.get("unstable_restarts", 0) > 0:
+        errors.append(f"process_unstable_restarts:{instance_name}:{pm2_env.get('unstable_restarts')}")
+
     if expected_sha:
         resolved = info["resolved_sha"]
         if not resolved:
             errors.append(f"missing_runtime_revision:{instance_name}")
         elif not (resolved == expected_sha or expected_sha.startswith(resolved) or resolved.startswith(expected_sha)):
             errors.append(f"runtime_sha_mismatch:{instance_name}:expected={expected_sha[:8]},actual={resolved[:8]}")
+
+    # Deep Application Readiness & Socket Check
+    if check_readiness:
+        # 1. Determine port from registry or process env
+        reg = registry or (load_registry() if DEFAULT_REGISTRY_PATH.is_file() else {})
+        entry = get_instance_by_name(reg, instance_name) if reg else None
+        target_port = 0
+        if entry and entry.get("port"):
+            try:
+                target_port = int(entry["port"])
+            except (ValueError, TypeError):
+                pass
+        if target_port <= 0:
+            env_vars = pm2_env.get("env") if isinstance(pm2_env.get("env"), dict) else {}
+            for port_key in ["APP_PORT", "MAX_APP_PORT", "PORT"]:
+                if env_vars.get(port_key):
+                    try:
+                        target_port = int(env_vars[port_key])
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+        # If a port is configured, verify that it accepts connections
+        if target_port > 0:
+            connected = False
+            last_exc: Exception | None = None
+            probe_deadline = time.time() + 3.0
+            while time.time() < probe_deadline:
+                try:
+                    with socket.create_connection(("127.0.0.1", target_port), timeout=0.5):
+                        connected = True
+                        break
+                except (ConnectionRefusedError, TimeoutError, OSError) as exc:
+                    last_exc = exc
+                    time.sleep(0.1)
+            if not connected:
+                errors.append(f"port_unresponsive:{instance_name}:port={target_port}:error={last_exc}")
+
+        # 2. Check PM2 error log tail for fatal exceptions
+        err_log_path = pm2_env.get("pm_err_log_path")
+        if err_log_path and Path(err_log_path).is_file():
+            try:
+                log_file = Path(err_log_path)
+                size = log_file.stat().st_size
+                if size > 0:
+                    read_bytes = min(size, 8192)
+                    with log_file.open("rb") as f:
+                        f.seek(size - read_bytes)
+                        tail = f.read().decode("utf-8", errors="replace")
+                    fatal_markers = [
+                        "ModuleNotFoundError",
+                        "ImportError",
+                        "Address already in use",
+                        "OperationalError: (psycopg2",
+                    ]
+                    for marker in fatal_markers:
+                        if marker in tail:
+                            errors.append(f"fatal_error_in_logs:{instance_name}:{marker}")
+                            break
+                    if "Traceback (most recent call last)" in tail:
+                        tail_clean = tail.strip()
+                        lines = [ln for ln in tail_clean.splitlines() if ln.strip()]
+                        last_err = lines[-1] if lines else ""
+                        if not any(ign in last_err for ign in ["KeyboardInterrupt", "SystemExit"]):
+                            errors.append(f"fatal_error_in_logs:{instance_name}:{last_err}")
+            except Exception:
+                pass
 
     return len(errors) == 0, errors
 
@@ -1156,6 +1469,17 @@ def rollback_instance(
                     reload_ok, reload_msg = reload_pm2_instance(instance_name, pm2_config, effective_runtime_env, restart=True)
                     if not reload_ok:
                         return False, f"PM2 reload failed during rollback to legacy: {reload_msg}", {}
+                    # Deep health and readiness check for legacy rollback
+                    legacy_health, legacy_errors = verify_instance_health(
+                        instance_name=instance_name,
+                        expected_sha="",
+                        settle_seconds=settle_seconds,
+                        base_dir=base_dir,
+                        registry=reg,
+                    )
+                    if not legacy_health:
+                        return False, f"Health check failed after rollback to legacy: {', '.join(legacy_errors)}", {"errors": legacy_errors}
+
                     state["current_release_sha"] = None
                     state["current_target_dir"] = "legacy"
                     save_instance_state(base_dir, instance_name, state)
@@ -1174,6 +1498,12 @@ def rollback_instance(
             return False, f"Rollback target python interpreter check failed: {py_msg}", {}
 
         current_sha_before = state.get("current_release_sha")
+        target_dir_before = None
+        if deployment_link.is_symlink() or deployment_link.is_dir():
+            try:
+                target_dir_before = deployment_link.resolve()
+            except OSError:
+                target_dir_before = None
 
         # Atomically switch symlink
         atomic_symlink_switch(base_dir, instance_name, target_release_dir)
@@ -1184,22 +1514,46 @@ def rollback_instance(
             pm2_config=pm2_config,
             runtime_env=effective_runtime_env,
         )
-        if not reload_ok:
-            return False, f"PM2 reload failed during rollback: {reload_msg}", {}
 
-        # Verify health
-        health_ok, errors = verify_instance_health(
-            instance_name=instance_name,
-            expected_sha=resolved_target_sha,
-            settle_seconds=settle_seconds,
-            base_dir=base_dir,
-        )
-        if not health_ok:
-            return False, f"Health check failed after rollback: {', '.join(errors)}", {"errors": errors}
+        health_ok, errors = (True, [])
+        if reload_ok:
+            health_ok, errors = verify_instance_health(
+                instance_name=instance_name,
+                expected_sha=resolved_target_sha,
+                settle_seconds=settle_seconds,
+                base_dir=base_dir,
+                registry=reg,
+            )
 
-        # Update state
+        # If reload or health check failed: REVERT SAFELY TO PRE-ROLLBACK STATE
+        if not reload_ok or not health_ok:
+            fail_reason = f"PM2 reload failed: {reload_msg}" if not reload_ok else f"Health check failed: {', '.join(errors)}"
+            if target_dir_before:
+                atomic_symlink_switch(base_dir, instance_name, target_dir_before)
+                rv_ok, rv_msg = reload_pm2_instance(instance_name, pm2_config, effective_runtime_env)
+                rv_health, rv_errors = verify_instance_health(
+                    instance_name=instance_name,
+                    expected_sha=current_sha_before or "",
+                    settle_seconds=settle_seconds,
+                    base_dir=base_dir,
+                    registry=reg,
+                )
+                if rv_ok and rv_health:
+                    return False, f"Rollback failed: {fail_reason} (safely reverted to pre-rollback state {current_sha_before[:8] if current_sha_before else 'prior'})", {"errors": errors}
+                else:
+                    state["last_action"] = "rollback_failed"
+                    state["status"] = "CRITICAL_EMERGENCY"
+                    save_instance_state(base_dir, instance_name, state)
+                    return False, f"CRITICAL_EMERGENCY: Rollback failed: {fail_reason} AND revert to pre-rollback state also failed: {rv_msg}", {"errors": errors, "revert_errors": rv_errors}
+            else:
+                if deployment_link.is_symlink():
+                    deployment_link.unlink()
+                reload_pm2_instance(instance_name, pm2_config, effective_runtime_env, restart=True)
+                return False, f"Rollback failed: {fail_reason} (reverted to legacy)", {"errors": errors}
+
+        # Update state: record TRUE previous target
         state["previous_successful_release_sha"] = current_sha_before
-        state["previous_successful_target_dir"] = str(deployment_link.resolve())
+        state["previous_successful_target_dir"] = str(target_dir_before) if target_dir_before else "legacy"
         state["current_release_sha"] = resolved_target_sha
         state["current_target_dir"] = str(target_release_dir)
         state["last_action"] = "rollback"
@@ -1232,10 +1586,11 @@ def prune_releases(
     dry_run: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Prune inactive releases, strictly protecting active deployments AND instance rollback targets."""
-    releases_dir = base_dir / "releases"
-    deployments_dir = base_dir / "deployments"
-    if not releases_dir.is_dir():
-        return [], []
+    with lock_pruning(base_dir):
+        releases_dir = base_dir / "releases"
+        deployments_dir = base_dir / "deployments"
+        if not releases_dir.is_dir():
+            return [], []
 
     protected_shas: set[str] = set()
 
