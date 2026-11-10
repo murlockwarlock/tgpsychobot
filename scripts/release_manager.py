@@ -35,6 +35,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 from typing import Any
 
@@ -243,6 +244,59 @@ def lock_pruning(base_dir: Path, timeout_seconds: float = 30.0):
         os.close(fd)
 
 
+def get_pins_dir(base_dir: Path) -> Path:
+    """Return the directory used for pinning staged releases awaiting activation."""
+    return base_dir / "releases" / ".pins"
+
+
+def pin_staged_release(base_dir: Path, sha: str, ttl_seconds: float = 3600.0) -> Path:
+    """Pin a staged release so it cannot be pruned before being activated by a deployment."""
+    pins_dir = get_pins_dir(base_dir)
+    pins_dir.mkdir(parents=True, exist_ok=True)
+    pin_file = pins_dir / f"{sha}.json"
+    data = {
+        "sha": sha,
+        "pinned_at": time.time(),
+        "ttl_seconds": ttl_seconds,
+    }
+    pin_file.write_text(json.dumps(data), encoding="utf-8")
+    return pin_file
+
+
+def unpin_staged_release(base_dir: Path, sha: str) -> None:
+    """Unpin a staged release once it is activated or explicitly cleaned up."""
+    pin_file = get_pins_dir(base_dir) / f"{sha}.json"
+    if safe_exists(pin_file):
+        try:
+            pin_file.unlink()
+        except OSError:
+            pass
+
+
+def get_active_pins(base_dir: Path) -> set[str]:
+    """Get all unexpired pinned SHAs."""
+    pins_dir = get_pins_dir(base_dir)
+    if not safe_is_dir(pins_dir):
+        return set()
+    now = time.time()
+    active_pins: set[str] = set()
+    for p in pins_dir.glob("*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            pinned_at = float(data.get("pinned_at", 0))
+            ttl = float(data.get("ttl_seconds", 3600.0))
+            if now - pinned_at < ttl:
+                active_pins.add(data.get("sha", p.stem))
+            else:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    return active_pins
+
+
 def load_instance_state(base_dir: Path, instance_name: str) -> dict[str, Any]:
     """Load the state history of a single bot instance.
     
@@ -328,6 +382,12 @@ def is_release_protected(base_dir: Path, sha: str) -> tuple[bool, str]:
                     return True, f"protected as rollback target for instance '{inst}'"
             except Exception:
                 pass
+
+    # Check active staged release pins
+    active_pins = get_active_pins(base_dir)
+    if sha in active_pins or any(p.startswith(sha) or sha.startswith(p) for p in active_pins):
+        return True, "staged release is pinned awaiting deployment"
+
     return False, ""
 
 
@@ -374,30 +434,41 @@ def verify_release_integrity(release_dir: Path, expected_sha: str) -> tuple[bool
         if actual_hash != expected_hash:
             return False, f"requirements.sha256 mismatch: expected {expected_hash[:8]}, got {actual_hash[:8]}"
 
-    # Manifest verification (tampering check)
+    # Manifest verification (mandatory tampering check)
     manifest_file = release_dir / "MANIFEST.sha256"
-    if manifest_file.is_file():
-        recorded_manifest: dict[str, str] = {}
-        for line in manifest_file.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("  ", 1)
-            if len(parts) == 2:
-                recorded_manifest[parts[1]] = parts[0]
-        # Check all recorded files
-        for rel_path, expected_h in recorded_manifest.items():
-            f = release_dir / rel_path
-            if not f.is_file():
-                return False, f"Integrity failed: file '{rel_path}' recorded in MANIFEST.sha256 is missing"
-            actual_h = hashlib.sha256(f.read_bytes()).hexdigest()
-            if actual_h != expected_h:
-                return False, f"Integrity failed: file '{rel_path}' has been tampered with (expected {expected_h[:8]}, got {actual_h[:8]})"
-        # Check for unrecorded files added post-staging
-        current_manifest = generate_release_manifest(release_dir)
-        extra_files = set(current_manifest.keys()) - set(recorded_manifest.keys())
-        if extra_files:
-            return False, f"Integrity failed: unverified file(s) added post-staging: {', '.join(sorted(extra_files))}"
+    if not manifest_file.is_file():
+        return False, "Missing mandatory MANIFEST.sha256 file"
+
+    manifest_lines = manifest_file.read_text(encoding="utf-8").splitlines()
+    if not manifest_lines:
+        return False, "MANIFEST.sha256 is empty"
+
+    recorded_manifest: dict[str, str] = {}
+    for line in manifest_lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("  ", 1)
+        if len(parts) == 2:
+            recorded_manifest[parts[1]] = parts[0]
+
+    if not recorded_manifest:
+        return False, "MANIFEST.sha256 contains no valid file entries"
+
+    # Check all recorded files
+    for rel_path, expected_h in recorded_manifest.items():
+        f = release_dir / rel_path
+        if not f.is_file():
+            return False, f"Integrity failed: file '{rel_path}' recorded in MANIFEST.sha256 is missing"
+        actual_h = hashlib.sha256(f.read_bytes()).hexdigest()
+        if actual_h != expected_h:
+            return False, f"Integrity failed: file '{rel_path}' has been tampered with (expected {expected_h[:8]}, got {actual_h[:8]})"
+
+    # Check for unrecorded files added post-staging
+    current_manifest = generate_release_manifest(release_dir)
+    extra_files = set(current_manifest.keys()) - set(recorded_manifest.keys())
+    if extra_files:
+        return False, f"Integrity failed: unverified file(s) added post-staging: {', '.join(sorted(extra_files))}"
 
     # Syntax validation
     for py_file in release_dir.rglob("*.py"):
@@ -565,6 +636,75 @@ def audit_schema_compatibility(repo_root: Path = REPO_ROOT) -> tuple[bool, str]:
 # Immutable Release Staging
 # =============================================================================
 
+def pack_release_archive(
+    source_dir: Path,
+    target_sha: str,
+    output_archive: Path,
+) -> tuple[Path, str]:
+    """Create a verified, self-contained release archive from a Git tree.
+
+    Includes authoritative MANIFEST.sha256, REVISION, requirements.sha256,
+    compiled bytecode, and writes an accompanying .sha256 digest file.
+    Returns (output_archive_path, archive_sha256_digest).
+    """
+    output_archive = Path(output_archive)
+    output_archive.parent.mkdir(parents=True, exist_ok=True)
+
+    rev_proc = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{target_sha}^{{commit}}"],
+        cwd=str(source_dir),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    full_sha = rev_proc.stdout.strip()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        archive_proc = subprocess.run(
+            ["git", "archive", full_sha],
+            cwd=str(source_dir),
+            capture_output=True,
+            check=True,
+        )
+        with tarfile.open(fileobj=io.BytesIO(archive_proc.stdout)) as tar:
+            if hasattr(tarfile, "data_filter"):
+                tar.extractall(path=tmp_path, filter="data")
+            else:
+                tar.extractall(path=tmp_path)
+
+        # Authoritative REVISION
+        (tmp_path / "REVISION").write_text(f"{full_sha}\n", encoding="utf-8")
+
+        # Authoritative requirements.sha256
+        req_file = tmp_path / "requirements.txt"
+        if req_file.is_file():
+            req_hash = hash_requirements(req_file)
+            (tmp_path / "requirements.sha256").write_text(f"{req_hash}\n", encoding="utf-8")
+        else:
+            (tmp_path / "requirements.sha256").write_text("empty\n", encoding="utf-8")
+
+        # Compile all python files
+        for py_file in tmp_path.rglob("*.py"):
+            if py_file.is_file() and not py_file.name.startswith("._") and "__pycache__" not in str(py_file):
+                py_compile.compile(str(py_file), doraise=True)
+
+        # Authoritative MANIFEST.sha256 from Git tree
+        write_release_manifest(tmp_path)
+
+        with tarfile.open(str(output_archive), "w:gz") as out_tar:
+            for item in sorted(tmp_path.rglob("*")):
+                if item.is_file():
+                    arcname = str(item.relative_to(tmp_path))
+                    out_tar.add(item, arcname=arcname)
+
+    archive_bytes = output_archive.read_bytes()
+    digest = hashlib.sha256(archive_bytes).hexdigest()
+    digest_file = output_archive.with_name(f"{output_archive.name}.sha256")
+    digest_file.write_text(f"{digest}  {output_archive.name}\n", encoding="utf-8")
+    return output_archive, digest
+
+
 def stage_release(
     base_dir: Path = DEFAULT_BASE_DIR,
     target_sha: str | None = None,
@@ -615,9 +755,11 @@ def stage_release(
             if is_prot and force:
                 raise RuntimeError(f"Refusing to overwrite protected release '{resolved_sha[:8]}' even with --force: {prot_reason}")
             if ok and not force:
+                pin_staged_release(base_dir, resolved_sha)
                 return target_dir
             if is_prot:
                 if ok:
+                    pin_staged_release(base_dir, resolved_sha)
                     return target_dir
                 raise RuntimeError(f"Cannot overwrite protected release '{resolved_sha[:8]}': {prot_reason}")
 
@@ -641,6 +783,25 @@ def stage_release(
                         tar.extractall(path=tmp_stage_dir, filter="data")
                     else:
                         tar.extractall(path=tmp_stage_dir)
+
+                # Write REVISION
+                (tmp_stage_dir / "REVISION").write_text(f"{resolved_sha}\n", encoding="utf-8")
+
+                # Write requirements and hash
+                req_file = tmp_stage_dir / "requirements.txt"
+                if req_file.is_file():
+                    req_hash = hash_requirements(req_file)
+                    (tmp_stage_dir / "requirements.sha256").write_text(f"{req_hash}\n", encoding="utf-8")
+                else:
+                    (tmp_stage_dir / "requirements.sha256").write_text("empty\n", encoding="utf-8")
+
+                # Compile all python files
+                for py_file in tmp_stage_dir.rglob("*.py"):
+                    if py_file.is_file() and not py_file.name.startswith("._") and "__pycache__" not in str(py_file):
+                        py_compile.compile(str(py_file), doraise=True)
+
+                # Generate and write full cryptographic manifest from authoritative git tree
+                write_release_manifest(tmp_stage_dir)
             else:
                 # Non-git source: require an explicit verified release archive
                 cand_archives = []
@@ -652,37 +813,56 @@ def stage_release(
                     source_dir / "release.tar.gz",
                 ])
                 chosen_archive = next((a for a in cand_archives if a.is_file()), None)
-                if chosen_archive:
-                    with tarfile.open(str(chosen_archive), "r:*") as tar:
-                        if hasattr(tarfile, "data_filter"):
-                            tar.extractall(path=tmp_stage_dir, filter="data")
-                        else:
-                            tar.extractall(path=tmp_stage_dir)
-                else:
-                    # STRICT FAIL-CLOSED: Refuse to stamp arbitrary disk files with an unverified SHA
+                if not chosen_archive:
                     raise RuntimeError(
                         f"Cannot stage release '{resolved_sha}': source '{source_dir}' is not a Git repository "
                         f"and no verified release archive was provided."
                     )
 
-            # Write REVISION
-            (tmp_stage_dir / "REVISION").write_text(f"{resolved_sha}\n", encoding="utf-8")
+                # Verify archive digest if digest file exists
+                cand_digests = [
+                    chosen_archive.with_name(f"{chosen_archive.name}.sha256"),
+                    chosen_archive.with_suffix(".sha256"),
+                ]
+                digest_file = next((d for d in cand_digests if d.is_file()), None)
+                if digest_file:
+                    expected_digest = digest_file.read_text(encoding="utf-8").split()[0].strip()
+                    actual_digest = hashlib.sha256(chosen_archive.read_bytes()).hexdigest()
+                    if actual_digest != expected_digest:
+                        raise RuntimeError(
+                            f"Release archive '{chosen_archive.name}' digest verification failed! "
+                            f"Expected {expected_digest[:8]}, got {actual_digest[:8]}."
+                        )
 
-            # Write requirements and hash
-            req_file = tmp_stage_dir / "requirements.txt"
-            if req_file.is_file():
-                req_hash = hash_requirements(req_file)
-                (tmp_stage_dir / "requirements.sha256").write_text(f"{req_hash}\n", encoding="utf-8")
-            else:
-                (tmp_stage_dir / "requirements.sha256").write_text("empty\n", encoding="utf-8")
+                with tarfile.open(str(chosen_archive), "r:*") as tar:
+                    if hasattr(tarfile, "data_filter"):
+                        tar.extractall(path=tmp_stage_dir, filter="data")
+                    else:
+                        tar.extractall(path=tmp_stage_dir)
 
-            # Compile all python files to verify syntax integrity before publishing
-            for py_file in tmp_stage_dir.rglob("*.py"):
-                if py_file.is_file() and not py_file.name.startswith("._") and "__pycache__" not in str(py_file):
-                    py_compile.compile(str(py_file), doraise=True)
+                # For external archives: MANIFEST.sha256 MUST be included in the archive from the source Git commit!
+                archive_manifest = tmp_stage_dir / "MANIFEST.sha256"
+                if not archive_manifest.is_file():
+                    raise RuntimeError(
+                        f"External release archive '{chosen_archive.name}' rejected: "
+                        f"Missing mandatory MANIFEST.sha256 formed from source Git commit."
+                    )
 
-            # Generate and write full cryptographic manifest
-            write_release_manifest(tmp_stage_dir)
+                # Check REVISION
+                rev_file = tmp_stage_dir / "REVISION"
+                if not rev_file.is_file():
+                    raise RuntimeError(f"External release archive '{chosen_archive.name}' rejected: Missing mandatory REVISION file.")
+                arch_sha = rev_file.read_text(encoding="utf-8").strip()
+                if arch_sha != resolved_sha and not arch_sha.startswith(resolved_sha) and not resolved_sha.startswith(arch_sha):
+                    raise RuntimeError(f"External release archive SHA mismatch: expected {resolved_sha[:8]}, got {arch_sha[:8]}.")
+
+                # Compile all python files
+                for py_file in tmp_stage_dir.rglob("*.py"):
+                    if py_file.is_file() and not py_file.name.startswith("._") and "__pycache__" not in str(py_file):
+                        py_compile.compile(str(py_file), doraise=True)
+
+                # CRITICAL: DO NOT call write_release_manifest() here!
+                # Files must match the pre-existing trusted MANIFEST.sha256 extracted from the archive.
 
             # Atomically publish the release directory
             if target_dir.exists():
@@ -693,6 +873,9 @@ def stage_release(
             ok, int_msg = verify_release_integrity(target_dir, resolved_sha)
             if not ok:
                 raise RuntimeError(f"Release integrity validation failed after staging: {int_msg}")
+
+            # Pin the newly staged release so it cannot be pruned before activation
+            pin_staged_release(base_dir, resolved_sha)
 
             return target_dir
 
@@ -824,26 +1007,54 @@ def verify_process_ownership(
     return False
 
 
+def is_tcp_port_accepting(port: int, host: str = "127.0.0.1") -> bool:
+    """Probe if a TCP port is actively accepting connections."""
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            return True
+    except (OSError, ConnectionRefusedError):
+        return False
+
+
 def get_listening_pids(port: int) -> tuple[bool, list[int], str]:
     """Query strictly TCP listening sockets on port.
     
-    Returns (success, pids, tool_used). If no tool is available, success=False (fail-closed).
+    Returns (success, pids, tool_used).
+    If a listening socket is present but owner PID cannot be identified (e.g. unprivileged user),
+    returns (False, [], f"{tool_used}:listening_socket_with_inaccessible_pid") to FAIL CLOSED.
     """
+    has_listening_socket_without_pid = False
+
     # 1. Try lsof strictly querying LISTEN sockets:
     try:
         proc = subprocess.run(
-            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
             capture_output=True,
             text=True,
             check=False,
         )
-        if proc.returncode == 0 or (proc.returncode == 1 and not proc.stdout.strip()):
+        if proc.returncode == 0:
+            lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
             pids = []
-            for raw in proc.stdout.splitlines():
-                raw = raw.strip()
-                if raw.isdigit():
-                    pids.append(int(raw))
-            return True, pids, "lsof"
+            has_listening_socket_without_pid = False
+            for line in lines:
+                if line.startswith("COMMAND"):
+                    continue
+                parts = line.split()
+                if len(parts) == 1 and parts[0].isdigit():
+                    pids.append(int(parts[0]))
+                elif len(parts) >= 2 and parts[1].isdigit():
+                    pids.append(int(parts[1]))
+                elif "LISTEN" in line:
+                    has_listening_socket_without_pid = True
+            if pids:
+                return True, list(set(pids)), "lsof"
+            if has_listening_socket_without_pid:
+                return False, [], "lsof:listening_socket_with_inaccessible_pid"
+            return True, [], "lsof"
+        elif proc.returncode == 1 and not proc.stdout.strip():
+            # lsof returns exit code 1 with empty stdout when no process is listening
+            return True, [], "lsof"
     except (FileNotFoundError, PermissionError):
         pass
 
@@ -856,10 +1067,21 @@ def get_listening_pids(port: int) -> tuple[bool, list[int], str]:
             check=False,
         )
         if proc.returncode == 0:
+            lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
             pids = []
-            for raw in re.findall(r"pid=(\d+)", proc.stdout):
-                pids.append(int(raw))
-            return True, pids, "ss"
+            has_listen_line = False
+            for line in lines:
+                if line.startswith("State") or line.startswith("Netid"):
+                    continue
+                if "LISTEN" in line or f":{port}" in line:
+                    has_listen_line = True
+                    for raw in re.findall(r"pid=(\d+)", line):
+                        pids.append(int(raw))
+            if pids:
+                return True, list(set(pids)), "ss"
+            if has_listen_line:
+                return False, [], "ss:listening_socket_with_inaccessible_pid"
+            return True, [], "ss"
     except (FileNotFoundError, PermissionError):
         pass
 
@@ -872,15 +1094,26 @@ def get_listening_pids(port: int) -> tuple[bool, list[int], str]:
             check=False,
         )
         if proc.returncode == 0:
+            lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
             pids = []
-            for line in proc.stdout.splitlines():
+            has_listen_line = False
+            for line in lines:
                 if f":{port} " in line and "LISTEN" in line:
+                    has_listen_line = True
                     m = re.search(r"(\d+)/", line)
                     if m:
                         pids.append(int(m.group(1)))
-            return True, pids, "netstat"
+            if pids:
+                return True, list(set(pids)), "netstat"
+            if has_listen_line:
+                return False, [], "netstat:listening_socket_with_inaccessible_pid"
+            return True, [], "netstat"
     except (FileNotFoundError, PermissionError):
         pass
+
+    # Active TCP probe check: if port is accepting connections:
+    if is_tcp_port_accepting(port):
+        return False, [], "tcp_probe:listening_socket_with_inaccessible_pid"
 
     # No port inspection tool succeeded: FAIL CLOSED
     return False, [], "none"
@@ -902,8 +1135,12 @@ def check_and_resolve_port_conflict(
 
     ok, listening_pids, tool_used = get_listening_pids(port)
     if not ok:
-        # STRICT FAIL-CLOSED: Refuse to continue if port inspection tools are missing or broken
-        return False, f"port_check_unavailable: No port inspection tool (lsof, ss, netstat) available. Failing closed for safety.", []
+        # STRICT FAIL-CLOSED: Refuse to continue if port inspection tools are missing or broken,
+        # or if an active listening socket exists with inaccessible PID
+        return False, f"port_check_unavailable: Port {port} check failed closed ({tool_used}). Active listening socket or tool failure detected on port {port}. Aborting deploy fail-closed for safety.", []
+
+    if is_tcp_port_accepting(port) and not listening_pids:
+        return False, f"Port {port} is actively accepting TCP connections but owner PID cannot be proven. Deploy aborted fail-closed for safety.", []
 
     if not listening_pids:
         return True, "port_clear", []
@@ -1607,60 +1844,79 @@ def prune_releases(
     base_dir: Path = DEFAULT_BASE_DIR,
     keep: int = 5,
     dry_run: bool = False,
+    grace_seconds: float = 3600.0,
 ) -> tuple[list[str], list[str]]:
-    """Prune inactive releases, strictly protecting active deployments AND instance rollback targets."""
-    with lock_pruning(base_dir):
-        releases_dir = base_dir / "releases"
-        deployments_dir = base_dir / "deployments"
-        if not releases_dir.is_dir():
-            return [], []
+    """Prune inactive releases, strictly protecting active deployments, rollback targets, and newly staged releases."""
+    with lock_staging(base_dir):
+        with lock_pruning(base_dir):
+            releases_dir = base_dir / "releases"
+            deployments_dir = base_dir / "deployments"
+            if not releases_dir.is_dir():
+                return [], []
 
-    protected_shas: set[str] = set()
+            protected_shas: set[str] = set()
 
-    # 1. Active deployment symlinks
-    if deployments_dir.is_dir():
-        for link in deployments_dir.iterdir():
-            if link.name == STATE_DIR_NAME or link.name.startswith("."):
-                continue
-            if link.is_symlink() or link.is_dir():
+            # 1. Active deployment symlinks
+            if deployments_dir.is_dir():
+                for link in deployments_dir.iterdir():
+                    if link.name == STATE_DIR_NAME or link.name.startswith("."):
+                        continue
+                    if safe_is_symlink(link) or safe_is_dir(link):
+                        try:
+                            resolved = link.resolve()
+                            protected_shas.add(resolved.name)
+                        except OSError:
+                            pass
+
+            # 2. Instance state rollback targets and current SHAs
+            state_dir = deployments_dir / STATE_DIR_NAME
+            if state_dir.is_dir():
+                for st_file in state_dir.glob("*.json"):
+                    try:
+                        st = json.loads(st_file.read_text(encoding="utf-8"))
+                        if st.get("current_release_sha"):
+                            protected_shas.add(st["current_release_sha"])
+                        if st.get("previous_successful_release_sha"):
+                            protected_shas.add(st["previous_successful_release_sha"])
+                    except Exception:
+                        pass
+
+            # 3. Active staged release pins (releases staged but not yet activated)
+            active_pins = get_active_pins(base_dir)
+            protected_shas.update(active_pins)
+
+            all_releases = [
+                d for d in releases_dir.iterdir()
+                if d.is_dir() and not d.name.startswith(".")
+            ]
+            all_releases.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+
+            now = time.time()
+            retained: list[str] = []
+            pruned: list[str] = []
+
+            for idx, rel in enumerate(all_releases):
+                # 4. Grace period: protect releases created/modified recently
+                is_within_grace = False
                 try:
-                    resolved = link.resolve()
-                    protected_shas.add(resolved.name)
+                    if (now - rel.stat().st_mtime) < grace_seconds:
+                        is_within_grace = True
                 except OSError:
                     pass
 
-    # 2. Instance state rollback targets and current SHAs
-    state_dir = deployments_dir / STATE_DIR_NAME
-    if state_dir.is_dir():
-        for st_file in state_dir.glob("*.json"):
-            try:
-                st = json.loads(st_file.read_text(encoding="utf-8"))
-                if st.get("current_release_sha"):
-                    protected_shas.add(st["current_release_sha"])
-                if st.get("previous_successful_release_sha"):
-                    protected_shas.add(st["previous_successful_release_sha"])
-            except Exception:
-                pass
+                is_protected = (
+                    is_within_grace
+                    or (rel.name in protected_shas)
+                    or any(s.startswith(rel.name) or rel.name.startswith(s) for s in protected_shas)
+                )
+                if is_protected or idx < keep:
+                    retained.append(rel.name)
+                else:
+                    if not dry_run:
+                        shutil.rmtree(rel, ignore_errors=True)
+                    pruned.append(rel.name)
 
-    all_releases = [
-        d for d in releases_dir.iterdir()
-        if d.is_dir() and not d.name.startswith(".")
-    ]
-    all_releases.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-
-    retained: list[str] = []
-    pruned: list[str] = []
-
-    for idx, rel in enumerate(all_releases):
-        is_protected = (rel.name in protected_shas) or any(s.startswith(rel.name) or rel.name.startswith(s) for s in protected_shas)
-        if is_protected or idx < keep:
-            retained.append(rel.name)
-        else:
-            if not dry_run:
-                shutil.rmtree(rel, ignore_errors=True)
-            pruned.append(rel.name)
-
-    return pruned, retained
+            return pruned, retained
 
 
 # =============================================================================
@@ -1785,10 +2041,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_preflight.add_argument("--target-sha", help="Target commit SHA (defaults to HEAD)")
     p_preflight.add_argument("--allow-dirty", action="store_true", help="Allow uncommitted changes (dev only)")
 
+    # pack
+    p_pack = subparsers.add_parser("pack", help="Build a verified release archive artifact from Git")
+    p_pack.add_argument("--target-sha", help="Target commit SHA (defaults to HEAD)")
+    p_pack.add_argument("--source-dir", type=Path, default=REPO_ROOT, help="Source git repository")
+    p_pack.add_argument("--output", type=Path, required=True, help="Output archive path (.tar.gz)")
+
     # stage
     p_stage = subparsers.add_parser("stage", help="Stage immutable release into releases/<sha>")
     p_stage.add_argument("--target-sha", help="Target commit SHA (defaults to HEAD)")
     p_stage.add_argument("--source-dir", type=Path, default=REPO_ROOT, help="Source repository directory")
+    p_stage.add_argument("--archive-path", type=Path, help="Explicit release archive artifact")
     p_stage.add_argument("--force", action="store_true", help="Force re-stage even if target exists")
 
     # deploy
@@ -1816,6 +2079,7 @@ def build_parser() -> argparse.ArgumentParser:
     # prune
     p_prune = subparsers.add_parser("prune", help="Prune inactive release directories")
     p_prune.add_argument("--keep", type=int, default=5, help="Number of releases to retain")
+    p_prune.add_argument("--grace-seconds", type=float, default=3600.0, help="Grace period for newly staged releases (default 3600s)")
     p_prune.add_argument("--dry-run", action="store_true", help="Simulate without deleting")
 
     # migrate-instance
@@ -1868,6 +2132,14 @@ def main() -> int:
         print("✓ All preflight checks passed successfully.")
         return 0
 
+    elif cmd == "pack":
+        target_sha = args.target_sha or resolve_git_commit_sha(args.source_dir)
+        print(f"Packaging release {target_sha} from {args.source_dir} to {args.output}...")
+        arch, digest = pack_release_archive(args.source_dir, target_sha, args.output)
+        print(f"✓ Release archive created: {arch}")
+        print(f"✓ Archive SHA256 digest: {digest}")
+        return 0
+
     elif cmd == "stage":
         target_sha = args.target_sha or resolve_git_commit_sha(args.source_dir)
         print(f"Staging release {target_sha} from {args.source_dir}...")
@@ -1875,6 +2147,7 @@ def main() -> int:
             base_dir=args.base_dir,
             target_sha=target_sha,
             source_dir=args.source_dir,
+            archive_path=args.archive_path,
             force=args.force,
         )
         print(f"✓ Release staged at: {rel_dir}")
@@ -1963,6 +2236,7 @@ def main() -> int:
             base_dir=args.base_dir,
             keep=args.keep,
             dry_run=args.dry_run,
+            grace_seconds=args.grace_seconds,
         )
         mode = "[DRY-RUN] " if args.dry_run else ""
         print(f"{mode}Retained {len(retained)} release(s): {', '.join(r[:8] for r in retained)}")

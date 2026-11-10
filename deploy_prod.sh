@@ -192,16 +192,6 @@ if [[ "$DEPLOY_MODE" == "rename" ]]; then
              --validate-runtime-env \
              --runtime-env '${REMOTE_RUNTIME_ENV}' \
              --pm2-names '${PM2_NAMES}' && \
-         echo 'Checking for ghost processes on ports 8080-8100...' && \
-         pm2_pids=\$(pm2 jlist | grep -o '\"pid\":[0-9]*' | cut -d: -f2 | tr '\n' ' ') && \
-         for port in {8080..8100}; do \
-             for pid in \$(command -v lsof >/dev/null && lsof -t -i :\$port || true); do \
-                 if [[ ! \" \$pm2_pids \" =~ \" \$pid \" ]]; then \
-                     echo \"Killing ghost process \$pid holding port \$port\" && \
-                     kill -9 \"\$pid\" || true; \
-                 fi; \
-             done; \
-         done && \
          '${REMOTE_PY}' 'scripts/cutover_bot_instance.py' \
              --pm2-name '${PM2_NAMES}' \
              --config '${PM2_CONFIG}' \
@@ -240,16 +230,6 @@ else
              --create-log-baseline \
              --pm2-names '${PM2_NAMES}') && \
          [[ -n "\$baseline_path" ]] && \
-         echo 'Checking for ghost processes on ports 8080-8100...' && \
-         pm2_pids=\$(pm2 jlist | grep -o '\"pid\":[0-9]*' | cut -d: -f2 | tr '\n' ' ') && \
-         for port in {8080..8100}; do \
-             for pid in \$(command -v lsof >/dev/null && lsof -t -i :\$port || true); do \
-                 if [[ ! \" \$pm2_pids \" =~ \" \$pid \" ]]; then \
-                     echo \"Killing ghost process \$pid holding port \$port\" && \
-                     kill -9 \"\$pid\" || true; \
-                 fi; \
-             done; \
-         done && \
          pm2 startOrReload '${PM2_CONFIG}' --only '${PM2_NAMES}' --update-env && \
          sleep 10 && \
          pm2 status && \

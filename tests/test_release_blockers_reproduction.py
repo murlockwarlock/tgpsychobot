@@ -435,3 +435,258 @@ def test_corrupted_state_file_fails_closed(tmp_path: Path):
 
     with pytest.raises(RuntimeError, match=r"(?i)corrupt"):
         rm.load_instance_state(base_dir, "tg_bot_corrupt")
+
+
+# =============================================================================
+# 9. Concurrency Safety: Pruning Lock Scope & Unactivated Release Protection
+# =============================================================================
+
+def test_unactivated_staged_release_cannot_be_pruned(tmp_path: Path):
+    """A release staged but not yet activated by any deployment must NOT be pruned."""
+    base_dir = tmp_path / "bots_root"
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True)
+    (repo_dir / "main.py").write_text("print('v1')\n")
+    (repo_dir / "requirements.txt").write_text("aiogram==3.1.1\n")
+    subprocess.run(["git", "add", "."], cwd=str(repo_dir), check=True)
+    subprocess.run(["git", "commit", "-m", "commit 1"], cwd=str(repo_dir), check=True)
+    head_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_dir), capture_output=True, text=True, check=True).stdout.strip()
+
+    # Stage the release
+    staged_dir = rm.stage_release(base_dir=base_dir, target_sha=head_sha, source_dir=repo_dir)
+    assert staged_dir.is_dir()
+
+    # Even with keep=0 and no deployment symlinks, unactivated pinned release must be retained!
+    pruned, retained = rm.prune_releases(base_dir=base_dir, keep=0)
+    assert head_sha in retained
+    assert head_sha not in pruned
+    assert staged_dir.is_dir()
+
+
+def _worker_stage_and_deploy(base_dir_str: str, repo_dir_str: str, sha: str, inst: str, iterations: int):
+    base_dir = Path(base_dir_str)
+    repo_dir = Path(repo_dir_str)
+    for _ in range(iterations):
+        staged = rm.stage_release(base_dir=base_dir, target_sha=sha, source_dir=repo_dir)
+        time.sleep(0.02)
+        rm.atomic_symlink_switch(base_dir, inst, staged)
+
+
+def _worker_prune(base_dir_str: str, iterations: int):
+    base_dir = Path(base_dir_str)
+    for _ in range(iterations):
+        rm.prune_releases(base_dir=base_dir, keep=1, grace_seconds=3600.0)
+        time.sleep(0.01)
+
+
+def test_real_multiprocessing_concurrency_safety(tmp_path: Path):
+    """Real multiprocessing: concurrent staging, deployment, and pruning never delete unactivated releases."""
+    import multiprocessing as mp
+
+    base_dir = tmp_path / "bots_root"
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True)
+    (repo_dir / "main.py").write_text("print('concurrent')\n")
+    (repo_dir / "requirements.txt").write_text("aiogram==3.1.1\n")
+    subprocess.run(["git", "add", "."], cwd=str(repo_dir), check=True)
+    subprocess.run(["git", "commit", "-m", "concurrent commit"], cwd=str(repo_dir), check=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_dir), capture_output=True, text=True, check=True).stdout.strip()
+
+    ctx = mp.get_context("spawn")
+    p1 = ctx.Process(target=_worker_stage_and_deploy, args=(str(base_dir), str(repo_dir), sha, "bot_alpha", 4))
+    p2 = ctx.Process(target=_worker_prune, args=(str(base_dir), 8))
+    p3 = ctx.Process(target=_worker_stage_and_deploy, args=(str(base_dir), str(repo_dir), sha, "bot_beta", 4))
+
+    p1.start()
+    p2.start()
+    p3.start()
+
+    p1.join(timeout=15.0)
+    p2.join(timeout=15.0)
+    p3.join(timeout=15.0)
+
+    assert p1.exitcode == 0
+    assert p2.exitcode == 0
+    assert p3.exitcode == 0
+
+    dep_a = (base_dir / "deployments" / "bot_alpha").resolve()
+    dep_b = (base_dir / "deployments" / "bot_beta").resolve()
+    assert dep_a.is_dir()
+    assert dep_b.is_dir()
+    assert (dep_a / "REVISION").read_text().strip() == sha
+
+
+# =============================================================================
+# 10. Manifest Integrity & External Archive Verification
+# =============================================================================
+
+def test_verify_release_integrity_strictly_rejects_missing_manifest(tmp_path: Path):
+    """verify_release_integrity must fail closed when MANIFEST.sha256 is missing."""
+    rel_dir = tmp_path / "release"
+    rel_dir.mkdir()
+    sha = "a" * 40
+    (rel_dir / "REVISION").write_text(f"{sha}\n")
+    (rel_dir / "requirements.txt").write_text("aiogram==3.1.1\n")
+    (rel_dir / "requirements.sha256").write_text(f"{rm.hash_requirements(rel_dir / 'requirements.txt')}\n")
+    (rel_dir / "main.py").write_text("print('test')\n")
+
+    # Missing MANIFEST.sha256
+    ok, msg = rm.verify_release_integrity(rel_dir, sha)
+    assert ok is False
+    assert "Missing mandatory MANIFEST.sha256" in msg
+
+
+def test_verify_release_integrity_strictly_rejects_empty_or_tampered_manifest(tmp_path: Path):
+    """verify_release_integrity must reject empty manifest or modified file hashes."""
+    rel_dir = tmp_path / "release"
+    rel_dir.mkdir()
+    sha = "b" * 40
+    (rel_dir / "REVISION").write_text(f"{sha}\n")
+    (rel_dir / "requirements.txt").write_text("aiogram==3.1.1\n")
+    (rel_dir / "requirements.sha256").write_text(f"{rm.hash_requirements(rel_dir / 'requirements.txt')}\n")
+    (rel_dir / "main.py").write_text("print('test')\n")
+
+    # Empty manifest
+    (rel_dir / "MANIFEST.sha256").write_text("")
+    ok, msg = rm.verify_release_integrity(rel_dir, sha)
+    assert ok is False
+    assert "empty" in msg.lower() or "no valid" in msg.lower()
+
+    # Tampered file
+    rm.write_release_manifest(rel_dir)
+    (rel_dir / "main.py").write_text("print('tampered!')\n")
+    ok, msg = rm.verify_release_integrity(rel_dir, sha)
+    assert ok is False
+    assert "tampered" in msg.lower()
+
+
+def test_external_archive_staging_verifies_pre_existing_manifest_and_rejects_arbitrary_files(tmp_path: Path):
+    """External archives must contain a pre-existing trusted MANIFEST.sha256 from Git, not regenerate one."""
+    import tarfile, io
+    base_dir = tmp_path / "bots_root"
+    sha = "c" * 40
+
+    # 1. Archive lacking MANIFEST.sha256
+    arch_bad = tmp_path / f"release_{sha}.tar.gz"
+    with tarfile.open(str(arch_bad), "w:gz") as tar:
+        rev_data = f"{sha}\n".encode("utf-8")
+        ti = tarfile.TarInfo("REVISION")
+        ti.size = len(rev_data)
+        tar.addfile(ti, io.BytesIO(rev_data))
+
+        py_data = b"print('untrusted')\n"
+        ti2 = tarfile.TarInfo("main.py")
+        ti2.size = len(py_data)
+        tar.addfile(ti2, io.BytesIO(py_data))
+
+    with pytest.raises(RuntimeError, match=r"Missing mandatory MANIFEST\.sha256"):
+        rm.stage_release(base_dir=base_dir, target_sha=sha, source_dir=tmp_path, archive_path=arch_bad)
+
+
+def test_pack_release_archive_and_stage_end_to_end(tmp_path: Path):
+    """pack_release_archive creates a verified archive with digest and manifest that stages cleanly."""
+    base_dir = tmp_path / "bots_root"
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True)
+    (repo_dir / "main.py").write_text("print('packaged')\n")
+    (repo_dir / "requirements.txt").write_text("aiogram==3.1.1\n")
+    subprocess.run(["git", "add", "."], cwd=str(repo_dir), check=True)
+    subprocess.run(["git", "commit", "-m", "pack commit"], cwd=str(repo_dir), check=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_dir), capture_output=True, text=True, check=True).stdout.strip()
+
+    archive_out = tmp_path / "artifacts" / f"release_{sha}.tar.gz"
+    arch_path, digest = rm.pack_release_archive(repo_dir, sha, archive_out)
+    assert arch_path.is_file()
+    assert len(digest) == 64
+
+    # Stage into non-git environment using explicit archive
+    non_git_src = tmp_path / "non_git_empty"
+    non_git_src.mkdir()
+    staged = rm.stage_release(base_dir=base_dir, target_sha=sha, source_dir=non_git_src, archive_path=arch_path)
+    assert staged.is_dir()
+    ok, msg = rm.verify_release_integrity(staged, sha)
+    assert ok is True
+
+
+# =============================================================================
+# 11. Elimination of Mass Process Killing in Legacy Deploy
+# =============================================================================
+
+def test_deploy_prod_script_contains_no_port_range_kill():
+    """deploy_prod.sh must NOT contain blind kill loops over ports 8080..8100."""
+    script_path = Path("deploy_prod.sh")
+    content = script_path.read_text(encoding="utf-8")
+    assert "8080..8100" not in content, "deploy_prod.sh still contains range 8080..8100"
+    assert "kill -9" not in content, "deploy_prod.sh still contains blind kill -9"
+
+
+# =============================================================================
+# 12. Fix False Clear-Port Detection (Inaccessible Owner PID)
+# =============================================================================
+
+def test_port_check_fails_closed_when_listening_socket_has_unknown_pid(tmp_path: Path, monkeypatch):
+    """If ss or netstat detects LISTEN on port but cannot determine PID, port check must fail closed."""
+    port = 8199
+    base_dir = tmp_path / "bots_root"
+
+    # Simulate ss returning LISTEN line without pid= (as happens for unprivileged users)
+    ss_output = f"LISTEN  0  128  0.0.0.0:{port}  0.0.0.0:*\n"
+    def mock_subprocess_run(cmd, *args, **kwargs):
+        if cmd[0] == "lsof":
+            raise FileNotFoundError("lsof not found")
+        if cmd[0] == "ss":
+            return subprocess.CompletedProcess(cmd, 0, stdout=ss_output, stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+
+    ok, pids, tool = rm.get_listening_pids(port)
+    assert ok is False
+    assert "listening_socket_with_inaccessible_pid" in tool
+
+    ok, msg, killed = rm.check_and_resolve_port_conflict(
+        port=port,
+        instance_name="tg_bot_test",
+        base_dir=base_dir,
+        pm2_snapshot={"tg_bot_test": {"name": "tg_bot_test", "pm_id": 0, "pid": 111}},
+        registry={"instances": [{"pm2_name": "tg_bot_test"}]},
+    )
+    assert ok is False
+    assert "port_clear" not in msg
+    assert "failed closed" in msg.lower() or "aborted" in msg.lower()
+
+
+def test_port_check_fails_closed_when_tcp_port_actively_accepts_connections(tmp_path: Path, monkeypatch):
+    """When a real socket accepts TCP connections, port check must fail closed even if tool reported no PIDs."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 0))
+    s.listen(1)
+    port = s.getsockname()[1]
+
+    try:
+        base_dir = tmp_path / "bots_root"
+        # Mock inspection tool returning success=True, pids=[]
+        monkeypatch.setattr(rm, "get_listening_pids", lambda p: (True, [], "mock_blind_tool"))
+
+        ok, msg, killed = rm.check_and_resolve_port_conflict(
+            port=port,
+            instance_name="tg_bot_test",
+            base_dir=base_dir,
+            pm2_snapshot={"tg_bot_test": {"name": "tg_bot_test", "pm_id": 0, "pid": 111}},
+            registry={"instances": [{"pm2_name": "tg_bot_test"}]},
+        )
+        assert ok is False
+        assert "accepting TCP connections" in msg
+    finally:
+        s.close()

@@ -11,6 +11,9 @@ This guide describes how to operate the versioned, isolated release management s
 ├── releases/
 │   ├── .staging.lock           # Concurrency staging lock (flock)
 │   ├── .prune.lock             # Concurrency release pruning lock (flock)
+│   ├── .pins/                  # Staged release pins (protects unactivated releases from pruning)
+│   │   ├── <commit_sha_40>.json
+│   │   └── ...
 │   └── <commit_sha_40>/        # Immutable release tree
 │       ├── REVISION            # 40-character commit SHA
 │       ├── requirements.txt
@@ -151,6 +154,8 @@ Instead:
 
 Before reloading an instance, the release manager inspects the configured port:
 - **Fail-Closed Inspection Tools**: Checks strictly TCP LISTEN sockets using `lsof -sTCP:LISTEN`, `ss -ltnp`, or `netstat -ltnp`. If all socket inspection tools are missing, the system fails closed with `RuntimeError`.
+- **Inaccessible Owner PID Protection**: If `lsof`, `ss`, or `netstat` detects an active listening socket on the port but owner PID information is inaccessible (e.g. unprivileged user permissions, container namespace boundary, or missing `pid=` in output), the release manager strictly **FAILS CLOSED**, aborting deployment to prevent binding conflicts or downtime.
+- **Active TCP Socket Probe**: Performs an active TCP connect probe (`socket.create_connection`) as a defense-in-depth verification. If the port accepts connections while process tools report no PIDs, the release manager fails closed.
 - If a process is listening on the port, the release manager checks whether the PID is managed by PM2.
 - If not managed by PM2, it checks **authoritative process ownership**:
   - Checks `/proc/<pid>/cmdline` (or `ps -p <pid> -o command=`).
@@ -191,10 +196,13 @@ When switching from legacy to isolated mode, the release manager performs a fres
 
 ## 9. Pruning Old Inactive Releases (`prune`)
 
-Prunes unreferenced releases while protecting:
+Prunes unreferenced releases while strictly protecting:
 - All releases currently pointed to by any `deployments/<instance>` symlink.
 - All releases referenced as `previous_successful_release_sha` across all `deployments/.state/*.json` files.
+- All newly staged releases actively pinned in `releases/.pins/<sha>.json` awaiting activation.
+- Any release directory created or modified within the grace period (`--grace-seconds`, default 3600s / 1 hour).
 - Even if an operator runs `stage_release --force` or `prune --keep 0`, protected releases cannot be deleted.
+- **Lock Scope**: Pruning is executed under both `lock_staging` and `lock_pruning` (flock) for the entire duration of scanning and deletion, preventing any race condition with concurrent staging or deployment operations.
 
 ```bash
 # Dry run to see what would be pruned
@@ -202,7 +210,38 @@ python3 scripts/release_manager.py prune --keep 5 --dry-run
 
 # Prune keeping latest 5 releases plus all protected releases
 python3 scripts/release_manager.py prune --keep 5
+
+# Prune with custom grace period (e.g. 1800 seconds)
+python3 scripts/release_manager.py prune --keep 3 --grace-seconds 1800
 ```
+
+---
+
+## 10. Packaging & External Archive Artifacts (`pack`)
+
+When deploying to environments without a full Git repository:
+
+1. **Build Verified Archive on Build/CI Runner**:
+   ```bash
+   python3 scripts/release_manager.py pack \
+       --source-dir /path/to/repo \
+       --target-sha <commit_sha> \
+       --output artifacts/release_<sha>.tar.gz
+   ```
+   - Extracts the clean Git commit tree via `git archive`.
+   - Embeds authoritative `REVISION`, `requirements.sha256`, compiled python bytecode, and `MANIFEST.sha256`.
+   - Generates an accompanying SHA256 digest file `release_<sha>.tar.gz.sha256`.
+
+2. **Stage from Archive on Target Server**:
+   ```bash
+   python3 scripts/release_manager.py stage \
+       --target-sha <commit_sha> \
+       --source-dir /root/telegram_bots/newbots \
+       --archive-path artifacts/release_<sha>.tar.gz
+   ```
+   - Staging from an external archive verifies archive digest against `<archive>.sha256`.
+   - Strictly requires that `MANIFEST.sha256` and `REVISION` are already embedded in the archive from the source Git commit.
+   - Refuses to overwrite or generate a new manifest from untrusted extracted files, guaranteeing cryptographic integrity.
 
 ---
 
