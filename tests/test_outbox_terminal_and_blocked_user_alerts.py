@@ -359,6 +359,7 @@ class OutboxTerminalAndBlockedUserAlertsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.max_attempts, 7)
             payload_dict = json.loads(row.event_payload_json)
             self.assertTrue(payload_dict.get("terminal_alert_sent"))
+            self.assertEqual(payload_dict.get("terminal_alert_status"), "sent")
 
         # Verify real Telegram SendMessage method was dispatched strictly to Autobus
         self.assertGreater(len(self.recording_session.requests), 0)
@@ -595,3 +596,232 @@ class OutboxTerminalAndBlockedUserAlertsTests(unittest.IsolatedAsyncioTestCase):
                 is_bot_blocked_reason(b),
                 f"Blocked reason MUST be detected: {b}",
             )
+
+    # -------------------------------------------------------------------------
+    # 10. Outbox 7/7 -> Autobus down -> flag NOT set -> worker runs when up
+    #     -> alert delivered -> flag set -> NO re-delivery to recipient user!
+    # -------------------------------------------------------------------------
+    async def test_10_terminal_alert_retried_when_autobus_initially_unavailable(self):
+        """
+        10. Разделение состояний «запланировано» и «доставлено»:
+            - На 7/7 попытке Autobus недоступен -> флаг terminal_alert_sent НЕ выставляется в True.
+            - terminal_alert_status сохраняется как 'pending'.
+            - Worker при восстановлении Autobus доставляет служебное уведомление.
+            - Пользователю сообщение повторно НЕ отправляется!
+            - Повторный запуск worker не создает дублей.
+        """
+        user_id = 111010
+        key = f"scheduler:notification:{user_id}:retry_autobus_down_10"
+        now = datetime.utcnow()
+
+        async with async_session_maker() as session:
+            row = await enqueue_outbox_event(
+                session,
+                key,
+                "scheduler",
+                user_id,
+                "subscription_reminder",
+                {"text": "Autobus outage test message"},
+            )
+            row.attempts = 6  # 7th attempt will reach terminal failure
+            row.next_retry_at = now - timedelta(seconds=5)
+            await session.commit()
+
+        user_deliver_mock = AsyncMock(
+            return_value=NotificationDeliveryResult(
+                delivered=False,
+                retryable=True,
+                reason="upstream_503_unavailable",
+            )
+        )
+
+        mock_bot = self._make_bot()
+
+        # Step 1: Attempt 7 occurs while Autobus / admin notification route is DOWN
+        with patch.dict(os.environ, {
+            "BOT_INSTANCE_ID": "tg_someonelikeyouai04_bot_legacy",
+            "PM2_APP_NAME": "tg_someonelikeyouai04_bot_legacy",
+            "TELEGRAM_AUTOBUSBUSBOT_TOKEN": self.autobus_token,
+            "AUTOBUS_TELEGRAM_BOT_TOKEN": self.autobus_token,
+        }), patch("telegram_client.create_telegram_bot", lambda token: self._make_bot(token)), \
+           patch("notification_routing.send_admin_notification", AsyncMock(return_value=False)):
+            res = await dispatch_outbox_by_key(mock_bot, key, deliver_func=user_deliver_mock)
+            self.assertFalse(res)
+
+        # Confirm user delivery mock was called exactly once for attempt 7
+        self.assertEqual(user_deliver_mock.call_count, 1)
+
+        # Inspect DB: must be failed_terminal, but terminal_alert_sent MUST NOT be True
+        async with async_session_maker() as session:
+            from sqlalchemy import select
+            row = await session.scalar(
+                select(PaymentNotificationOutbox).where(PaymentNotificationOutbox.unique_key == key)
+            )
+            self.assertEqual(row.status, "failed_terminal")
+            self.assertEqual(row.attempts, 7)
+            self.assertEqual(row.max_attempts, 7)
+            payload_dict = json.loads(row.event_payload_json)
+            # CRITICAL REQUIREMENT: Not considered sent because autobus failed!
+            self.assertFalse(payload_dict.get("terminal_alert_sent", False))
+            self.assertEqual(payload_dict.get("terminal_alert_status"), "pending")
+
+            # Reset next_retry_at into the past so worker will process the retry immediately
+            row.next_retry_at = datetime.utcnow() - timedelta(seconds=1)
+            await session.commit()
+
+        # Confirm 0 admin alerts were dispatched through recording session so far
+        self.assertEqual(len(self.recording_session.requests), 0)
+
+        # Reset user mock to prove worker NEVER calls user delivery func
+        user_deliver_mock.reset_mock()
+
+        # Step 2: Autobus is now UP and worker runs
+        with patch.dict(os.environ, {
+            "BOT_INSTANCE_ID": "tg_someonelikeyouai04_bot_legacy",
+            "PM2_APP_NAME": "tg_someonelikeyouai04_bot_legacy",
+            "TELEGRAM_AUTOBUSBUSBOT_TOKEN": self.autobus_token,
+            "AUTOBUS_TELEGRAM_BOT_TOKEN": self.autobus_token,
+        }), patch("telegram_client.create_telegram_bot", lambda token: self._make_bot(token)):
+            delivered_cnt = await process_payment_notification_outbox(mock_bot, deliver_func=user_deliver_mock)
+            self.assertEqual(delivered_cnt, 0)
+
+        # CRITICAL REQUIREMENT: User delivery function was NEVER called!
+        user_deliver_mock.assert_not_called()
+
+        # CRITICAL REQUIREMENT: Exactly 1 alert broadcast was now delivered via Autobus (to its 3 registered admins)
+        self.assertEqual(len(self.recording_session.requests), 3)
+        for token, bot_id, method in self.recording_session.requests:
+            self.assertEqual(bot_id, 8346799080)  # Autobus platform_id
+            self.assertIn("Outbox Terminal Failure", method.text)
+            self.assertIn("7/7", method.text)
+
+        # Inspect DB: NOW terminal_alert_sent MUST be True and terminal_alert_status == 'sent'
+        async with async_session_maker() as session:
+            row = await session.scalar(
+                select(PaymentNotificationOutbox).where(PaymentNotificationOutbox.unique_key == key)
+            )
+            payload_dict = json.loads(row.event_payload_json)
+            self.assertTrue(payload_dict.get("terminal_alert_sent"))
+            self.assertEqual(payload_dict.get("terminal_alert_status"), "sent")
+            self.assertIsNotNone(payload_dict.get("terminal_alert_delivered_at"))
+
+        # Step 3: Run worker again to ensure idempotency and no duplicate alerts
+        with patch.dict(os.environ, {
+            "BOT_INSTANCE_ID": "tg_someonelikeyouai04_bot_legacy",
+            "PM2_APP_NAME": "tg_someonelikeyouai04_bot_legacy",
+            "TELEGRAM_AUTOBUSBUSBOT_TOKEN": self.autobus_token,
+            "AUTOBUS_TELEGRAM_BOT_TOKEN": self.autobus_token,
+        }), patch("telegram_client.create_telegram_bot", lambda token: self._make_bot(token)):
+            await process_payment_notification_outbox(mock_bot, deliver_func=user_deliver_mock)
+
+        user_deliver_mock.assert_not_called()
+        self.assertEqual(len(self.recording_session.requests), 3)
+
+    # -------------------------------------------------------------------------
+    # 11. Concurrent workers atomic CAS prevents duplicate terminal failure alerts
+    # -------------------------------------------------------------------------
+    async def test_11_concurrent_workers_atomic_cas_prevents_duplicate_terminal_alerts(self):
+        """
+        11. Конкурентные worker'ы при повторной отправке terminal alert:
+            CAS на базе claim_token исключает параллельные дубли.
+            Ровно одно оповещение отправляется в Autobus.
+        """
+        user_id = 111011
+        key = f"scheduler:notification:{user_id}:concurrency_alert_11"
+        now = datetime.utcnow()
+
+        async with async_session_maker() as session:
+            row = await enqueue_outbox_event(
+                session,
+                key,
+                "scheduler",
+                user_id,
+                "subscription_reminder",
+                {"text": "Concurrent alert test"},
+            )
+            row.status = "failed_terminal"
+            row.attempts = 7
+            row.max_attempts = 7
+            row.last_error = "network_504_gateway_timeout"
+            row.next_retry_at = now - timedelta(seconds=1)
+            row.event_payload_json = json.dumps({
+                "text": "Concurrent alert test",
+                "terminal_alert_status": "pending",
+                "terminal_alert_sent": False,
+            })
+            await session.commit()
+
+        mock_bot = self._make_bot()
+        user_mock = AsyncMock()
+
+        with patch.dict(os.environ, {
+            "BOT_INSTANCE_ID": "tg_someonelikeyouai04_bot_legacy",
+            "PM2_APP_NAME": "tg_someonelikeyouai04_bot_legacy",
+            "TELEGRAM_AUTOBUSBUSBOT_TOKEN": self.autobus_token,
+            "AUTOBUS_TELEGRAM_BOT_TOKEN": self.autobus_token,
+        }), patch("telegram_client.create_telegram_bot", lambda token: self._make_bot(token)):
+            # Run two workers concurrently
+            res1, res2 = await asyncio.gather(
+                process_payment_notification_outbox(mock_bot, deliver_func=user_mock),
+                process_payment_notification_outbox(mock_bot, deliver_func=user_mock),
+            )
+
+        user_mock.assert_not_called()
+        # Exactly 1 alert broadcast (to Autobus's 3 admins) captured, confirming atomic CAS prevented duplication
+        self.assertEqual(len(self.recording_session.requests), 3)
+
+        async with async_session_maker() as session:
+            from sqlalchemy import select
+            row = await session.scalar(
+                select(PaymentNotificationOutbox).where(PaymentNotificationOutbox.unique_key == key)
+            )
+            payload_dict = json.loads(row.event_payload_json)
+            self.assertTrue(payload_dict.get("terminal_alert_sent"))
+            self.assertEqual(payload_dict.get("terminal_alert_status"), "sent")
+
+    # -------------------------------------------------------------------------
+    # 12. User blocked bot is NEVER alerted even on background worker scans
+    # -------------------------------------------------------------------------
+    async def test_12_user_blocked_bot_never_alerted_on_worker_scan(self):
+        """
+        12. Если пользователь заблокировал бота, даже при запуске периодического
+            worker'а по записям failed_terminal уведомление никогда не отправляется.
+        """
+        user_id = 111012
+        key = f"scheduler:notification:{user_id}:blocked_worker_scan_12"
+        now = datetime.utcnow()
+
+        async with async_session_maker() as session:
+            row = await enqueue_outbox_event(
+                session,
+                key,
+                "scheduler",
+                user_id,
+                "subscription_reminder",
+                {"text": "Blocked worker scan test"},
+            )
+            row.status = "failed_terminal"
+            row.attempts = 7
+            row.max_attempts = 7
+            row.last_error = "telegram_bot_blocked"
+            row.next_retry_at = now - timedelta(seconds=1)
+            row.event_payload_json = json.dumps({
+                "text": "Blocked worker scan test",
+                "terminal_alert_status": "suppressed_blocked",
+                "terminal_alert_sent": False,
+            })
+            await session.commit()
+
+        mock_bot = self._make_bot()
+        user_mock = AsyncMock()
+
+        with patch.dict(os.environ, {
+            "BOT_INSTANCE_ID": "tg_someonelikeyouai04_bot_legacy",
+            "PM2_APP_NAME": "tg_someonelikeyouai04_bot_legacy",
+            "TELEGRAM_AUTOBUSBUSBOT_TOKEN": self.autobus_token,
+            "AUTOBUS_TELEGRAM_BOT_TOKEN": self.autobus_token,
+        }), patch("telegram_client.create_telegram_bot", lambda token: self._make_bot(token)):
+            await process_payment_notification_outbox(mock_bot, deliver_func=user_mock)
+
+        user_mock.assert_not_called()
+        self.assertEqual(len(self.recording_session.requests), 0)
