@@ -86,6 +86,17 @@ def safe_exists(path: Path | str | None) -> bool:
         return False
 
 
+def safe_is_symlink(path: Path | str | None) -> bool:
+    """Check if path is a symlink without raising PermissionError on restricted parents."""
+    if path is None:
+        return False
+    try:
+        p = Path(path)
+        return p.is_symlink()
+    except (OSError, PermissionError, ValueError):
+        return False
+
+
 def load_registry(path: Path | str = DEFAULT_REGISTRY_PATH) -> dict[str, Any]:
     """Load and validate the bot instance registry."""
     path = Path(path)
@@ -749,18 +760,18 @@ def verify_process_ownership(
 
     # Check Linux /proc/<pid>
     proc_dir = Path(f"/proc/{pid}")
-    if proc_dir.is_dir():
+    if safe_is_dir(proc_dir):
         try:
             cmdline = (proc_dir / "cmdline").read_bytes().decode("utf-8", errors="replace")
-        except OSError:
+        except (OSError, PermissionError):
             pass
         try:
             cwd_str = str((proc_dir / "cwd").resolve())
-        except OSError:
+        except (OSError, PermissionError):
             pass
         try:
             environ_str = (proc_dir / "environ").read_bytes().decode("utf-8", errors="replace")
-        except OSError:
+        except (OSError, PermissionError):
             pass
     else:
         # macOS / BSD fallback via ps and lsof
@@ -1024,12 +1035,12 @@ def inspect_runtime_process(
     # Linux /proc/<pid>/cwd inspection
     if pid and isinstance(pid, int):
         proc_cwd_path = Path(f"/proc/{pid}/cwd")
-        if proc_cwd_path.exists():
+        if safe_is_symlink(proc_cwd_path):
             try:
-                proc_cwd_link = proc_cwd_path.resolve()
+                proc_cwd_link = proc_cwd_path.resolve(strict=True)
                 resolved_root = proc_cwd_link
-            except OSError:
-                pass
+            except (OSError, PermissionError, ValueError):
+                proc_cwd_link = None
 
     # Fallback to pm_cwd / pm_exec_path resolution
     if not resolved_root:
@@ -1475,8 +1486,8 @@ def rollback_instance(
                 resolved_target_sha = prev_sha
             else:
                 prev_target = state.get("previous_successful_target_dir")
-                if prev_target == "legacy" or (not deployment_link.exists() and not state.get("current_release_sha")):
-                    if deployment_link.is_symlink():
+                if prev_target == "legacy" or (not safe_exists(deployment_link) and not state.get("current_release_sha")):
+                    if safe_is_symlink(deployment_link):
                         deployment_link.unlink()
                     reload_ok, reload_msg = reload_pm2_instance(instance_name, pm2_config, effective_runtime_env, restart=True)
                     if not reload_ok:
