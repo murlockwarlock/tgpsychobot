@@ -532,34 +532,41 @@ async def check_kie_credit_balance(bot: Bot):
 
             if remaining_credits < threshold:
                 if not config.kie_credit_alert_sent:
-                    config.kie_credit_alert_sent = True
-                    await session.commit()
                     admin_ids = await get_all_admin_ids()
                     text = (
                         f"⚠️ <b>Предупреждение KIE</b>\n\n"
                         f"Баланс KIE снизился до <code>{remaining_credits:.2f}</code> кредитов "
                         f"(порог предупреждения: <code>{threshold:.2f}</code>)."
                     )
+                    any_delivered = False
                     for admin_id in admin_ids:
                         try:
                             await bot.send_message(admin_id, text, parse_mode="HTML")
+                            any_delivered = True
                         except Exception as send_err:
                             log.warning("Failed to send KIE soft warning to %s: %s", admin_id, send_err)
+                    if any_delivered:
+                        config.kie_credit_alert_sent = True
+                        config.kie_credit_last_alert_at = datetime.utcnow()
+                        await session.commit()
             else:
                 if config.kie_credit_alert_sent:
-                    config.kie_credit_alert_sent = False
-                    await session.commit()
                     admin_ids = await get_all_admin_ids()
                     text = (
                         f"✅ <b>Баланс KIE пополнен</b>\n\n"
                         f"Текущий остаток: <code>{remaining_credits:.2f}</code> кредитов "
                         f"(порог: <code>{threshold:.2f}</code>)."
                     )
+                    any_delivered = False
                     for admin_id in admin_ids:
                         try:
                             await bot.send_message(admin_id, text, parse_mode="HTML")
+                            any_delivered = True
                         except Exception as send_err:
                             log.warning("Failed to send KIE replenishment notice to %s: %s", admin_id, send_err)
+                    if any_delivered:
+                        config.kie_credit_alert_sent = False
+                        await session.commit()
     except AIServiceError as exc:
         log.warning("KIE credit balance check failed: %s", exc)
     except Exception as exc:

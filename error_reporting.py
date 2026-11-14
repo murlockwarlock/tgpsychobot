@@ -480,13 +480,14 @@ async def notify_admins_about_error(
     provider_attempts: Sequence[dict[str, str | None]] | None = None,
     exception: Exception | None = None,
     classification_override: str | None = None,
+    classification: str | None = None,
     include_traceback: bool = True,
     logger: logging.Logger | None = None,
     level: int = logging.ERROR,
 ) -> None:
     log = logger or logging.getLogger(__name__)
     root_exception = root_cause_exception(exception)
-    classification = classification_override
+    classification = classification_override or classification
     classification_description = None
     root_summary = None
     outcome = getattr(exception, "ai_outcome", None) if exception is not None else None
@@ -552,7 +553,15 @@ async def notify_admins_about_error(
     )
 
     if is_handled_ai:
-        log.warning(" | ".join(log_lines))
+        ai_notice_lines = [
+            f"Handled AI notice: {title}",
+            f"stage={stage}",
+        ]
+        if provider:
+            ai_notice_lines.append(f"provider={provider}")
+        if classification:
+            ai_notice_lines.append(f"failure_type={classification}")
+        log.warning(" | ".join(ai_notice_lines))
     elif exception is not None and include_traceback:
         log.log(level, " | ".join(log_lines), exc_info=exception)
     else:
@@ -616,17 +625,18 @@ async def notify_admins_about_error(
     if classification in OPERATOR_CLASSES or (
         root_exception is not None and type(root_exception).__name__ == "InsufficientBalanceError"
     ):
-        from ai_incident_manager import record_ai_provider_failure
-        try:
-            await record_ai_provider_failure(
-                origin_instance_id=None,
-                provider=provider or "unknown",
-                error=exception or root_exception or Exception(details or title),
-                operation=stage or "chat",
-                model=model,
-            )
-        except Exception as rec_exc:
-            log.warning("Could not record AI provider failure in incident manager: %s", rec_exc)
+        if stage not in ("ai_provider_fallback", "check_credit_balance"):
+            from ai_incident_manager import record_ai_provider_failure
+            try:
+                await record_ai_provider_failure(
+                    origin_instance_id=None,
+                    provider=provider or "unknown",
+                    error=exception or root_exception or Exception(details or title),
+                    operation=stage or "chat",
+                    model=model,
+                )
+            except Exception as rec_exc:
+                log.warning("Could not record AI provider failure in incident manager: %s", rec_exc)
         return
 
     admin_text = "\n".join(message_lines)

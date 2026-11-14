@@ -945,6 +945,26 @@ def is_bot_blocked_or_suspended_log(text: str) -> bool:
     return False
 
 
+def is_handled_ai_log(line: str) -> bool:
+    """True if line is a handled AI provider notice, warning, or fallback event."""
+    lowered = line.lower()
+    if "handled ai notice:" in lowered:
+        return True
+    if "[ai incident]" in lowered or "[ai incident worker]" in lowered:
+        return True
+    if "stage=ai_provider_fallback" in lowered:
+        return True
+    if "kie credit balance check" in lowered:
+        return True
+    if "transcription failed, falling back" in lowered:
+        return True
+    if "failed to record ai fallback success" in lowered:
+        return True
+    if "fallback provider" in lowered and "also failed" not in lowered:
+        return True
+    return False
+
+
 def extract_log_error_summaries(chunk: str) -> list[str]:
     lines = chunk.splitlines()
     summaries: list[str] = []
@@ -999,7 +1019,7 @@ def extract_log_error_summaries(chunk: str) -> list[str]:
             continue
 
         if LOG_ERROR_RE.search(line):
-            if not is_bot_blocked_or_suspended_log(line):
+            if not is_bot_blocked_or_suspended_log(line) and not is_handled_ai_log(line):
                 summaries.append(line)
         i += 1
 
@@ -1035,7 +1055,7 @@ def read_new_log_errors(app: dict, state: dict, include_existing: bool) -> list[
     if not matches:
         return []
 
-    matches = [line for line in matches if not is_bot_blocked_or_suspended_log(line)]
+    matches = [line for line in matches if not is_bot_blocked_or_suspended_log(line) and not is_handled_ai_log(line)]
     if not matches:
         return []
 

@@ -9,6 +9,8 @@ Enforces the canonical lifecycle for AI provider incidents across Psychobot inst
 - Granular operational recovery matching exact provider, key fingerprint, operation, and model scope.
 - Key rotation supersedes old incidents without generating false recovery alerts.
 - Safe static templating with zero secrets, user prompts, or raw tracebacks in notification text.
+- Safe typed error reasons (no raw exception strings or payload leaks in DB).
+- Absolute fail-safety: incident manager exceptions never break operational AI calls.
 """
 
 from __future__ import annotations
@@ -22,7 +24,13 @@ from datetime import datetime, timedelta
 from typing import Any, Sequence
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramUnauthorizedError,
+)
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,10 +43,13 @@ from database import (
 from notification_outbox import BACKOFF_DELAYS
 from notification_routing import (
     detect_current_instance,
+    extract_telegram_bot_id,
+    get_instance_by_id,
     get_instance_by_pm2_name,
     is_valid_telegram_user_id,
     resolve_companion_telegram_instance,
     resolve_target_admin_ids,
+    resolve_target_bot_token,
 )
 from notification_transport import is_bot_blocked_reason
 from provider_failures import ProviderFailure, normalize_exception
@@ -110,6 +121,21 @@ def _format_incident_message_text(
     code_esc = html.escape(str(detail_code))
     time_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    if incident_type == "low_credit_warning":
+        if event_type == "resolved":
+            return (
+                f"✅ <b>Баланс KIE пополнен</b>\n\n"
+                f"Провайдер: <code>{p_esc}</code>\n"
+                f"Время: <code>{time_str}</code>\n"
+                f"Статус: Баланс превысил порог предупреждения."
+            )
+        return (
+            f"⚠️ <b>Предупреждение KIE: низкий баланс</b>\n\n"
+            f"Провайдер: <code>{p_esc}</code>\n"
+            f"Код: <code>{code_esc}</code>\n"
+            f"Время: <code>{time_str}</code>"
+        )
+
     if event_type == "resolved":
         return (
             f"✅ <b>AI-провайдер восстановил работу</b>\n\n"
@@ -138,7 +164,11 @@ def _format_incident_message_text(
         else "На основе ответа провайдера"
     )
 
-    prefix = "🚨 <b>Сбой AI-провайдера</b>" if event_type == "opened" else "⏰ <b>Напоминание: Сбой AI-провайдера сохраняется</b>"
+    prefix = (
+        "🚨 <b>Сбой AI-провайдера</b>"
+        if event_type == "opened"
+        else "⏰ <b>Напоминание: Сбой AI-провайдера сохраняется</b>"
+    )
     return (
         f"{prefix}\n\n"
         f"Провайдер: <code>{p_esc}</code>\n"
@@ -147,8 +177,8 @@ def _format_incident_message_text(
         f"Тип сбоя: <code>{html.escape(incident_type)}</code>\n"
         f"Код: <code>{code_esc}</code>\n"
         f"Уровень: {tier_label}\n"
-        f"Время: <code>{time_str}</code>\n"
-        f"Требуется вмешательство оператора для восстановления канала."
+        f"Время: <code>{time_str}</code>\n\n"
+        f"Требуется вмешательство оператора."
     )
 
 
@@ -164,7 +194,40 @@ async def record_ai_provider_failure(
     credential_scope: str | None = None,
     session_maker: Any = None,
 ) -> AIProviderIncidentModel | None:
-    """Record an AI provider failure, opening or updating an active incident and enqueuing outbox events."""
+    """
+    Record an AI provider failure, opening or updating an active incident and enqueuing outbox events.
+    Fail-safe: catches all internal exceptions and logs warning, never raising to caller.
+    """
+    try:
+        return await _record_ai_provider_failure_impl(
+            origin_instance_id=origin_instance_id,
+            provider=provider,
+            error=error,
+            operation=operation,
+            model=model,
+            fallback_provider=fallback_provider,
+            fallback_model=fallback_model,
+            fallback_succeeded=fallback_succeeded,
+            credential_scope=credential_scope,
+            session_maker=session_maker,
+        )
+    except Exception as exc:
+        logger.warning("[AI Incident] Unexpected error recording failure for %s: %s", provider, exc)
+        return None
+
+
+async def _record_ai_provider_failure_impl(
+    origin_instance_id: str | None,
+    provider: str,
+    error: Exception,
+    operation: str,
+    model: str | None = None,
+    fallback_provider: str | None = None,
+    fallback_model: str | None = None,
+    fallback_succeeded: bool = False,
+    credential_scope: str | None = None,
+    session_maker: Any = None,
+) -> AIProviderIncidentModel | None:
     current_inst = detect_current_instance()
     if not origin_instance_id:
         if not current_inst:
@@ -177,23 +240,57 @@ async def record_ai_provider_failure(
         logger.critical("[AI Incident] Fail-closed: origin_instance_id %r not in registry.", origin_instance_id)
         return None
 
+    # Verify origin bot token consistency
+    source_platform = source_def.get("platform")
+    if source_platform == "telegram":
+        env_token = os.environ.get("BOT_TOKEN")
+        expected_pid = source_def.get("platform_id")
+        if env_token and expected_pid:
+            token_pid = extract_telegram_bot_id(env_token)
+            if token_pid != expected_pid:
+                logger.critical(
+                    "[AI Incident] Fail-closed: BOT_TOKEN mismatch (token ID %s != expected %s).",
+                    token_pid,
+                    expected_pid,
+                )
+                return None
+
     companion_def = resolve_companion_telegram_instance(source_def)
     if not companion_def:
         logger.error("[AI Incident] No companion Telegram instance found for %s. Dropping incident.", origin_instance_id)
         return None
 
+    if source_platform == "max":
+        comp_env_token = os.environ.get("COMPANION_TELEGRAM_BOT_TOKEN")
+        comp_pid = companion_def.get("platform_id")
+        if comp_env_token and comp_pid:
+            token_pid = extract_telegram_bot_id(comp_env_token)
+            if token_pid != comp_pid:
+                logger.critical(
+                    "[AI Incident] Fail-closed: COMPANION_TELEGRAM_BOT_TOKEN mismatch (%s != %s).",
+                    token_pid,
+                    comp_pid,
+                )
+                return None
+
     companion_instance_id = companion_def["pm2_name"]
-    authorized_instance_id = companion_instance_id  # Delivery worker belongs strictly to the companion Telegram bot
+    authorized_instance_id = companion_instance_id  # Delivery worker belongs strictly to companion Telegram bot
 
     # Normalize error to canonical ProviderFailure
     existing_failure = getattr(error, "failure", None)
-    failure = existing_failure if isinstance(existing_failure, ProviderFailure) else normalize_exception(error, provider=provider, operation=operation)
+    failure = (
+        existing_failure
+        if isinstance(existing_failure, ProviderFailure)
+        else normalize_exception(error, provider=provider, operation=operation)
+    )
 
     # Transient or non-operator failures do NOT create long-lived operator incidents
     if not failure.operator_action_required:
         logger.info(
             "[AI Incident] Non-operator failure for %s (%s, %s): not creating operator incident.",
-            provider, operation, failure.classification,
+            provider,
+            operation,
+            failure.classification,
         )
         return None
 
@@ -234,7 +331,6 @@ async def record_ai_provider_failure(
 
         incident: AIProviderIncidentModel
         is_new = False
-
         if existing:
             incident = existing
             await session.execute(
@@ -244,7 +340,6 @@ async def record_ai_provider_failure(
                     occurrence_count=AIProviderIncidentModel.occurrence_count + 1,
                     last_seen_at=now,
                     detail_code=det_code,
-                    evidence_tier=evidence_tier,
                 )
             )
         else:
@@ -256,10 +351,8 @@ async def record_ai_provider_failure(
                 operation=op_norm,
                 model_scope=mod_norm,
                 incident_type=inc_type,
-                evidence_tier=evidence_tier,
                 detail_code=det_code,
-                http_status=failure.http_status,
-                classification_source=failure.classification_source,
+                evidence_tier=evidence_tier,
                 status="active",
                 occurrence_count=1,
                 reminder_cycle=0,
@@ -339,7 +432,32 @@ async def record_ai_operation_success(
     model: str | None = None,
     session_maker: Any = None,
 ) -> bool:
-    """Record an operational success, resolving any active matching incident strictly within this scope."""
+    """
+    Record an operational success, resolving any active matching incident strictly within this scope.
+    Fail-safe: catches all internal exceptions and logs warning, never raising to caller.
+    """
+    try:
+        return await _record_ai_operation_success_impl(
+            origin_instance_id=origin_instance_id,
+            provider=provider,
+            credential_scope=credential_scope,
+            operation=operation,
+            model=model,
+            session_maker=session_maker,
+        )
+    except Exception as exc:
+        logger.warning("[AI Incident] Unexpected error recording operation success for %s: %s", provider, exc)
+        return False
+
+
+async def _record_ai_operation_success_impl(
+    origin_instance_id: str | None,
+    provider: str,
+    credential_scope: str,
+    operation: str,
+    model: str | None = None,
+    session_maker: Any = None,
+) -> bool:
     current_inst = detect_current_instance()
     if not origin_instance_id:
         if not current_inst:
@@ -371,19 +489,26 @@ async def record_ai_operation_success(
             ),
             AIProviderIncidentModel.status == "active",
         )
-        matching_incidents = (await session.execute(stmt)).scalars().all()
+        active_incidents = (await session.execute(stmt)).scalars().all()
+        if not active_incidents:
+            return False
 
-        for inc in matching_incidents:
-            resolved_any = True
+        admin_ids = (
+            await resolve_target_admin_ids(companion_def, current_instance=source_def, session=session)
+            if companion_def
+            else ()
+        )
+
+        for inc in active_incidents:
             inc.status = "resolved"
             inc.resolved_at = now
+            resolved_any = True
 
-            # 1. Cancel in-flight and pending reminder/opened notifications for this incident
+            # Cancel any pending/processing 'opened', 'repeat_reminder' or 'fallback_used' notifications
             await session.execute(
                 update(AIIncidentNotificationModel)
                 .where(
                     AIIncidentNotificationModel.incident_id == inc.id,
-                    AIIncidentNotificationModel.event_type.in_(["opened", "repeat_reminder", "fallback_used"]),
                     AIIncidentNotificationModel.status.in_(["pending", "processing"]),
                 )
                 .values(
@@ -393,15 +518,14 @@ async def record_ai_operation_success(
                 )
             )
 
-            # 2. Enqueue 'resolved' notification event
-            if companion_def:
-                admin_ids = await resolve_target_admin_ids(companion_def, current_instance=source_def, session=session)
+            # Enqueue single recovery notification per admin
+            if admin_ids:
                 msg_text = _format_incident_message_text(
-                    provider=inc.provider,
-                    operation=inc.operation,
+                    provider=prov_norm,
+                    operation=op_norm,
                     model_scope=inc.model_scope,
                     incident_type=inc.incident_type,
-                    detail_code=inc.detail_code,
+                    detail_code=inc.detail_code or "recovered",
                     evidence_tier=inc.evidence_tier,
                     event_type="resolved",
                 )
@@ -427,8 +551,17 @@ async def record_ai_operation_success(
                     except IntegrityError:
                         pass
 
-        if resolved_any:
-            await session.commit()
+        await session.commit()
+
+    if resolved_any:
+        logger.info(
+            "[AI Incident] Operational recovery confirmed for %s (%s, %s, %s). Resolved %d active incidents.",
+            prov_norm,
+            credential_scope,
+            op_norm,
+            mod_norm,
+            len(active_incidents),
+        )
 
     return resolved_any
 
@@ -436,17 +569,34 @@ async def record_ai_operation_success(
 async def handle_key_rotation(
     origin_instance_id: str | None,
     provider: str,
-    new_key: str | None,
+    new_key: str,
     base_url: str | None = None,
     session_maker: Any = None,
 ) -> int:
-    """Supersede active incidents when an API key is rotated in AIConfig, without false replenishment alerts."""
-    current_inst = detect_current_instance()
-    if not origin_instance_id:
-        if not current_inst:
-            return 0
-        origin_instance_id = current_inst["pm2_name"]
+    """
+    Supersede active incidents when an API key is rotated in AIConfig, without false replenishment alerts.
+    Supersedes across the database, ensuring Telegram and companion MAX instances in shared DB are both transitioned.
+    """
+    try:
+        return await _handle_key_rotation_impl(
+            origin_instance_id=origin_instance_id,
+            provider=provider,
+            new_key=new_key,
+            base_url=base_url,
+            session_maker=session_maker,
+        )
+    except Exception as exc:
+        logger.warning("[AI Incident] Unexpected error in handle_key_rotation: %s", exc)
+        return 0
 
+
+async def _handle_key_rotation_impl(
+    origin_instance_id: str | None,
+    provider: str,
+    new_key: str,
+    base_url: str | None = None,
+    session_maker: Any = None,
+) -> int:
     prov_norm = provider.strip().upper()
     new_fp = get_provider_account_fingerprint(new_key, base_url)
     sm = session_maker or async_session_maker
@@ -454,8 +604,8 @@ async def handle_key_rotation(
     superseded_count = 0
 
     async with sm() as session:
+        # Supersede ALL active incidents in this DB for provider whose credential_scope != new_fp
         stmt = select(AIProviderIncidentModel).where(
-            AIProviderIncidentModel.origin_instance_id == origin_instance_id,
             AIProviderIncidentModel.provider == prov_norm,
             AIProviderIncidentModel.credential_scope != new_fp,
             AIProviderIncidentModel.status == "active",
@@ -466,7 +616,7 @@ async def handle_key_rotation(
             inc.resolved_at = now
             superseded_count += 1
 
-            # Cancel pending notifications
+            # Cancel pending/processing notifications without sending alerts
             await session.execute(
                 update(AIIncidentNotificationModel)
                 .where(
@@ -480,22 +630,27 @@ async def handle_key_rotation(
                 )
             )
 
-        if superseded_count > 0:
-            await session.commit()
-            logger.info(
-                "[AI Incident] Superseded %d incidents for %s due to key rotation (new_fp=%s).",
-                superseded_count, prov_norm, new_fp,
-            )
+        await session.commit()
 
+    logger.info(
+        "[AI Incident] Key rotation for %s: superseded %d active incidents (new fp=%s).",
+        prov_norm,
+        superseded_count,
+        new_fp,
+    )
     return superseded_count
 
 
 async def check_incident_repeat_reminders(
     bot: Bot | None = None,
-    repeat_seconds: int = DEFAULT_REPEAT_ALERT_SECONDS,
+    repeat_interval_seconds: int = DEFAULT_REPEAT_ALERT_SECONDS,
     session_maker: Any = None,
+    repeat_seconds: int | None = None,
+    **kwargs: Any,
 ) -> int:
-    """Atomic reminder cycle advance: CAS check + notification enqueue in a single transaction."""
+    """Check active incidents and enqueue repeat reminder outbox rows if cooldown elapsed."""
+    if repeat_seconds is not None:
+        repeat_interval_seconds = repeat_seconds
     current_inst = detect_current_instance()
     if not current_inst:
         return 0
@@ -503,65 +658,52 @@ async def check_incident_repeat_reminders(
 
     sm = session_maker or async_session_maker
     now = datetime.utcnow()
+    threshold = now - timedelta(seconds=repeat_interval_seconds)
     reminders_created = 0
 
     async with sm() as session:
-        cutoff = now - timedelta(seconds=repeat_seconds)
         stmt = select(AIProviderIncidentModel).where(
+            AIProviderIncidentModel.origin_instance_id == current_bot_instance_id,
             AIProviderIncidentModel.status == "active",
-            or_(
-                AIProviderIncidentModel.last_alerted_at.is_(None),
-                AIProviderIncidentModel.last_alerted_at <= cutoff,
-            ),
+            AIProviderIncidentModel.last_alerted_at <= threshold,
         )
-        due_incidents = (await session.execute(stmt)).scalars().all()
+        stale_incidents = (await session.execute(stmt)).scalars().all()
+        if not stale_incidents:
+            return 0
 
-        for inc in due_incidents:
-            target_cycle = inc.reminder_cycle + 1
-            cas_stmt = (
-                update(AIProviderIncidentModel)
-                .where(
-                    AIProviderIncidentModel.id == inc.id,
-                    AIProviderIncidentModel.status == "active",
-                    AIProviderIncidentModel.reminder_cycle == inc.reminder_cycle,
-                    or_(
-                        AIProviderIncidentModel.last_alerted_at.is_(None),
-                        AIProviderIncidentModel.last_alerted_at <= cutoff,
-                    ),
-                )
-                .values(
-                    reminder_cycle=target_cycle,
-                    last_alerted_at=now,
-                )
-            )
-            res = await session.execute(cas_stmt)
-            if getattr(res, "rowcount", 0) != 1:
-                continue
+        companion_def = resolve_companion_telegram_instance(current_inst)
+        if not companion_def:
+            return 0
+        admin_ids = await resolve_target_admin_ids(companion_def, current_instance=current_inst, session=session)
+        if not admin_ids:
+            return 0
 
-            source_def = get_instance_by_pm2_name(inc.origin_instance_id) or current_inst
-            companion_def = resolve_companion_telegram_instance(source_def) if source_def else None
-            if not companion_def:
-                continue
+        authorized_instance_id = companion_def["pm2_name"]
 
-            admin_ids = await resolve_target_admin_ids(companion_def, current_instance=source_def, session=session)
+        for inc in stale_incidents:
+            new_cycle = inc.reminder_cycle + 1
+            inc.reminder_cycle = new_cycle
+            inc.last_alerted_at = now
+
             msg_text = _format_incident_message_text(
                 provider=inc.provider,
                 operation=inc.operation,
                 model_scope=inc.model_scope,
                 incident_type=inc.incident_type,
-                detail_code=inc.detail_code,
+                detail_code=inc.detail_code or "persisting",
                 evidence_tier=inc.evidence_tier,
                 event_type="repeat_reminder",
             )
+
             for admin_id in admin_ids:
                 if not is_valid_telegram_user_id(admin_id):
                     continue
                 notif = AIIncidentNotificationModel(
                     incident_id=inc.id,
                     event_type="repeat_reminder",
-                    cycle_index=target_cycle,
+                    cycle_index=new_cycle,
                     recipient_id=admin_id,
-                    authorized_instance_id=companion_def["pm2_name"],
+                    authorized_instance_id=authorized_instance_id,
                     message_text=msg_text,
                     status="pending",
                     attempts=0,
@@ -586,12 +728,46 @@ async def process_ai_incident_notifications(
     batch_size: int = 20,
     session_maker: Any = None,
 ) -> int:
-    """Outbox worker: claims tasks strictly for authorized_instance_id, validates permissions, and dispatches."""
+    """
+    Outbox worker: claims tasks strictly for authorized_instance_id, validates bot identity and permissions,
+    and dispatches via Telegram.
+    """
     current_inst = detect_current_instance()
     if not current_inst:
         logger.error("[AI Incident Worker] Fail-closed: cannot determine instance identity.")
         return 0
+    if current_inst.get("platform") != "telegram":
+        logger.error(
+            "[AI Incident Worker] Worker running on non-Telegram instance %s. Refusing delivery.",
+            current_inst.get("pm2_name"),
+        )
+        return 0
+
     current_bot_instance_id = current_inst["pm2_name"]
+    expected_pid = current_inst.get("platform_id")
+
+    # Strict Bot Identity Verification
+    actual_bot = bot
+    if actual_bot is not None:
+        cand_token = getattr(actual_bot, "token", None)
+        token_pid = extract_telegram_bot_id(cand_token) if cand_token else None
+        if token_pid != expected_pid:
+            logger.critical(
+                "[AI Incident Worker] Foreign bot token supplied: token ID %s != expected %s for %s. Refusing delivery.",
+                token_pid,
+                expected_pid,
+                current_bot_instance_id,
+            )
+            return 0
+    else:
+        resolved_tok = resolve_target_bot_token(current_inst, is_companion=False)
+        if not resolved_tok or extract_telegram_bot_id(resolved_tok) != expected_pid:
+            logger.critical(
+                "[AI Incident Worker] Valid target bot token missing for %s. Fail-closed.",
+                current_bot_instance_id,
+            )
+            return 0
+        actual_bot = Bot(token=resolved_tok)
 
     sm = session_maker or async_session_maker
     now = datetime.utcnow()
@@ -625,7 +801,7 @@ async def process_ai_incident_notifications(
     if not candidates:
         return 0
 
-    # Dispatch via provided Bot or create verified Bot from current_inst token
+    # Dispatch via verified Bot
     async def _do_send(row_id: int) -> bool:
         token = str(uuid.uuid4())
         lease_duration = timedelta(seconds=OUTBOX_LEASE_SECONDS)
@@ -658,76 +834,80 @@ async def process_ai_incident_notifications(
             )
             res = await session.execute(claim_stmt)
             await session.commit()
-            if getattr(res, "rowcount", 0) != 1:
-                return False
+            if res.rowcount == 0:
+                return False  # Lost race or lease taken
 
+            # Fetch claimed row
             row = await session.get(AIIncidentNotificationModel, row_id)
-            if not row:
+            if not row or row.claim_token != token:
                 return False
 
-            # Pre-Send Check 1: Parent incident freshness
+            # Check parent incident freshness: if resolved/superseded before sending 'opened' or 'repeat_reminder', skip!
             parent_inc = await session.get(AIProviderIncidentModel, row.incident_id)
-            if not parent_inc or (parent_inc.status != "active" and row.event_type in ("opened", "repeat_reminder", "fallback_used")):
-                row.status = "cancelled"
-                row.last_error = f"incident_{parent_inc.status if parent_inc else 'missing'}_before_send"
+            if parent_inc and parent_inc.status != "active" and row.event_type in ("opened", "repeat_reminder", "fallback_used"):
+                row.status = "skipped_stale"
+                row.last_error = f"incident_{parent_inc.status}_before_send"
+                row.updated_at = ts_now
                 await session.commit()
                 return False
 
-            # Pre-Send Check 2: Dynamic recipient permissions verification
-            target_inst = get_instance_by_pm2_name(row.authorized_instance_id) or current_inst
-            allowed_admins = await resolve_target_admin_ids(target_inst, current_instance=current_inst, session=session)
-            if row.recipient_id not in allowed_admins or not is_valid_telegram_user_id(row.recipient_id):
-                row.status = "failed_terminal"
+            # Dynamic Admin Authorization Verification
+            allowed_admins = await resolve_target_admin_ids(current_inst, current_instance=current_inst, session=session)
+            if row.recipient_id not in allowed_admins:
+                row.status = "skipped_unauthorized"
                 row.last_error = "recipient_permission_revoked_or_invalid"
+                row.updated_at = ts_now
                 await session.commit()
-                logger.warning(
-                    "[AI Incident Worker] Dropped delivery for revoked/invalid recipient_id=%s via %s",
-                    row.recipient_id, row.authorized_instance_id,
-                )
                 return False
 
-            msg_text = row.message_text
-            recipient_id = row.recipient_id
             attempts = row.attempts
 
-        # Send HTTP RPC outside DB transaction
+        # Dispatch message via actual_bot
         send_success = False
-        error_reason: str | None = None
         is_terminal = False
-        retry_delay = BACKOFF_DELAYS[min(attempts - 1, len(BACKOFF_DELAYS) - 1)]
+        retry_delay = BACKOFF_DELAYS[min(attempts, len(BACKOFF_DELAYS) - 1)]
+        error_code = "delivery_success"
 
         try:
-            if bot is not None:
-                await bot.send_message(recipient_id, msg_text, parse_mode="HTML")
-            else:
-                from telegram_client import create_telegram_bot
-                bot_token = os.environ.get("BOT_TOKEN")
-                if not bot_token:
-                    logger.error("[AI Incident Worker] Missing BOT_TOKEN for dispatch.")
-                    return False
-                async with create_telegram_bot(bot_token) as t_bot:
-                    await t_bot.send_message(recipient_id, msg_text, parse_mode="HTML")
+            await actual_bot.send_message(
+                chat_id=row.recipient_id,
+                text=row.message_text,
+                parse_mode="HTML",
+            )
             send_success = True
-        except TelegramForbiddenError as exc:
+        except TelegramForbiddenError:
             send_success = False
-            error_reason = str(exc)
             is_terminal = True
+            error_code = "telegram_bot_blocked"
         except TelegramBadRequest as exc:
             send_success = False
-            error_reason = str(exc)
+            exc_str = str(exc).lower()
             if is_bot_blocked_reason(str(exc)):
                 is_terminal = True
-            elif "chat not found" in str(exc).lower():
+                error_code = "telegram_bot_blocked"
+            elif "chat not found" in exc_str:
                 is_terminal = True
+                error_code = "telegram_chat_not_found"
+            else:
+                error_code = "telegram_bad_request"
         except TelegramRetryAfter as exc:
             send_success = False
-            error_reason = str(exc)
+            error_code = "telegram_rate_limited"
             retry_delay = timedelta(seconds=getattr(exc, "retry_after", 30))
+        except TelegramNetworkError:
+            send_success = False
+            error_code = "telegram_network_error"
+        except TelegramUnauthorizedError:
+            send_success = False
+            is_terminal = True
+            error_code = "telegram_unauthorized_token"
         except Exception as exc:
             send_success = False
-            error_reason = str(exc)
             if is_bot_blocked_reason(str(exc)):
                 is_terminal = True
+                error_code = "telegram_bot_blocked"
+            else:
+                error_code = "unexpected_delivery_error"
 
         # Post-Send CAS Update
         ts_post = datetime.utcnow()
@@ -743,6 +923,7 @@ async def process_ai_incident_notifications(
                     .values(
                         status="delivered",
                         delivered_at=ts_post,
+                        last_error="delivered_ok",
                         updated_at=ts_post,
                     )
                 )
@@ -760,7 +941,7 @@ async def process_ai_incident_notifications(
                     )
                     .values(
                         status=new_status,
-                        last_error=error_reason[:500] if error_reason else "unknown_error",
+                        last_error=error_code,
                         next_retry_at=ts_post + retry_delay,
                         updated_at=ts_post,
                     )
@@ -769,8 +950,8 @@ async def process_ai_incident_notifications(
                 await session.commit()
                 return False
 
-    for c_id in candidates:
-        if await _do_send(c_id):
+    for cand_id in candidates:
+        if await _do_send(cand_id):
             delivered_count += 1
 
     return delivered_count

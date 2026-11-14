@@ -236,7 +236,8 @@ async def test_scenario_3_shared_db_max_companion_isolation(test_db_session_make
     delivered_tg = await process_ai_incident_notifications(bot=bot, session_maker=test_db_session_maker)
     assert delivered_tg == 1
     assert bot.send_message.call_count == 1
-    assert bot.send_message.call_args[0][0] == 777
+    recipient_called = bot.send_message.call_args.kwargs.get("chat_id") if bot.send_message.call_args.kwargs else bot.send_message.call_args.args[0]
+    assert recipient_called == 777
 
     # Status updated to delivered
     async with test_db_session_maker() as session:
@@ -320,7 +321,7 @@ async def test_scenario_5_dynamic_admin_permissions_revocation(test_db_session_m
 
     async with test_db_session_maker() as session:
         notif = (await session.execute(select(AIIncidentNotificationModel))).scalar_one()
-        assert notif.status == "failed_terminal"
+        assert notif.status == "skipped_unauthorized"
         assert notif.last_error == "recipient_permission_revoked_or_invalid"
 
 
@@ -591,14 +592,27 @@ async def test_scenario_10_repeat_reminder_cycle(test_db_session_maker, monkeypa
 
 @pytest.mark.asyncio
 async def test_scenario_11_autobus_isolation_handled_ai_warning_no_alert(monkeypatch, tmp_path):
-    """Scenario 11: Handled AI warnings without stack trace produce 0 alerts for Autobus."""
+    """Scenario 11: Handled AI warnings without stack trace produce 0 alerts for Autobus (real file check)."""
     lock_file = str(tmp_path / "lock.lock")
     state_file = str(tmp_path / "state.json")
     monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
     monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
 
+    error_log_file = tmp_path / "test-bot-error.log"
+    error_log_file.write_text(
+        "2026-11-14 10:00:00 | WARNING | Handled AI notice: KIE credit balance check | stage=check_credit_balance | provider=KIE | failure_type=insufficient_balance_quota\n"
+        "2026-11-14 10:01:00 | WARNING | [AI Incident Worker] Worker running on tg_bot_online\n"
+        "2026-11-14 10:02:00 | WARNING | KIE transcription failed, falling back to OpenAI Whisper: model=whisper-large-v3-turbo\n"
+    )
+
     apps = [
-        {"name": "tg_bot_online", "status": "online", "token": "tok_1", "owner_ids": [272982544]}
+        {
+            "name": "tg_bot_online",
+            "status": "online",
+            "token": "tok_1",
+            "owner_ids": [272982544],
+            "error_log": str(error_log_file),
+        }
     ]
     monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
 
@@ -611,12 +625,7 @@ async def test_scenario_11_autobus_isolation_handled_ai_warning_no_alert(monkeyp
     monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
     monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
 
-    # Handled AI provider warning logged at WARNING level: not scraped by LOG_ERROR_RE
-    monkeypatch.setattr(
-        monitor, "read_new_log_errors",
-        lambda *args, **kwargs: []  # Warning is not in error log
-    )
-
+    # Note: monitor.read_new_log_errors is NOT mocked! It reads error_log_file directly.
     sent_alerts = []
     async def fake_send_alert(a, text, **kwargs):
         sent_alerts.append(text)
@@ -626,6 +635,15 @@ async def test_scenario_11_autobus_isolation_handled_ai_warning_no_alert(monkeyp
     exit_code = await monitor.run_check(False)
     assert exit_code == 0
     assert len(sent_alerts) == 0
+
+    # Now append an unhandled fatal error and verify Autobus DOES alert!
+    with open(error_log_file, "a", encoding="utf-8") as f:
+        f.write("2026-11-14 10:05:00 | ERROR | Traceback (most recent call last):\n  File \"main.py\", line 12\nRuntimeError: unhandled crash\n")
+
+    exit_code_2 = await monitor.run_check(False)
+    assert exit_code_2 == 1
+    assert len(sent_alerts) == 1
+    assert "RuntimeError: unhandled crash" in sent_alerts[0]
 
 
 @pytest.mark.asyncio
@@ -1023,3 +1041,575 @@ def test_generated_telegram_methods_pass_aiogram_pydantic_validation():
         assert method.chat_id == 272982544
         assert len(method.text) > 0
         assert len(method.text) <= 4096
+
+
+# ==============================================================================
+# Additional Architectural Invariant Tests
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_observability_ai_success_not_broken_by_incident_db_error(test_db_session_maker, monkeypatch):
+    """When AI operation succeeds, failure to record incident state does NOT fail the operation or break user result."""
+    import ai_integration
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_telegram_token_123456789012")
+    monkeypatch.setattr(ai_integration, "async_session_maker", test_db_session_maker)
+
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, image_generation_provider="Gemini", image_generation_model="gemini-3.1-flash-image")
+            session.add(cfg)
+        else:
+            cfg.image_generation_provider = "Gemini"
+            cfg.image_generation_model = "gemini-3.1-flash-image"
+        await session.commit()
+
+    async def mock_call_gemini(*args, **kwargs):
+        return b"fake_png_data_123"
+
+    monkeypatch.setattr(ai_integration, "_call_gemini_image_generation", mock_call_gemini)
+
+    # Mock record_ai_operation_success to simulate a database crash / connection loss
+    async def mock_fail_obs(*args, **kwargs):
+        raise RuntimeError("Incident DB completely broken!")
+
+    import ai_incident_manager
+    monkeypatch.setattr(ai_incident_manager, "record_ai_operation_success", mock_fail_obs)
+
+    # Calling generate_image MUST succeed and return the generated image bytes to user!
+    result = await ai_integration.generate_image("A beautiful sunset")
+    assert result == b"fake_png_data_123"
+
+
+@pytest.mark.asyncio
+async def test_observability_incident_db_error_does_not_mask_ai_failure(test_db_session_maker, monkeypatch):
+    """When AI operation fails, failure to record incident in DB does NOT mask or replace the original AI exception."""
+    import ai_integration
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_telegram_token_123456789012")
+    monkeypatch.setattr(ai_integration, "async_session_maker", test_db_session_maker)
+
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, image_generation_provider="KIE", image_generation_model="seedream/4.5-text-to-image")
+            session.add(cfg)
+        else:
+            cfg.image_generation_provider = "KIE"
+            cfg.image_generation_model = "seedream/4.5-text-to-image"
+        await session.commit()
+
+    orig_err = InsufficientBalanceError("KIE credits empty")
+    orig_err.provider = "KIE"
+    async def mock_call_kie(*args, **kwargs):
+        raise orig_err
+
+    monkeypatch.setattr(ai_integration, "_call_kie_image_generation", mock_call_kie)
+
+    # Mock record_ai_provider_failure to simulate DB crash
+    async def mock_fail_rec(*args, **kwargs):
+        raise RuntimeError("Incident DB failure recording down!")
+
+    import ai_incident_manager
+    monkeypatch.setattr(ai_incident_manager, "record_ai_provider_failure", mock_fail_rec)
+
+    # Must raise the original InsufficientBalanceError, NOT the DB RuntimeError!
+    with pytest.raises(InsufficientBalanceError) as exc_info:
+        await ai_integration.generate_image("A futuristic city")
+
+    assert "KIE credits empty" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_chat_fallback_single_canonical_incident_and_notification(test_db_session_maker, monkeypatch):
+    """When primary provider fails and fallback succeeds: exactly ONE canonical incident and one notification per admin."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    bot_token = "8281390498:AAFtest_telegram_token_123456789012"
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+
+    primary_err = InsufficientBalanceError("KIE credits 0")
+    primary_err.provider = "KIE"
+
+    # 1. Primary failure recorded with fallback_succeeded=True
+    inc = await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        error=primary_err,
+        operation="chat",
+        model="kie-chat-v1",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-5.6-terra",
+        fallback_succeeded=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc is not None
+    assert inc.status == "active"
+
+    # 2. Operational success recorded for OpenAI fallback
+    fp_oai = get_provider_account_fingerprint("openai_test_key_1")
+    await record_ai_operation_success(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="OpenAI",
+        credential_scope=fp_oai,
+        operation="chat",
+        model="gpt-5.6-terra",
+        session_maker=test_db_session_maker,
+    )
+
+    # 3. Simulate calling notify_admins_about_error with stage="ai_provider_fallback"
+    import error_reporting
+    mock_bot = AsyncMock(spec=Bot)
+    mock_bot.token = bot_token
+    await error_reporting.notify_admins_about_error(
+        mock_bot,
+        title="Основной AI-провайдер не сработал — использован резервный",
+        provider="KIE",
+        model="kie-chat-v1",
+        stage="ai_provider_fallback",
+        exception=primary_err,
+        classification="insufficient_balance_quota",
+    )
+
+    async with test_db_session_maker() as session:
+        # Verify: Exactly ONE incident in DB, with operation='chat', NOT 'ai_provider_fallback'
+        all_incidents = (await session.execute(select(AIProviderIncidentModel))).scalars().all()
+        assert len(all_incidents) == 1
+        assert all_incidents[0].operation == "chat"
+        assert all_incidents[0].provider == "KIE"
+
+        # Verify: Outbox has fallback_used notifications for authorized admins
+        notifs = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        assert len(notifs) > 0
+        for n in notifs:
+            assert n.event_type == "fallback_used"
+            assert "Резервный:" in n.message_text
+            assert "OPENAI" in n.message_text
+
+
+@pytest.mark.asyncio
+async def test_admin_key_change_triggers_handle_key_rotation(test_db_session_maker, monkeypatch):
+    """Rotating an API key supersedes active incidents across Telegram and MAX companion bots without false alert."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda_telegram")
+
+    err = InsufficientBalanceError("KIE credits empty")
+    err.provider = "KIE"
+
+    # Open active incident for Telegram bot
+    inc_tg = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=err,
+        operation="chat",
+        model="kie-v1",
+        credential_scope="old_kie_fp_1",
+        session_maker=test_db_session_maker,
+    )
+    assert inc_tg is not None
+
+    # Open active incident for MAX companion bot in same database
+    inc_max = await record_ai_provider_failure(
+        origin_instance_id="max_se13639182_bot_legacy",
+        provider="KIE",
+        error=err,
+        operation="vision",
+        model="kie-vision-1",
+        credential_scope="old_kie_fp_1",
+        session_maker=test_db_session_maker,
+    )
+    assert inc_max is not None
+
+    # Now simulate key rotation to new key
+    superseded = await handle_key_rotation(
+        origin_instance_id=None,
+        provider="KIE",
+        new_key="new_super_secret_kie_key_2026",
+        base_url="https://api.kie.ai",
+        session_maker=test_db_session_maker,
+    )
+    assert superseded == 2
+
+    async with test_db_session_maker() as session:
+        incidents = (await session.execute(select(AIProviderIncidentModel))).scalars().all()
+        for inc in incidents:
+            assert inc.status == "superseded"
+            assert inc.resolved_at is not None
+
+        # Verify pending notifications are cancelled
+        notifs = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        for notif in notifs:
+            assert notif.status == "cancelled"
+            assert notif.last_error == "superseded_by_key_rotation"
+
+
+@pytest.mark.asyncio
+async def test_foreign_bot_token_worker_fail_closed(test_db_session_maker, monkeypatch):
+    """Outbox worker rejects Bot with mismatched/foreign token and refuses delivery (fail-closed)."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFcorrect_bot_token")
+
+    # Open an incident
+    err = InsufficientBalanceError("Low balance")
+    err.provider = "KIE"
+    err.failure = ProviderFailure(
+        provider="KIE",
+        operation="image_generation",
+        classification="insufficient_balance_quota",
+        detail_code="credits_exhausted",
+        operator_action_required=True,
+    )
+    await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        error=err,
+        operation="image_generation",
+        session_maker=test_db_session_maker,
+    )
+
+    # Pass a Bot with foreign platform_id (e.g. Autobus token 7858169956)
+    foreign_bot = AsyncMock(spec=Bot)
+    foreign_bot.token = "7858169956:AAFforeign_autobus_token_wrong"
+
+    delivered = await process_ai_incident_notifications(
+        foreign_bot,
+        session_maker=test_db_session_maker,
+    )
+    assert delivered == 0
+    foreign_bot.send_message.assert_not_called()
+
+    # Verify rows in DB remain pending and were not delivered
+    async with test_db_session_maker() as session:
+        notifs = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        assert len(notifs) > 0
+        for n in notifs:
+            assert n.status == "pending"
+
+
+# ==============================================================================
+# Real PostgreSQL Integration Tests
+# ==============================================================================
+
+@pytest_asyncio.fixture
+async def pg_test_session_maker():
+    """Provide a real PostgreSQL session maker on validated disposable test database."""
+    pg_url = os.environ.get("POSTGRES_TEST_DATABASE_URL") or "postgresql+asyncpg://localhost/test_tgpsychobot_ai_incidents"
+    try:
+        engine = create_async_engine(pg_url, echo=False)
+        async with engine.begin() as conn:
+            curr_db = (await conn.execute(text("SELECT current_database()"))).scalar()
+            if not curr_db or not curr_db.startswith("test_"):
+                await engine.dispose()
+                pytest.skip(f"SAFETY ABORT: PostgreSQL database {curr_db} does not start with 'test_'")
+            await conn.run_sync(Base.metadata.drop_all)
+            await conn.run_sync(Base.metadata.create_all)
+    except Exception as exc:
+        pytest.skip(f"PostgreSQL test database not available ({pg_url}): {exc}")
+
+    session_maker = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+    # Seed AIConfig
+    async with session_maker() as session:
+        ai_cfg = AIConfig(
+            id=1,
+            provider="Gemini",
+            gemini_api_key="gem_pg_key_1",
+            image_generation_provider="KIE",
+            kie_api_key="kie_pg_key_1",
+            kie_credit_alert_threshold=2.0,
+            kie_credit_alert_sent=False,
+            allow_fallback=True,
+            fallback_provider="OpenAI",
+            openai_api_key="openai_pg_key_1",
+        )
+        session.add(ai_cfg)
+        await session.commit()
+
+    yield session_maker
+    await engine.dispose()
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_incident_lifecycle_and_cas_outbox(pg_test_session_maker, monkeypatch):
+    """Real PostgreSQL: full incident lifecycle, outbox CAS dispatch, and recovery on actual PostgreSQL."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    bot_token = "8281390498:AAFtest_telegram_token_123456789012"
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+
+    err = InsufficientBalanceError("KIE credits empty")
+    err.provider = "KIE"
+
+    # 1. Record failure on PostgreSQL
+    inc = await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        error=err,
+        operation="image_generation",
+        model="seedream-v4",
+        session_maker=pg_test_session_maker,
+    )
+    assert inc is not None
+    assert inc.status == "active"
+
+    # Verify row in real PostgreSQL
+    async with pg_test_session_maker() as session:
+        db_inc = await session.get(AIProviderIncidentModel, inc.id)
+        assert db_inc is not None
+        assert db_inc.provider == "KIE"
+
+        outbox_rows = (await session.execute(
+            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.incident_id == inc.id)
+        )).scalars().all()
+        assert len(outbox_rows) > 0
+        assert outbox_rows[0].status == "pending"
+
+    # 2. Worker processes notifications on PostgreSQL
+    mock_bot = AsyncMock(spec=Bot)
+    mock_bot.token = bot_token
+    mock_bot.send_message.return_value = True
+
+    delivered = await process_ai_incident_notifications(
+        mock_bot,
+        session_maker=pg_test_session_maker,
+    )
+    assert delivered > 0
+
+    async with pg_test_session_maker() as session:
+        outbox_rows = (await session.execute(
+            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.incident_id == inc.id)
+        )).scalars().all()
+        for r in outbox_rows:
+            assert r.status == "delivered"
+            assert r.delivered_at is not None
+
+    # 3. Operational success resolves incident on PostgreSQL
+    fp = inc.credential_scope
+    resolved = await record_ai_operation_success(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        credential_scope=fp,
+        operation="image_generation",
+        model="seedream-v4",
+        session_maker=pg_test_session_maker,
+    )
+    assert resolved is True
+
+    async with pg_test_session_maker() as session:
+        db_inc = await session.get(AIProviderIncidentModel, inc.id)
+        assert db_inc.status == "resolved"
+        assert db_inc.resolved_at is not None
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_concurrent_failure_atomic_upsert(pg_test_session_maker, monkeypatch):
+    """Real PostgreSQL: 10 concurrent tasks calling record_ai_provider_failure produce exactly 1 row with occurrence_count=10."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_telegram_token_123456789012")
+
+    err = InsufficientBalanceError("KIE credits empty")
+    err.provider = "KIE"
+
+    # Launch 10 concurrent operations against real PostgreSQL
+    async def worker_task():
+        return await record_ai_provider_failure(
+            origin_instance_id="tg_someonewithyou01_bot_new",
+            provider="KIE",
+            error=err,
+            operation="image_generation",
+            model="seedream-v4",
+            session_maker=pg_test_session_maker,
+        )
+
+    results = await asyncio.gather(*(worker_task() for _ in range(10)))
+    assert all(r is not None for r in results)
+
+    async with pg_test_session_maker() as session:
+        incidents = (await session.execute(select(AIProviderIncidentModel))).scalars().all()
+        assert len(incidents) == 1
+        assert incidents[0].occurrence_count == 10
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_cas_lease_expiration_and_recovery(pg_test_session_maker, monkeypatch):
+    """Real PostgreSQL: worker lease expires, allowing recovery worker to safely claim and deliver."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    bot_token = "8281390498:AAFtest_telegram_token_123456789012"
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+
+    err = InsufficientBalanceError("KIE credits empty")
+    err.provider = "KIE"
+    inc = await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        error=err,
+        operation="image_generation",
+        model="seedream-v4",
+        session_maker=pg_test_session_maker,
+    )
+
+    # Manually simulate a crashed worker holding an expired processing lease on PostgreSQL
+    async with pg_test_session_maker() as session:
+        notif = (await session.execute(
+            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.incident_id == inc.id)
+        )).scalars().first()
+        notif.status = "processing"
+        notif.claim_token = "dead_worker_token"
+        notif.lease_until = datetime.utcnow() - timedelta(seconds=10)
+        await session.commit()
+
+    mock_bot = AsyncMock(spec=Bot)
+    mock_bot.token = bot_token
+    mock_bot.send_message.return_value = True
+
+    # Recovery worker runs
+    delivered = await process_ai_incident_notifications(
+        mock_bot,
+        session_maker=pg_test_session_maker,
+    )
+    assert delivered > 0
+
+    async with pg_test_session_maker() as session:
+        updated_notif = await session.get(AIIncidentNotificationModel, notif.id)
+        assert updated_notif.status == "delivered"
+        assert updated_notif.claim_token != "dead_worker_token"
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_partial_delivery_and_restart_retry(pg_test_session_maker, monkeypatch):
+    """Real PostgreSQL: 3 admins (1 success, 1 temporary fail, 1 blocked). Retry after restart delivers only to remaining."""
+    from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    bot_token = "8281390498:AAFtest_telegram_token_123456789012"
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+
+    err = InsufficientBalanceError("KIE credits empty")
+    err.provider = "KIE"
+    inc = await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        error=err,
+        operation="image_generation",
+        model="seedream-v4",
+        session_maker=pg_test_session_maker,
+    )
+
+    # Re-seed exactly 3 recipient notifications in PostgreSQL
+    admin_success = 272982544
+    admin_retry = 979514796
+    admin_blocked = 806750628
+
+    async with pg_test_session_maker() as session:
+        # Clear existing notifications
+        await session.execute(text("DELETE FROM ai_incident_notifications"))
+        now = datetime.utcnow()
+        for idx, adm in enumerate([admin_success, admin_retry, admin_blocked]):
+            session.add(AIIncidentNotificationModel(
+                incident_id=inc.id,
+                event_type="opened",
+                cycle_index=0,
+                recipient_id=adm,
+                authorized_instance_id="tg_someonewithyou01_bot_new",
+                message_text="Alert text",
+                status="pending",
+                attempts=0,
+                max_attempts=5,
+                next_retry_at=now,
+            ))
+        await session.commit()
+
+    # Dispatch: admin_success succeeds, admin_retry gets network error, admin_blocked gets forbidden
+    mock_bot = AsyncMock(spec=Bot)
+    mock_bot.token = bot_token
+
+    async def fake_send(chat_id, text, **kwargs):
+        if chat_id == admin_success:
+            return True
+        elif chat_id == admin_retry:
+            raise TelegramNetworkError(method=SendMessage(chat_id=chat_id, text=text), message="Connection reset")
+        elif chat_id == admin_blocked:
+            raise TelegramForbiddenError(method=SendMessage(chat_id=chat_id, text=text), message="Forbidden: bot was blocked by the user")
+
+    mock_bot.send_message.side_effect = fake_send
+
+    delivered_1 = await process_ai_incident_notifications(
+        mock_bot,
+        session_maker=pg_test_session_maker,
+    )
+    assert delivered_1 == 1
+
+    async with pg_test_session_maker() as session:
+        rows = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        by_adm = {r.recipient_id: r for r in rows}
+        assert by_adm[admin_success].status == "delivered"
+        assert by_adm[admin_retry].status == "pending"
+        assert by_adm[admin_retry].last_error == "telegram_network_error"
+        assert by_adm[admin_blocked].status == "failed_terminal"
+        assert by_adm[admin_blocked].last_error == "telegram_bot_blocked"
+
+        # Advance retry timestamp for admin_retry so next sweep picks it up
+        by_adm[admin_retry].next_retry_at = datetime.utcnow() - timedelta(seconds=1)
+        await session.commit()
+
+    # Restart sweep: mock_bot now succeeds for admin_retry
+    mock_bot.send_message.side_effect = None
+    mock_bot.send_message.return_value = True
+
+    delivered_2 = await process_ai_incident_notifications(
+        mock_bot,
+        session_maker=pg_test_session_maker,
+    )
+    assert delivered_2 == 1
+
+    async with pg_test_session_maker() as session:
+        rows = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        by_adm = {r.recipient_id: r for r in rows}
+        assert by_adm[admin_success].status == "delivered"
+        assert by_adm[admin_retry].status == "delivered"
+        assert by_adm[admin_blocked].status == "failed_terminal"
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_key_rotation_superseded_no_false_alert(pg_test_session_maker, monkeypatch):
+    """Real PostgreSQL: rotating API key transitions active PostgreSQL incidents to superseded without false alert."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_telegram_token_123456789012")
+
+    err = InsufficientBalanceError("KIE credits empty")
+    err.provider = "KIE"
+    inc = await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        error=err,
+        operation="image_generation",
+        model="seedream-v4",
+        credential_scope="old_pg_scope_1",
+        session_maker=pg_test_session_maker,
+    )
+    assert inc is not None
+
+    superseded = await handle_key_rotation(
+        origin_instance_id=None,
+        provider="KIE",
+        new_key="new_pg_secret_kie_key_2026",
+        base_url="https://api.kie.ai",
+        session_maker=pg_test_session_maker,
+    )
+    assert superseded == 1
+
+    async with pg_test_session_maker() as session:
+        db_inc = await session.get(AIProviderIncidentModel, inc.id)
+        assert db_inc.status == "superseded"
+        assert db_inc.resolved_at is not None
+
+        notifs = (await session.execute(
+            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.incident_id == inc.id)
+        )).scalars().all()
+        for n in notifs:
+            assert n.status == "cancelled"
+            assert n.last_error == "superseded_by_key_rotation"
