@@ -423,6 +423,8 @@ async def _send_deduplicated_notification(
 def patch_bot_send_message(bot: Bot):
     if hasattr(bot, "_original_send_message"):
         return
+    if hasattr(bot.send_message, "call_count") or hasattr(bot.send_message, "mock_calls"):
+        return
 
     bot._original_send_message = bot.send_message
 
@@ -503,6 +505,22 @@ async def check_kie_credit_balance(bot: Bot):
             if not config:
                 return
 
+            from ai_incident_manager import (
+                is_provider_active_for_bot,
+                get_provider_account_fingerprint,
+                resolve_bot_identifier,
+                format_provider_balance_alert_message,
+                format_provider_recovery_message,
+                should_alert_provider_incident,
+                record_provider_incident_alerted,
+                record_provider_incident_recovered,
+                is_provider_incident_active,
+                send_provider_incident_message_to_admins,
+            )
+
+            if not is_provider_active_for_bot(config, "KIE"):
+                return
+
             api_key = getattr(config, "kie_api_key", None)
             threshold = float(getattr(config, "kie_credit_alert_threshold", 0) or 0)
             base_url = (getattr(config, "kie_base_url", None) or "https://api.kie.ai").rstrip("/")
@@ -513,33 +531,60 @@ async def check_kie_credit_balance(bot: Bot):
                     await session.commit()
                 return
 
-            effective_threshold = threshold if threshold > 0 else 2.0
+            bot_id = resolve_bot_identifier(bot)
+            account_fp = get_provider_account_fingerprint(api_key)
+
             remaining_credits = await get_kie_remaining_credits(api_key, base_url)
 
-            if remaining_credits < effective_threshold:
-                if not config.kie_credit_alert_sent:
-                    config.kie_credit_alert_sent = True
-                    await session.commit()
-                    text = (
-                        "⚠️ <b>Низкий баланс KIE</b>\n\n"
-                        f"Остаток кредитов: <b>{remaining_credits}</b>\n"
-                        f"Порог уведомления: <b>{effective_threshold}</b>\n\n"
-                        "Пополните баланс KIE, чтобы генерации и мультимодальные запросы не остановились."
-                    )
-                    for admin_id in await get_all_admin_ids():
+            recovery_threshold = threshold if threshold > 0 else 2.0
+            is_active = is_provider_incident_active(bot_id, "KIE", account_fp) or config.kie_credit_alert_sent
+
+            if remaining_credits >= recovery_threshold:
+                if is_active:
+                    admin_ids = await get_all_admin_ids()
+                    text = format_provider_recovery_message("KIE", remaining_credits)
+                    delivered = await send_provider_incident_message_to_admins(bot, admin_ids, text)
+                    if delivered:
+                        record_provider_incident_recovered(
+                            bot_id,
+                            "KIE",
+                            account_fp,
+                            details={"credits": remaining_credits},
+                        )
+                        config.kie_credit_alert_sent = False
+                        await session.commit()
                         try:
-                            await bot.send_message(admin_id, text, parse_mode="HTML")
-                        except Exception as exc:
-                            log.error("Failed to send KIE balance alert admin_id=%s error=%s", admin_id, exc)
-            else:
-                if config.kie_credit_alert_sent:
-                    config.kie_credit_alert_sent = False
-                    await session.commit()
-                    try:
-                        from error_reporting import reset_insufficient_balance_cooldown
-                        reset_insufficient_balance_cooldown("KIE")
-                    except Exception:
-                        pass
+                            from error_reporting import reset_insufficient_balance_cooldown
+                            reset_insufficient_balance_cooldown("KIE")
+                        except Exception:
+                            pass
+            elif threshold > 0 and remaining_credits < threshold:
+                if should_alert_provider_incident(bot_id, "KIE", account_fp):
+                    admin_ids = await get_all_admin_ids()
+                    text = format_provider_balance_alert_message("KIE", remaining_credits)
+                    delivered = await send_provider_incident_message_to_admins(bot, admin_ids, text)
+                    if delivered:
+                        record_provider_incident_alerted(
+                            bot_id,
+                            "KIE",
+                            account_fp,
+                            details={"credits": remaining_credits, "threshold": threshold},
+                        )
+                        if not config.kie_credit_alert_sent:
+                            config.kie_credit_alert_sent = True
+                            await session.commit()
+            elif is_active and remaining_credits < recovery_threshold:
+                if should_alert_provider_incident(bot_id, "KIE", account_fp):
+                    admin_ids = await get_all_admin_ids()
+                    text = format_provider_balance_alert_message("KIE", remaining_credits)
+                    delivered = await send_provider_incident_message_to_admins(bot, admin_ids, text)
+                    if delivered:
+                        record_provider_incident_alerted(
+                            bot_id,
+                            "KIE",
+                            account_fp,
+                            details={"credits": remaining_credits, "threshold": threshold},
+                        )
     except AIServiceError as exc:
         log.error("KIE credit balance check failed: %s", exc, exc_info=exc)
         if _kie_credit_error_alert_cooldown.should_send():

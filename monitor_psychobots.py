@@ -945,6 +945,22 @@ def is_bot_blocked_or_suspended_log(text: str) -> bool:
     return False
 
 
+def is_ai_balance_issue(issue: str) -> bool:
+    """Detect AI provider balance/quota exhaustion errors."""
+    if not issue or not isinstance(issue, str):
+        return False
+    lower = issue.lower()
+    return (
+        "insufficientbalanceerror" in lower
+        or "credits insufficient" in lower
+        or "current balance isn't enough" in lower
+        or "current balance isn’t enough" in lower
+        or "insufficient_balance" in lower
+        or "credit_balance_exhausted" in lower
+        or "prepayment credits are depleted" in lower
+    )
+
+
 def extract_log_error_summaries(chunk: str) -> list[str]:
     lines = chunk.splitlines()
     summaries: list[str] = []
@@ -978,7 +994,12 @@ def extract_log_error_summaries(chunk: str) -> list[str]:
                     i += 1
                     break
 
-            if is_bot_blocked_or_suspended_log(exception_line) or any(is_bot_blocked_or_suspended_log(l) for l in tb_lines):
+            if (
+                is_bot_blocked_or_suspended_log(exception_line)
+                or any(is_bot_blocked_or_suspended_log(l) for l in tb_lines)
+                or is_ai_balance_issue(exception_line)
+                or any(is_ai_balance_issue(l) for l in tb_lines)
+            ):
                 continue
 
             frame_info = ""
@@ -996,7 +1017,7 @@ def extract_log_error_summaries(chunk: str) -> list[str]:
             continue
 
         if LOG_ERROR_RE.search(line):
-            if not is_bot_blocked_or_suspended_log(line):
+            if not is_bot_blocked_or_suspended_log(line) and not is_ai_balance_issue(line):
                 summaries.append(line)
         i += 1
 
@@ -1206,7 +1227,7 @@ def format_issues_alert(
         lines.append(f"• Статус прокси: {html.escape(proxy_status)}")
 
     for name, issues in all_issues:
-        filtered = [i for i in issues if not is_bot_blocked_or_suspended_log(i)]
+        filtered = [i for i in issues if not is_bot_blocked_or_suspended_log(i) and not is_ai_balance_issue(i)]
         if is_shared_network_active:
             display_issues = [i for i in filtered if not is_telegram_network_issue(i)]
         else:
@@ -1218,21 +1239,6 @@ def format_issues_alert(
                 lines.append(f"• {html.escape(issue)}")
 
     return "\n".join(lines)
-
-
-def is_ai_balance_issue(issue: str) -> bool:
-    if not issue or not isinstance(issue, str):
-        return False
-    lower = issue.lower()
-    return (
-        "insufficientbalanceerror" in lower
-        or "credits insufficient" in lower
-        or "current balance isn't enough" in lower
-        or "current balance isn’t enough" in lower
-        or "insufficient_balance" in lower
-        or "credit_balance_exhausted" in lower
-        or "prepayment credits are depleted" in lower
-    )
 
 
 def extract_ai_balance_provider(issue: str) -> str:
@@ -1551,6 +1557,16 @@ async def run_check(
 
         await check_stuck_dialogues(apps, state, all_issues)
 
+        # Operational AI provider balance issues are handled directly by each bot's
+        # internal incident manager and notified to that bot's administrators.
+        # They must never be alerted in central autobus monitoring.
+        filtered_all_issues = []
+        for name, issues in all_issues:
+            non_ai_issues = [i for i in issues if not is_ai_balance_issue(i)]
+            if non_ai_issues:
+                filtered_all_issues.append((name, non_ai_issues))
+        all_issues = filtered_all_issues
+
         telegram_apps = [a for a in apps if a.get("platform") == "telegram" or a.get("token")]
         active_incidents = state.setdefault("active_incidents", {})
         polling_failures = state.setdefault("polling_failure_counts", {})
@@ -1757,85 +1773,10 @@ async def run_check(
                             pending_notifications.pop(rec_k, None)
                             active_incidents.pop(inc_k, None)
 
-        # Handle AI Balance Incidents (KIE credits, OpenAI, etc.)
-        ai_balance_by_provider: dict[str, list[str]] = defaultdict(list)
-        for name, issues in all_issues:
-            for issue in issues:
-                if is_ai_balance_issue(issue):
-                    prov = extract_ai_balance_provider(issue)
-                    if name not in ai_balance_by_provider[prov]:
-                        ai_balance_by_provider[prov].append(name)
-
-        active_bal_keys = []
-        should_alert_any_bal = False
-        for prov, bot_list in ai_balance_by_provider.items():
-            bal_inc_key = f"ai_balance_{prov.lower()}"
-            active_bal_keys.append(bal_inc_key)
-            should_alert_this_bal = False
-            if bal_inc_key not in active_incidents:
-                active_incidents[bal_inc_key] = {
-                    "first_seen": now,
-                    "last_seen": now,
-                    "last_alerted": 0,
-                    "alert_count": 0,
-                    "provider": prov,
-                    "affected_bots": sorted(bot_list),
-                    "summary": "Credits insufficient",
-                }
-                should_alert_this_bal = True
-            else:
-                inc = active_incidents[bal_inc_key]
-                inc["last_seen"] = now
-                inc["affected_bots"] = sorted(set(inc.get("affected_bots", [])) | set(bot_list))
-                last_alerted = int(inc.get("last_alerted", 0))
-                if last_alerted == 0 or (now - last_alerted >= REPEAT_ALERT_SECONDS):
-                    should_alert_this_bal = True
-                else:
-                    should_alert_this_bal = False
-
-            if should_alert_this_bal:
-                bal_alert_text = format_ai_balance_alert(prov, active_incidents[bal_inc_key]["affected_bots"])
-                _queue_issue_notification(pending_notifications, bal_alert_text, now)
-                should_alert_any_bal = True
-
-            pending_notifications.pop(f"recovery_{bal_inc_key}", None)
-
-        # Check recovery for active AI balance incidents
+        # Clean up any legacy ai_balance_* incidents from monitor state
         for inc_k in list(active_incidents.keys()):
             if inc_k.startswith("ai_balance_"):
-                prov = active_incidents[inc_k].get("provider", "AI")
-                if prov not in ai_balance_by_provider:
-                    issue_keys = [
-                        k for k in sorted(pending_notifications.keys())
-                        if k == "issue" or k.startswith("issue_")
-                    ]
-                    all_issues_delivered = True
-                    for k in issue_keys:
-                        p_issue = pending_notifications[k]
-                        issue_delivered = await _deliver_notification(apps, p_issue, state)
-                        if issue_delivered:
-                            pending_notifications.pop(k, None)
-                        else:
-                            all_issues_delivered = False
-                            break
-
-                    if all_issues_delivered:
-                        rec_k = f"recovery_{inc_k}"
-                        if rec_k not in pending_notifications:
-                            inc = active_incidents[inc_k]
-                            duration_sec = max(0, now - int(inc.get("first_seen", now)))
-                            duration_str = format_age(duration_sec)
-                            recovery_text = format_ai_balance_recovery_alert(prov, inc.get("affected_bots", []), duration_str)
-                            pending_notifications[rec_k] = {
-                                "text": recovery_text,
-                                "created_at": now,
-                                "delivered_recipients": [],
-                            }
-                        rec_notif = pending_notifications[rec_k]
-                        rec_delivered = await _deliver_notification(apps, rec_notif, state)
-                        if rec_delivered:
-                            pending_notifications.pop(rec_k, None)
-                            active_incidents.pop(inc_k, None)
+                active_incidents.pop(inc_k, None)
 
         # Remaining non-incident issues (PM2 status stopped, DB errors, auth errors, etc.)
         remaining_issues = []
@@ -1889,11 +1830,6 @@ async def run_check(
                 if single_inc and (should_alert_single_net or int(single_inc.get("last_alerted", 0)) == 0):
                     single_inc["last_alerted"] = now
                     single_inc["alert_count"] = single_inc.get("alert_count", 0) + 1
-            for bal_inc_key in active_bal_keys:
-                bal_inc = active_incidents.get(bal_inc_key)
-                if bal_inc and int(bal_inc.get("last_alerted", 0)) == 0:
-                    bal_inc["last_alerted"] = now
-                    bal_inc["alert_count"] = bal_inc.get("alert_count", 0) + 1
             if should_alert_other:
                 record_alert_delivered(flat_remaining, state)
 
