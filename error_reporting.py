@@ -545,7 +545,15 @@ async def notify_admins_about_error(
     if extra:
         log_lines.append(f"extra={_safe_extra_text(extra)}")
 
-    if exception is not None:
+    from provider_failures import OPERATOR_CLASSES, RETRYABLE_CLASSES
+    is_handled_ai = (
+        classification in (OPERATOR_CLASSES | RETRYABLE_CLASSES)
+        or (provider and stage in ("chat", "vision", "transcription", "image_generation", "image_edit", "ai_provider_fallback", "check_credit_balance"))
+    )
+
+    if is_handled_ai:
+        log.warning(" | ".join(log_lines))
+    elif exception is not None and include_traceback:
         log.log(level, " | ".join(log_lines), exc_info=exception)
     else:
         log.log(level, " | ".join(log_lines))
@@ -605,63 +613,20 @@ async def notify_admins_about_error(
     if trace and trace.strip() and trace.strip() != "NoneType: None":
         message_lines.append(f"Traceback: <code>{html.escape(_shorten(trace, 1800))}</code>")
 
-    if classification == "insufficient_balance_quota" or (
+    if classification in OPERATOR_CLASSES or (
         root_exception is not None and type(root_exception).__name__ == "InsufficientBalanceError"
     ):
-        from ai_incident_manager import (
-            resolve_bot_identifier,
-            get_provider_api_key,
-            get_provider_account_fingerprint,
-            should_alert_provider_incident,
-            format_provider_balance_alert_message,
-            send_provider_incident_message_to_admins,
-            record_provider_incident_alerted,
-        )
-
-        provider_name = (provider or "unknown").strip().upper()
-        bot_id = resolve_bot_identifier(bot)
-
-        account_fp = "default"
+        from ai_incident_manager import record_ai_provider_failure
         try:
-            async with async_session_maker() as session:
-                config = await session.get(AIConfig, 1)
-                if config:
-                    api_key = get_provider_api_key(config, provider_name)
-                    account_fp = get_provider_account_fingerprint(api_key)
-        except Exception as db_exc:
-            log.warning("Could not read AIConfig for fingerprint: %s", db_exc)
-
-        bal_key = f"balance:{bot_id}:{provider_name}:{account_fp}"
-        if not should_alert_provider_incident(bot_id, provider_name, account_fp):
-            log.info(
-                "Suppressed repeated admin notification for %s (%s, fp=%s) due to active cooldown",
-                provider_name,
-                bot_id,
-                account_fp,
+            await record_ai_provider_failure(
+                origin_instance_id=None,
+                provider=provider or "unknown",
+                error=exception or root_exception or Exception(details or title),
+                operation=stage or "chat",
+                model=model,
             )
-            return
-
-        admin_text = format_provider_balance_alert_message(provider_name)
-        admin_ids = await get_all_admin_ids()
-        delivered = await send_provider_incident_message_to_admins(bot, admin_ids, admin_text)
-        if delivered:
-            _insufficient_balance_cooldown.reset(bal_key)
-            _insufficient_balance_cooldown.should_send(bal_key)
-            record_provider_incident_alerted(
-                bot_id,
-                provider_name,
-                account_fp,
-                details={"stage": stage, "error": str(exception or details)},
-            )
-            if provider_name == "KIE":
-                try:
-                    async with async_session_maker() as session:
-                        config = await session.get(AIConfig, 1)
-                        if config and not config.kie_credit_alert_sent:
-                            config.kie_credit_alert_sent = True
-                            await session.commit()
-                except Exception as commit_exc:
-                    log.warning("Could not update kie_credit_alert_sent: %s", commit_exc)
+        except Exception as rec_exc:
+            log.warning("Could not record AI provider failure in incident manager: %s", rec_exc)
         return
 
     admin_text = "\n".join(message_lines)
@@ -679,7 +644,7 @@ _insufficient_balance_cooldown = KeyedAlertCooldown(timedelta(hours=6))
 
 
 def reset_insufficient_balance_cooldown(provider: str | None = None) -> None:
-    """Reset insufficient balance alert cooldown, e.g. after balance replenishment."""
+    """Reset insufficient balance alert cooldown in error_reporting."""
     if provider:
         norm = provider.strip()
         _insufficient_balance_cooldown.reset(f"balance:{norm}")
@@ -687,21 +652,6 @@ def reset_insufficient_balance_cooldown(provider: str | None = None) -> None:
         _insufficient_balance_cooldown.reset(f"balance:{norm.lower()}")
     else:
         _insufficient_balance_cooldown.reset_all()
-
-    try:
-        from ai_incident_manager import clear_all_provider_incidents, load_ai_incident_state, save_ai_incident_state
-        if provider:
-            prov_norm = provider.strip().upper()
-            state = load_ai_incident_state()
-            incidents = state.get("incidents", {})
-            for k in list(incidents.keys()):
-                if f":{prov_norm}:" in k:
-                    incidents[k]["status"] = "resolved"
-            save_ai_incident_state(state)
-        else:
-            clear_all_provider_incidents()
-    except Exception as exc:
-        log.warning("Could not reset ai incident state: %s", exc)
 
 
 def extract_error_metadata(

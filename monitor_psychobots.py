@@ -945,22 +945,6 @@ def is_bot_blocked_or_suspended_log(text: str) -> bool:
     return False
 
 
-def is_ai_balance_issue(issue: str) -> bool:
-    """Detect AI provider balance/quota exhaustion errors."""
-    if not issue or not isinstance(issue, str):
-        return False
-    lower = issue.lower()
-    return (
-        "insufficientbalanceerror" in lower
-        or "credits insufficient" in lower
-        or "current balance isn't enough" in lower
-        or "current balance isn’t enough" in lower
-        or "insufficient_balance" in lower
-        or "credit_balance_exhausted" in lower
-        or "prepayment credits are depleted" in lower
-    )
-
-
 def extract_log_error_summaries(chunk: str) -> list[str]:
     lines = chunk.splitlines()
     summaries: list[str] = []
@@ -997,8 +981,6 @@ def extract_log_error_summaries(chunk: str) -> list[str]:
             if (
                 is_bot_blocked_or_suspended_log(exception_line)
                 or any(is_bot_blocked_or_suspended_log(l) for l in tb_lines)
-                or is_ai_balance_issue(exception_line)
-                or any(is_ai_balance_issue(l) for l in tb_lines)
             ):
                 continue
 
@@ -1017,7 +999,7 @@ def extract_log_error_summaries(chunk: str) -> list[str]:
             continue
 
         if LOG_ERROR_RE.search(line):
-            if not is_bot_blocked_or_suspended_log(line) and not is_ai_balance_issue(line):
+            if not is_bot_blocked_or_suspended_log(line):
                 summaries.append(line)
         i += 1
 
@@ -1227,7 +1209,7 @@ def format_issues_alert(
         lines.append(f"• Статус прокси: {html.escape(proxy_status)}")
 
     for name, issues in all_issues:
-        filtered = [i for i in issues if not is_bot_blocked_or_suspended_log(i) and not is_ai_balance_issue(i)]
+        filtered = [i for i in issues if not is_bot_blocked_or_suspended_log(i)]
         if is_shared_network_active:
             display_issues = [i for i in filtered if not is_telegram_network_issue(i)]
         else:
@@ -1238,53 +1220,6 @@ def format_issues_alert(
             for issue in display_issues[:8]:
                 lines.append(f"• {html.escape(issue)}")
 
-    return "\n".join(lines)
-
-
-def extract_ai_balance_provider(issue: str) -> str:
-    lower = issue.lower()
-    if "kie" in lower:
-        return "KIE"
-    if "openai" in lower:
-        return "OpenAI"
-    if "gemini" in lower:
-        return "Gemini"
-    if "deepseek" in lower:
-        return "DeepSeek"
-    if "claude" in lower or "anthropic" in lower:
-        return "Claude"
-    return "AI"
-
-
-def format_ai_balance_alert(
-    provider: str,
-    affected_bots: list[str],
-) -> str:
-    bot_str = ", ".join(affected_bots)
-    lines = [
-        "🚨 <b>Psychobots monitor detected issues</b>\n",
-        f"⚠️ <b>Недостаточно кредитов AI-провайдера ({html.escape(provider)})</b>",
-        f"• Провайдер: <b>{html.escape(provider)}</b>",
-        f"• Затронуто ботов: {len(affected_bots)} ({html.escape(bot_str)})",
-        "• Ошибка: Credits insufficient. Баланс исчерпан, генерации приостановлены.",
-        f"• Действие: Пополните баланс в личном кабинете {html.escape(provider)}.",
-    ]
-    return "\n".join(lines)
-
-
-def format_ai_balance_recovery_alert(
-    provider: str,
-    affected_bots: list[str],
-    duration_str: str,
-) -> str:
-    bot_str = ", ".join(affected_bots)
-    lines = [
-        f"✅ <b>Восстановление: Баланс {html.escape(provider)} пополнен</b>",
-        f"• Провайдер: <b>{html.escape(provider)}</b>",
-        f"• Восстановлены боты: {len(affected_bots)} ({html.escape(bot_str)})",
-        f"• Длительность инцидента: {duration_str}",
-        "• Работа генераций восстановлена.",
-    ]
     return "\n".join(lines)
 
 
@@ -1557,16 +1492,6 @@ async def run_check(
 
         await check_stuck_dialogues(apps, state, all_issues)
 
-        # Operational AI provider balance issues are handled directly by each bot's
-        # internal incident manager and notified to that bot's administrators.
-        # They must never be alerted in central autobus monitoring.
-        filtered_all_issues = []
-        for name, issues in all_issues:
-            non_ai_issues = [i for i in issues if not is_ai_balance_issue(i)]
-            if non_ai_issues:
-                filtered_all_issues.append((name, non_ai_issues))
-        all_issues = filtered_all_issues
-
         telegram_apps = [a for a in apps if a.get("platform") == "telegram" or a.get("token")]
         active_incidents = state.setdefault("active_incidents", {})
         polling_failures = state.setdefault("polling_failure_counts", {})
@@ -1784,7 +1709,6 @@ async def run_check(
             display_issues = [
                 i for i in issues
                 if not is_telegram_network_issue(i)
-                and not is_ai_balance_issue(i)
                 and not is_bot_blocked_or_suspended_log(i)
             ]
             if display_issues:

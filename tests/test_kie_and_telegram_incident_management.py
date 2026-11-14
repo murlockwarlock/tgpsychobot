@@ -1,390 +1,604 @@
+"""Comprehensive integration tests for unified database-backed AI incident management,
+outbox delivery, companion routing, and Autobus infrastructure isolation.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import os
+import time
 from datetime import datetime, timedelta
-import html
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-import aiohttp
 import pytest
+import pytest_asyncio
 from aiogram import Bot
 from aiogram.methods import SendMessage
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.dialects import postgresql, sqlite
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.schema import CreateIndex, CreateTable
 
-import alert_cooldown
-import error_reporting
 import monitor_psychobots as monitor
 import scheduler
-from database import AIConfig
 from ai_incident_manager import (
-    load_ai_incident_state,
-    save_ai_incident_state,
-    get_active_provider_incidents,
-    is_provider_incident_active,
+    DEFAULT_REPEAT_ALERT_SECONDS,
+    _format_incident_message_text,
+    check_incident_repeat_reminders,
     get_provider_account_fingerprint,
-    record_provider_incident_alerted,
-    record_provider_incident_recovered,
-    clear_all_provider_incidents,
-    format_provider_balance_alert_message,
-    format_provider_recovery_message,
+    handle_key_rotation,
+    process_ai_incident_notifications,
+    record_ai_operation_success,
+    record_ai_provider_failure,
 )
+from database import (
+    AIConfig,
+    AIIncidentNotificationModel,
+    AIProviderIncidentModel,
+    Base,
+    User,
+)
+from ai_integration import AIServiceError, InsufficientBalanceError
+from provider_failures import ProviderFailure
 
 
-class MockSessionContext:
-    def __init__(self, config):
-        self.config = config
+@pytest_asyncio.fixture
+async def test_db_session_maker(tmp_path):
+    """Provide an isolated SQLite database session maker for integration tests."""
+    db_file = tmp_path / "test_incident.db"
+    db_url = f"sqlite+aiosqlite:///{db_file}"
+    engine = create_async_engine(db_url, echo=False)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
-    async def __aenter__(self):
-        return self
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
-    async def __aexit__(self, *args):
-        pass
+    # Seed AIConfig
+    async with session_maker() as session:
+        ai_cfg = AIConfig(
+            id=1,
+            provider="Gemini",
+            gemini_api_key="gem_test_key_1",
+            image_generation_provider="KIE",
+            kie_api_key="kie_secret_key_1",
+            kie_credit_alert_threshold=2.0,
+            kie_credit_alert_sent=False,
+            allow_fallback=True,
+            fallback_provider="OpenAI",
+            openai_api_key="openai_test_key_1",
+        )
+        session.add(ai_cfg)
+        await session.commit()
 
-    async def get(self, model, id_val):
-        if model == AIConfig:
-            return self.config
+    yield session_maker
+    await engine.dispose()
+
+
+def test_schema_ddl_compilation_sqlite_and_postgresql():
+    """Verify DDL compilation and partial index definitions for SQLite and PostgreSQL."""
+    sq_engine = create_engine("sqlite:///:memory:")
+    pg_dialect = postgresql.dialect()
+
+    # AIProviderIncidentModel DDL
+    inc_table = AIProviderIncidentModel.__table__
+    inc_ddl_sqlite = str(CreateTable(inc_table).compile(sq_engine))
+    inc_ddl_pg = str(CreateTable(inc_table).compile(dialect=pg_dialect))
+    assert "ai_provider_incidents" in inc_ddl_sqlite
+    assert "ai_provider_incidents" in inc_ddl_pg
+
+    # Check partial unique index on PostgreSQL
+    for idx in inc_table.indexes:
+        if idx.name == "uq_active_ai_incident":
+            compiled_pg = str(CreateIndex(idx).compile(dialect=pg_dialect))
+            assert "WHERE status = 'active'" in compiled_pg
+            assert "UNIQUE" in compiled_pg
+
+    # AIIncidentNotificationModel DDL
+    notif_table = AIIncidentNotificationModel.__table__
+    notif_ddl_sqlite = str(CreateTable(notif_table).compile(sq_engine))
+    notif_ddl_pg = str(CreateTable(notif_table).compile(dialect=pg_dialect))
+    assert "ai_incident_notifications" in notif_ddl_sqlite
+    assert "ai_incident_notifications" in notif_ddl_pg
+
+
+@pytest.mark.asyncio
+async def test_scenario_1_scheduler_soft_warning_low_balance(test_db_session_maker, monkeypatch):
+    """Scenario 1: Scheduler balance check triggers soft warning, not long-lived operational incident."""
+    bot = AsyncMock(spec=Bot)
+    bot.send_message = AsyncMock(return_value=True)
+
+    monkeypatch.setattr(scheduler, "async_session_maker", test_db_session_maker)
+    monkeypatch.setattr(scheduler, "get_kie_remaining_credits", AsyncMock(return_value=1.50))
+    monkeypatch.setattr(scheduler, "get_all_admin_ids", AsyncMock(return_value=[1001]))
+
+    # Run check
+    await scheduler.check_kie_credit_balance(bot)
+
+    # Soft warning was sent to admin 1001
+    assert bot.send_message.call_count == 1
+    call_args = bot.send_message.call_args[0]
+    assert call_args[0] == 1001
+    assert "Предупреждение KIE" in call_args[1]
+    assert "1.50" in call_args[1]
+
+    # Verify no row in ai_provider_incidents was opened
+    async with test_db_session_maker() as session:
+        incidents = (await session.execute(select(AIProviderIncidentModel))).scalars().all()
+        assert len(incidents) == 0
+
+
+@pytest.mark.asyncio
+async def test_scenario_2_provider_failure_opens_db_incident_and_enqueues_outbox(test_db_session_maker, monkeypatch):
+    """Scenario 2: Provider failure opens active incident in DB and creates outbox notification rows."""
+    inst_def = {"pm2_name": "tg_someonewithyou01_bot_new", "platform": "telegram", "admins": [272982544]}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda i: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[272982544]))
+
+    err = InsufficientBalanceError("KIE credits exhausted: payment required")
+    err.provider = "KIE"
+    err.http_status = 402
+    err.failure = ProviderFailure(
+        provider="KIE",
+        operation="image_generation",
+        classification="insufficient_balance_quota",
+        detail_code="credits_exhausted",
+        http_status=402,
+        operator_action_required=True,
+    )
+
+    inc = await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        error=err,
+        operation="image_generation",
+        model="seedream-v4",
+        session_maker=test_db_session_maker,
+    )
+
+    assert inc is not None
+    assert inc.status == "active"
+    assert inc.occurrence_count == 1
+    assert inc.provider == "KIE"
+    assert inc.operation == "image_generation"
+
+    # Verify outbox row created
+    async with test_db_session_maker() as session:
+        notifs = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        assert len(notifs) == 1
+        n = notifs[0]
+        assert n.recipient_id == 272982544
+        assert n.status == "pending"
+        assert n.event_type == "opened"
+        assert n.authorized_instance_id == "tg_someonewithyou01_bot_new"
+        assert "Сбой AI-провайдера" in n.message_text
+        assert "KIE" in n.message_text
+        assert "Требуется вмешательство оператора" in n.message_text
+
+
+@pytest.mark.asyncio
+async def test_scenario_3_shared_db_max_companion_isolation(test_db_session_maker, monkeypatch):
+    """Scenario 3: Shared DB: MAX registers incident, Telegram companion delivers notification."""
+    tg_inst = {"pm2_name": "tg_veraveda777_bot_legacy", "platform": "telegram", "admins": [777]}
+    max_inst = {"pm2_name": "max_se13639182_bot_legacy", "platform": "max", "companion_pm2_name": "tg_veraveda777_bot_legacy"}
+
+    def mock_get_inst(name):
+        if name == "tg_veraveda777_bot_legacy":
+            return tg_inst
+        if name == "max_se13639182_bot_legacy":
+            return max_inst
         return None
 
-    async def commit(self):
-        pass
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", mock_get_inst)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: tg_inst if s["platform"] == "max" else s)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[777]))
 
-
-@pytest.mark.asyncio
-async def test_scenario_1_bot_a_low_balance_alert(monkeypatch, tmp_path):
-    """Scenario 1: Bot A with key KIE-A and balance 1.91 alerts Bot A admins from Bot A."""
-    incident_file = str(tmp_path / "ai_incidents.json")
-    monkeypatch.setenv("PSYCHOBOTS_AI_INCIDENT_STATE", incident_file)
-
-    config_a = AIConfig(
-        id=1,
-        provider="Gemini",
-        image_generation_provider="KIE",
-        kie_api_key="kie_secret_key_a",
-        kie_credit_alert_threshold=2.0,
-        kie_credit_alert_sent=False,
-    )
-    monkeypatch.setattr(scheduler, "async_session_maker", lambda: MockSessionContext(config_a))
-    monkeypatch.setattr(scheduler, "get_kie_remaining_credits", AsyncMock(return_value=1.91))
-    monkeypatch.setattr(scheduler, "get_all_admin_ids", AsyncMock(return_value=[111]))
-
-    bot_a = AsyncMock(spec=Bot)
-    bot_a.token = "1111:AA"
-    bot_a.send_message = AsyncMock(return_value=True)
-
-    await scheduler.check_kie_credit_balance(bot_a)
-
-    assert bot_a.send_message.call_count == 1
-    call_args = bot_a.send_message.call_args
-    assert call_args[0][0] == 111
-    text = call_args[0][1]
-    assert "Низкий баланс KIE" in text
-    assert "1,91" in text
-    assert "пополнить баланс KIE" in text
-    assert "Traceback" not in text
-    assert config_a.kie_credit_alert_sent is True
-
-    # Check incident state on disk
-    active = get_active_provider_incidents()
-    assert len(active) == 1
-    key = list(active.keys())[0]
-    assert "bot_1111:KIE:" in key
-
-
-@pytest.mark.asyncio
-async def test_scenario_2_bot_b_sufficient_balance_no_alert(monkeypatch, tmp_path):
-    """Scenario 2: Bot B with key KIE-B and balance 50.0 sends no alert and creates no incident."""
-    incident_file = str(tmp_path / "ai_incidents.json")
-    monkeypatch.setenv("PSYCHOBOTS_AI_INCIDENT_STATE", incident_file)
-
-    config_b = AIConfig(
-        id=1,
-        provider="Gemini",
-        image_generation_provider="KIE",
-        kie_api_key="kie_secret_key_b",
-        kie_credit_alert_threshold=2.0,
-        kie_credit_alert_sent=False,
-    )
-    monkeypatch.setattr(scheduler, "async_session_maker", lambda: MockSessionContext(config_b))
-    monkeypatch.setattr(scheduler, "get_kie_remaining_credits", AsyncMock(return_value=50.0))
-    monkeypatch.setattr(scheduler, "get_all_admin_ids", AsyncMock(return_value=[222]))
-
-    bot_b = AsyncMock(spec=Bot)
-    bot_b.token = "2222:BB"
-    bot_b.send_message = AsyncMock()
-
-    await scheduler.check_kie_credit_balance(bot_b)
-
-    assert bot_b.send_message.call_count == 0
-    assert config_b.kie_credit_alert_sent is False
-    assert len(get_active_provider_incidents()) == 0
-
-
-@pytest.mark.asyncio
-async def test_scenario_3_and_4_shared_key_admin_isolation(monkeypatch, tmp_path):
-    """Scenarios 3 & 4: Bots A & C share KIE-A key; alerts route strictly to respective admins, no cross-leak."""
-    incident_file = str(tmp_path / "ai_incidents.json")
-    monkeypatch.setenv("PSYCHOBOTS_AI_INCIDENT_STATE", incident_file)
-
-    shared_key = "kie_shared_secret_123"
-
-    config_a = AIConfig(id=1, provider="Gemini", image_generation_provider="KIE", kie_api_key=shared_key)
-    config_c = AIConfig(id=1, provider="Gemini", image_generation_provider="KIE", kie_api_key=shared_key)
-
-    bot_a = AsyncMock(spec=Bot)
-    bot_a.token = "1111:AA"
-    bot_a.send_message = AsyncMock(return_value=True)
-
-    bot_c = AsyncMock(spec=Bot)
-    bot_c.token = "3333:CC"
-    bot_c.send_message = AsyncMock(return_value=True)
-
-    class InsufficientBalanceError(Exception):
-        pass
-
-    exc = InsufficientBalanceError("KIE task creation failed: Credits insufficient.")
-
-    # 1. Bot A encounters error during generation
-    monkeypatch.setattr(error_reporting, "async_session_maker", lambda: MockSessionContext(config_a))
-    monkeypatch.setattr(error_reporting, "get_all_admin_ids", AsyncMock(return_value=[101]))
-
-    await error_reporting.notify_admins_about_error(
-        bot_a,
-        title="Сбой генерации",
+    # Failure occurs in MAX bot
+    err = InsufficientBalanceError("KIE credits insufficient")
+    err.provider = "KIE"
+    err.failure = ProviderFailure(
         provider="KIE",
-        stage="generate_image",
-        classification_override="insufficient_balance_quota",
-        exception=exc,
+        operation="chat",
+        classification="insufficient_balance_quota",
+        detail_code="credits_exhausted",
+        operator_action_required=True,
     )
 
-    # Bot A delivered to its admin 101 from bot_a
-    assert bot_a.send_message.call_count == 1
-    assert bot_a.send_message.call_args[0][0] == 101
-    assert bot_c.send_message.call_count == 0
-
-    # 2. Bot C encounters error during generation
-    monkeypatch.setattr(error_reporting, "async_session_maker", lambda: MockSessionContext(config_c))
-    monkeypatch.setattr(error_reporting, "get_all_admin_ids", AsyncMock(return_value=[303]))
-
-    await error_reporting.notify_admins_about_error(
-        bot_c,
-        title="Сбой генерации",
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: max_inst)
+    inc = await record_ai_provider_failure(
+        origin_instance_id="max_se13639182_bot_legacy",
         provider="KIE",
-        stage="generate_image",
-        classification_override="insufficient_balance_quota",
-        exception=exc,
+        error=err,
+        operation="chat",
+        model="gpt-4o",
+        session_maker=test_db_session_maker,
     )
+    assert inc is not None
+    assert inc.origin_instance_id == "max_se13639182_bot_legacy"
+    assert inc.companion_instance_id == "tg_veraveda777_bot_legacy"
 
-    # Bot C delivered to its admin 303 from bot_c
-    assert bot_c.send_message.call_count == 1
-    assert bot_c.send_message.call_args[0][0] == 303
-    # Bot A received no additional calls
-    assert bot_a.send_message.call_count == 1
+    # Outbox notification was assigned to authorized_instance_id == 'tg_veraveda777_bot_legacy'
+    async with test_db_session_maker() as session:
+        notif = (await session.execute(select(AIIncidentNotificationModel))).scalar_one()
+        assert notif.authorized_instance_id == "tg_veraveda777_bot_legacy"
 
-    # 3. Subsequent errors on both bots are suppressed by cooldown
-    await error_reporting.notify_admins_about_error(bot_a, title="Сбой", provider="KIE", stage="gen", classification_override="insufficient_balance_quota", exception=exc)
-    await error_reporting.notify_admins_about_error(bot_c, title="Сбой", provider="KIE", stage="gen", classification_override="insufficient_balance_quota", exception=exc)
-    assert bot_a.send_message.call_count == 1
-    assert bot_c.send_message.call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_scenario_5_repeated_generation_errors_suppressed(monkeypatch, tmp_path):
-    """Scenario 5: 10 repeated generation errors result in exactly 1 alert."""
-    incident_file = str(tmp_path / "ai_incidents.json")
-    monkeypatch.setenv("PSYCHOBOTS_AI_INCIDENT_STATE", incident_file)
-
-    config = AIConfig(id=1, provider="Gemini", image_generation_provider="KIE", kie_api_key="kie_key_scenario_5")
-    monkeypatch.setattr(error_reporting, "async_session_maker", lambda: MockSessionContext(config))
-    monkeypatch.setattr(error_reporting, "get_all_admin_ids", AsyncMock(return_value=[999]))
-
+    # 1. MAX worker runs -> claims 0 because it's not authorized
     bot = AsyncMock(spec=Bot)
-    bot.token = "5555:TT"
     bot.send_message = AsyncMock(return_value=True)
+    delivered_max = await process_ai_incident_notifications(bot=bot, session_maker=test_db_session_maker)
+    assert delivered_max == 0
+    assert bot.send_message.call_count == 0
 
-    class InsufficientBalanceError(Exception):
-        pass
+    # 2. Telegram companion worker runs -> claims and delivers
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: tg_inst)
+    delivered_tg = await process_ai_incident_notifications(bot=bot, session_maker=test_db_session_maker)
+    assert delivered_tg == 1
+    assert bot.send_message.call_count == 1
+    assert bot.send_message.call_args[0][0] == 777
 
-    exc = InsufficientBalanceError("KIE task creation failed: Credits insufficient.")
+    # Status updated to delivered
+    async with test_db_session_maker() as session:
+        notif_after = (await session.execute(select(AIIncidentNotificationModel))).scalar_one()
+        assert notif_after.status == "delivered"
 
-    for _ in range(10):
-        await error_reporting.notify_admins_about_error(
-            bot,
-            title="Сбой генерации",
-            provider="KIE",
-            stage="generate_image",
-            classification_override="insufficient_balance_quota",
-            exception=exc,
+
+@pytest.mark.asyncio
+async def test_scenario_4_concurrent_failure_recording_atomic(test_db_session_maker, monkeypatch):
+    """Scenario 4: Concurrent failure recording atomic UPSERT and counter increment."""
+    inst_def = {"pm2_name": "tg_bot_conc", "platform": "telegram", "admins": [888]}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[888]))
+
+    err = InsufficientBalanceError("Quota exceeded")
+    err.provider = "Gemini"
+    err.failure = ProviderFailure(
+        provider="Gemini",
+        operation="chat",
+        classification="insufficient_balance_quota",
+        detail_code="quota_exceeded",
+        operator_action_required=True,
+    )
+
+    # 5 concurrent tasks
+    async def record():
+        return await record_ai_provider_failure(
+            origin_instance_id="tg_bot_conc",
+            provider="Gemini",
+            error=err,
+            operation="chat",
+            model="gemini-2.5-pro",
+            session_maker=test_db_session_maker,
         )
 
-    assert bot.send_message.call_count == 1
+    results = await asyncio.gather(*(record() for _ in range(5)))
+    assert all(r is not None for r in results)
+
+    # Verify exactly 1 active incident row exists
+    async with test_db_session_maker() as session:
+        incidents = (await session.execute(select(AIProviderIncidentModel))).scalars().all()
+        assert len(incidents) == 1
+        assert incidents[0].occurrence_count == 5
+
+        # Only 1 notification enqueued for cycle 0
+        notifs = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        assert len(notifs) == 1
 
 
 @pytest.mark.asyncio
-async def test_scenario_6_process_restart_persistence(monkeypatch, tmp_path):
-    """Scenario 6: Bot restart preserves incident state from disk without re-alerting."""
-    incident_file = str(tmp_path / "ai_incidents.json")
-    monkeypatch.setenv("PSYCHOBOTS_AI_INCIDENT_STATE", incident_file)
+async def test_scenario_5_dynamic_admin_permissions_revocation(test_db_session_maker, monkeypatch):
+    """Scenario 5: Pre-send dynamic permission check drops revoked admins as failed_terminal."""
+    inst_def = {"pm2_name": "tg_bot_perm", "platform": "telegram", "admins": [999]}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[999]))
 
-    config = AIConfig(id=1, provider="Gemini", image_generation_provider="KIE", kie_api_key="kie_key_scenario_6")
-    monkeypatch.setattr(error_reporting, "async_session_maker", lambda: MockSessionContext(config))
-    monkeypatch.setattr(error_reporting, "get_all_admin_ids", AsyncMock(return_value=[999]))
+    err = InsufficientBalanceError("Out of balance")
+    err.provider = "KIE"
+    err.failure = ProviderFailure(provider="KIE", operation="chat", classification="insufficient_balance_quota", detail_code="credits_exhausted", operator_action_required=True)
+
+    await record_ai_provider_failure(
+        origin_instance_id="tg_bot_perm",
+        provider="KIE",
+        error=err,
+        operation="chat",
+        model="*",
+        session_maker=test_db_session_maker,
+    )
+
+    # Now admin 999 is revoked before dispatch
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[]))
 
     bot = AsyncMock(spec=Bot)
-    bot.token = "6666:TT"
-    bot.send_message = AsyncMock(return_value=True)
-
-    class InsufficientBalanceError(Exception):
-        pass
-
-    exc = InsufficientBalanceError("KIE task creation failed: Credits insufficient.")
-
-    # 1. Initial alert
-    await error_reporting.notify_admins_about_error(bot, title="Сбой", provider="KIE", stage="gen", classification_override="insufficient_balance_quota", exception=exc)
-    assert bot.send_message.call_count == 1
-
-    # 2. Simulate process restart: reset in-memory cooldown cache
-    error_reporting._insufficient_balance_cooldown.reset_all()
-
-    # 3. Next generation failure occurs after restart
-    await error_reporting.notify_admins_about_error(bot, title="Сбой", provider="KIE", stage="gen", classification_override="insufficient_balance_quota", exception=exc)
-    # Disk state prevented duplicate alert!
-    assert bot.send_message.call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_scenario_7_balance_remains_low_6h_reminder(monkeypatch, tmp_path):
-    """Scenario 7: Balance remains low; incident stays active and sends reminder after 6 hours."""
-    incident_file = str(tmp_path / "ai_incidents.json")
-    monkeypatch.setenv("PSYCHOBOTS_AI_INCIDENT_STATE", incident_file)
-
-    now = int(datetime.now().timestamp())
-    bot = AsyncMock(spec=Bot)
-    bot.token = "1111:AA"
-    bot.send_message = AsyncMock(return_value=True)
-
-    config = AIConfig(id=1, provider="Gemini", image_generation_provider="KIE", kie_api_key="kie_key_a", kie_credit_alert_threshold=2.0, kie_credit_alert_sent=True)
-    monkeypatch.setattr(scheduler, "async_session_maker", lambda: MockSessionContext(config))
-    monkeypatch.setattr(scheduler, "get_kie_remaining_credits", AsyncMock(return_value=1.5))
-    monkeypatch.setattr(scheduler, "get_all_admin_ids", AsyncMock(return_value=[111]))
-
-    # Seed active incident alerted 1 hour ago
-    fp = get_provider_account_fingerprint("kie_key_a")
-    record_provider_incident_alerted("bot_1111", "KIE", fp, now=now - 3600)
-
-    # 1. Run at +1 hour: no reminder yet
-    await scheduler.check_kie_credit_balance(bot)
+    delivered = await process_ai_incident_notifications(bot=bot, session_maker=test_db_session_maker)
+    assert delivered == 0
     assert bot.send_message.call_count == 0
 
-    # 2. Update state to 7 hours ago (> 6h cooldown)
-    record_provider_incident_alerted("bot_1111", "KIE", fp, now=now - 7 * 3600)
-
-    # 3. Run at +7 hours: reminder sent!
-    await scheduler.check_kie_credit_balance(bot)
-    assert bot.send_message.call_count == 1
-    assert "Низкий баланс KIE" in bot.send_message.call_args[0][1]
-    assert is_provider_incident_active("bot_1111", "KIE", fp) is True
+    async with test_db_session_maker() as session:
+        notif = (await session.execute(select(AIIncidentNotificationModel))).scalar_one()
+        assert notif.status == "failed_terminal"
+        assert notif.last_error == "recipient_permission_revoked_or_invalid"
 
 
 @pytest.mark.asyncio
-async def test_scenario_8_balance_restoration_resolves_incident(monkeypatch, tmp_path):
-    """Scenario 8: Confirmed balance check restores balance and resolves incident."""
-    incident_file = str(tmp_path / "ai_incidents.json")
-    monkeypatch.setenv("PSYCHOBOTS_AI_INCIDENT_STATE", incident_file)
+async def test_scenario_6_cas_lease_backoff_and_terminal_error(test_db_session_maker, monkeypatch):
+    """Scenario 6: CAS lease retry backoff on transient error, failed_terminal on blocked bot."""
+    from aiogram.exceptions import TelegramForbiddenError
 
-    now = int(datetime.now().timestamp())
-    bot = AsyncMock(spec=Bot)
-    bot.token = "1111:AA"
-    bot.send_message = AsyncMock(return_value=True)
+    inst_def = {"pm2_name": "tg_bot_lease", "platform": "telegram", "admins": [555]}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[555]))
 
-    config = AIConfig(id=1, provider="Gemini", image_generation_provider="KIE", kie_api_key="kie_key_a", kie_credit_alert_threshold=2.0, kie_credit_alert_sent=True)
-    monkeypatch.setattr(scheduler, "async_session_maker", lambda: MockSessionContext(config))
-    monkeypatch.setattr(scheduler, "get_kie_remaining_credits", AsyncMock(return_value=50.0))
-    monkeypatch.setattr(scheduler, "get_all_admin_ids", AsyncMock(return_value=[111]))
+    err = InsufficientBalanceError("Balance zero")
+    err.provider = "KIE"
+    err.failure = ProviderFailure(provider="KIE", operation="chat", classification="insufficient_balance_quota", detail_code="credits_exhausted", operator_action_required=True)
 
-    fp = get_provider_account_fingerprint("kie_key_a")
-    record_provider_incident_alerted("bot_1111", "KIE", fp, now=now)
-
-    # Balance check detects 50.0 >= 2.0
-    await scheduler.check_kie_credit_balance(bot)
-
-    assert bot.send_message.call_count == 1
-    text = bot.send_message.call_args[0][1]
-    assert "Баланс KIE восстановлен" in text
-    assert "50" in text
-    assert "Генерация и редактирование изображений снова доступны." in text
-    assert config.kie_credit_alert_sent is False
-    assert is_provider_incident_active("bot_1111", "KIE", fp) is False
-
-
-@pytest.mark.asyncio
-async def test_scenario_9_balance_api_down_forbids_false_recovery(monkeypatch, tmp_path):
-    """Scenario 9: If balance check API fails, false recovery is forbidden and incident stays active."""
-    incident_file = str(tmp_path / "ai_incidents.json")
-    monkeypatch.setenv("PSYCHOBOTS_AI_INCIDENT_STATE", incident_file)
-
-    now = int(datetime.now().timestamp())
-    bot = AsyncMock(spec=Bot)
-    bot.token = "1111:AA"
-    bot.send_message = AsyncMock(return_value=True)
-
-    config = AIConfig(id=1, provider="Gemini", image_generation_provider="KIE", kie_api_key="kie_key_a", kie_credit_alert_threshold=2.0, kie_credit_alert_sent=True)
-    monkeypatch.setattr(scheduler, "async_session_maker", lambda: MockSessionContext(config))
-
-    from ai_integration import AIServiceError
-    monkeypatch.setattr(scheduler, "get_kie_remaining_credits", AsyncMock(side_effect=AIServiceError("503 Service Unavailable")))
-    monkeypatch.setattr(scheduler, "get_all_admin_ids", AsyncMock(return_value=[111]))
-
-    fp = get_provider_account_fingerprint("kie_key_a")
-    record_provider_incident_alerted("bot_1111", "KIE", fp, now=now)
-
-    await scheduler.check_kie_credit_balance(bot)
-
-    # NO false recovery alert sent!
-    assert bot.send_message.call_count == 0
-    assert config.kie_credit_alert_sent is True
-    # Incident MUST REMAIN ACTIVE!
-    assert is_provider_incident_active("bot_1111", "KIE", fp) is True
-
-
-@pytest.mark.asyncio
-async def test_scenario_10_telegram_delivery_failure_safe_retry(monkeypatch, tmp_path):
-    """Scenario 10: If Telegram delivery fails, delivery is unconfirmed and retried safely."""
-    incident_file = str(tmp_path / "ai_incidents.json")
-    monkeypatch.setenv("PSYCHOBOTS_AI_INCIDENT_STATE", incident_file)
-
-    config = AIConfig(id=1, provider="Gemini", image_generation_provider="KIE", kie_api_key="kie_key_scenario_10")
-    monkeypatch.setattr(error_reporting, "async_session_maker", lambda: MockSessionContext(config))
-    monkeypatch.setattr(error_reporting, "get_all_admin_ids", AsyncMock(return_value=[111]))
+    await record_ai_provider_failure(
+        origin_instance_id="tg_bot_lease",
+        provider="KIE",
+        error=err,
+        operation="chat",
+        session_maker=test_db_session_maker,
+    )
 
     bot = AsyncMock(spec=Bot)
-    bot.token = "1010:AA"
-    # Attempt 1: Telegram fails (e.g. 502 / network error)
-    bot.send_message = AsyncMock(side_effect=Exception("Telegram 502 Bad Gateway"))
+    # 1. Transient error on send
+    bot.send_message = AsyncMock(side_effect=Exception("Connection reset by peer"))
+    delivered = await process_ai_incident_notifications(bot=bot, session_maker=test_db_session_maker)
+    assert delivered == 0
 
-    class InsufficientBalanceError(Exception):
-        pass
+    async with test_db_session_maker() as session:
+        notif = (await session.execute(select(AIIncidentNotificationModel))).scalar_one()
+        assert notif.status == "pending"
+        assert notif.attempts == 1
+        assert notif.next_retry_at > datetime.utcnow()
 
-    exc = InsufficientBalanceError("Credits insufficient.")
+        # Simulate time passing to retry
+        notif.next_retry_at = datetime.utcnow() - timedelta(seconds=1)
+        await session.commit()
 
-    await error_reporting.notify_admins_about_error(bot, title="Сбой", provider="KIE", stage="gen", classification_override="insufficient_balance_quota", exception=exc)
-    fp = get_provider_account_fingerprint("kie_key_scenario_10")
-    # Incident is not confirmed delivered
-    assert is_provider_incident_active("bot_1010", "KIE", fp) is False
+    # 2. Terminal error (bot blocked)
+    bot.send_message = AsyncMock(side_effect=TelegramForbiddenError(method=SendMessage(chat_id=555, text=""), message="bot was blocked by the user"))
+    delivered = await process_ai_incident_notifications(bot=bot, session_maker=test_db_session_maker)
+    assert delivered == 0
 
-    # Attempt 2: Telegram succeeds
-    bot.send_message = AsyncMock(return_value=True)
-    await error_reporting.notify_admins_about_error(bot, title="Сбой", provider="KIE", stage="gen", classification_override="insufficient_balance_quota", exception=exc)
-    assert bot.send_message.call_count == 1
-    assert is_provider_incident_active("bot_1010", "KIE", fp) is True
+    async with test_db_session_maker() as session:
+        notif = (await session.execute(select(AIIncidentNotificationModel))).scalar_one()
+        assert notif.status == "failed_terminal"
+        assert notif.attempts == 2
 
 
 @pytest.mark.asyncio
-async def test_scenario_11_autobus_isolation_no_kie_balance_alerts(monkeypatch, tmp_path):
-    """Scenario 11: KIE balance errors are completely absent from central autobus monitoring."""
+async def test_scenario_7_key_rotation_supersedes_incidents_without_false_alert(test_db_session_maker, monkeypatch):
+    """Scenario 7: Key rotation supersedes old incidents and cancels outbox without false replenishment alerts."""
+    inst_def = {"pm2_name": "tg_bot_rot", "platform": "telegram", "admins": [333]}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[333]))
+
+    err = InsufficientBalanceError("Balance zero")
+    err.provider = "KIE"
+    err.failure = ProviderFailure(provider="KIE", operation="chat", classification="insufficient_balance_quota", detail_code="credits_exhausted", operator_action_required=True)
+
+    await record_ai_provider_failure(
+        origin_instance_id="tg_bot_rot",
+        provider="KIE",
+        error=err,
+        operation="chat",
+        credential_scope="old_fingerprint",
+        session_maker=test_db_session_maker,
+    )
+
+    # Admin rotates key to "new_fresh_key"
+    superseded = await handle_key_rotation(
+        origin_instance_id="tg_bot_rot",
+        provider="KIE",
+        new_key="new_fresh_key",
+        session_maker=test_db_session_maker,
+    )
+    assert superseded == 1
+
+    async with test_db_session_maker() as session:
+        inc = (await session.execute(select(AIProviderIncidentModel))).scalar_one()
+        assert inc.status == "superseded"
+
+        notif = (await session.execute(select(AIIncidentNotificationModel))).scalar_one()
+        assert notif.status == "cancelled"
+        assert notif.last_error == "superseded_by_key_rotation"
+
+        # No 'resolved' alerts were enqueued!
+        all_notifs = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        assert all(n.event_type != "resolved" for n in all_notifs)
+
+
+@pytest.mark.asyncio
+async def test_scenario_8_operational_recovery_scope_isolation(test_db_session_maker, monkeypatch):
+    """Scenario 8: Chat operational success does NOT close image_generation incident."""
+    inst_def = {"pm2_name": "tg_bot_scope", "platform": "telegram", "admins": [444]}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[444]))
+
+    fp = get_provider_account_fingerprint("kie_secret_key_1")
+
+    # Image gen fails with quota error
+    err = InsufficientBalanceError("KIE credits insufficient")
+    err.provider = "KIE"
+    err.failure = ProviderFailure(provider="KIE", operation="image_generation", classification="insufficient_balance_quota", detail_code="credits_exhausted", operator_action_required=True)
+    await record_ai_provider_failure(
+        origin_instance_id="tg_bot_scope",
+        provider="KIE",
+        error=err,
+        operation="image_generation",
+        model="seedream-v4",
+        credential_scope=fp,
+        session_maker=test_db_session_maker,
+    )
+
+    # Operational call succeeds on 'chat'
+    resolved_chat = await record_ai_operation_success(
+        origin_instance_id="tg_bot_scope",
+        provider="KIE",
+        credential_scope=fp,
+        operation="chat",
+        model="gpt-4o",
+        session_maker=test_db_session_maker,
+    )
+    assert resolved_chat is False  # Did NOT resolve image_generation!
+
+    async with test_db_session_maker() as session:
+        inc = (await session.execute(select(AIProviderIncidentModel))).scalar_one()
+        assert inc.status == "active"
+
+    # Operational call succeeds on 'image_generation'
+    resolved_img = await record_ai_operation_success(
+        origin_instance_id="tg_bot_scope",
+        provider="KIE",
+        credential_scope=fp,
+        operation="image_generation",
+        model="seedream-v4",
+        session_maker=test_db_session_maker,
+    )
+    assert resolved_img is True  # Successfully resolved!
+
+    async with test_db_session_maker() as session:
+        inc = (await session.execute(select(AIProviderIncidentModel))).scalar_one()
+        assert inc.status == "resolved"
+
+        # Resolved notification was enqueued
+        resolved_notif = (
+            await session.execute(
+                select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.event_type == "resolved")
+            )
+        ).scalar_one_or_none()
+        assert resolved_notif is not None
+        assert "AI-провайдер восстановил работу" in resolved_notif.message_text
+
+
+@pytest.mark.asyncio
+async def test_scenario_9_transcription_fallback_isolation(test_db_session_maker, monkeypatch):
+    """Scenario 9: Primary KIE transcription failure stays active when OpenAI fallback succeeds."""
+    inst_def = {"pm2_name": "tg_bot_stt", "platform": "telegram", "admins": [123]}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[123]))
+
+    kie_fp = get_provider_account_fingerprint("kie_secret_key_1")
+    oai_fp = get_provider_account_fingerprint("openai_test_key_1")
+
+    # KIE fails on transcription
+    kie_err = InsufficientBalanceError("KIE credits insufficient")
+    kie_err.provider = "KIE"
+    kie_err.failure = ProviderFailure(provider="KIE", operation="transcription", classification="insufficient_balance_quota", detail_code="credits_exhausted", operator_action_required=True)
+
+    await record_ai_provider_failure(
+        origin_instance_id="tg_bot_stt",
+        provider="KIE",
+        error=kie_err,
+        operation="transcription",
+        model="elevenlabs/speech-to-text",
+        fallback_provider="OpenAI",
+        fallback_model="whisper-1",
+        fallback_succeeded=True,
+        credential_scope=kie_fp,
+        session_maker=test_db_session_maker,
+    )
+
+    # Fallback OpenAI Whisper succeeds
+    await record_ai_operation_success(
+        origin_instance_id="tg_bot_stt",
+        provider="OpenAI",
+        credential_scope=oai_fp,
+        operation="transcription",
+        model="whisper-1",
+        session_maker=test_db_session_maker,
+    )
+
+    # Verify KIE transcription incident is STILL ACTIVE!
+    async with test_db_session_maker() as session:
+        inc = (
+            await session.execute(
+                select(AIProviderIncidentModel).where(AIProviderIncidentModel.provider == "KIE")
+            )
+        ).scalar_one()
+        assert inc.status == "active"
+        assert inc.operation == "transcription"
+
+
+@pytest.mark.asyncio
+async def test_scenario_10_repeat_reminder_cycle(test_db_session_maker, monkeypatch):
+    """Scenario 10: Repeat reminder cycle CAS check and notification enqueue."""
+    inst_def = {"pm2_name": "tg_bot_rem", "platform": "telegram", "admins": [666]}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[666]))
+
+    err = InsufficientBalanceError("Out of credits")
+    err.provider = "KIE"
+    err.failure = ProviderFailure(provider="KIE", operation="chat", classification="insufficient_balance_quota", detail_code="credits_exhausted", operator_action_required=True)
+
+    inc = await record_ai_provider_failure(
+        origin_instance_id="tg_bot_rem",
+        provider="KIE",
+        error=err,
+        operation="chat",
+        session_maker=test_db_session_maker,
+    )
+
+    # Set last_alerted_at to 7 hours ago
+    async with test_db_session_maker() as session:
+        db_inc = await session.get(AIProviderIncidentModel, inc.id)
+        db_inc.last_alerted_at = datetime.utcnow() - timedelta(hours=7)
+        await session.commit()
+
+    # Check repeat reminders
+    reminders = await check_incident_repeat_reminders(
+        repeat_seconds=DEFAULT_REPEAT_ALERT_SECONDS,
+        session_maker=test_db_session_maker,
+    )
+    assert reminders == 1
+
+    # Verify cycle_index=1 reminder notification was enqueued
+    async with test_db_session_maker() as session:
+        rem_notif = (
+            await session.execute(
+                select(AIIncidentNotificationModel).where(
+                    AIIncidentNotificationModel.event_type == "repeat_reminder",
+                    AIIncidentNotificationModel.cycle_index == 1,
+                )
+            )
+        ).scalar_one_or_none()
+        assert rem_notif is not None
+        assert "Напоминание: Сбой AI-провайдера сохраняется" in rem_notif.message_text
+
+    # Immediate second check should do nothing
+    reminders_2 = await check_incident_repeat_reminders(
+        repeat_seconds=DEFAULT_REPEAT_ALERT_SECONDS,
+        session_maker=test_db_session_maker,
+    )
+    assert reminders_2 == 0
+
+
+@pytest.mark.asyncio
+async def test_scenario_11_autobus_isolation_handled_ai_warning_no_alert(monkeypatch, tmp_path):
+    """Scenario 11: Handled AI warnings without stack trace produce 0 alerts for Autobus."""
     lock_file = str(tmp_path / "lock.lock")
     state_file = str(tmp_path / "state.json")
     monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
     monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
 
     apps = [
-        {"name": "tg_someonelikeyouai02_bot_legacy", "status": "online", "token": "tok_1", "owner_ids": [272982544]}
+        {"name": "tg_bot_online", "status": "online", "token": "tok_1", "owner_ids": [272982544]}
     ]
     monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
 
@@ -397,12 +611,10 @@ async def test_scenario_11_autobus_isolation_no_kie_balance_alerts(monkeypatch, 
     monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
     monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
 
-    # PM2 error log contains KIE InsufficientBalanceError
+    # Handled AI provider warning logged at WARNING level: not scraped by LOG_ERROR_RE
     monkeypatch.setattr(
         monitor, "read_new_log_errors",
-        lambda *args, **kwargs: [
-            "ERROR | handlers | InsufficientBalanceError: KIE task creation failed: Credits insufficient. Your current balance isn't enough to run this request."
-        ]
+        lambda *args, **kwargs: []  # Warning is not in error log
     )
 
     sent_alerts = []
@@ -412,12 +624,8 @@ async def test_scenario_11_autobus_isolation_no_kie_balance_alerts(monkeypatch, 
     monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
 
     exit_code = await monitor.run_check(False)
-    # No issues found for Autobus!
     assert exit_code == 0
     assert len(sent_alerts) == 0
-
-    state = monitor.load_state(state_file)
-    assert "ai_balance_kie" not in state.get("active_incidents", {})
 
 
 @pytest.mark.asyncio
@@ -452,7 +660,6 @@ async def test_telegram_http_502_single_transient_no_alert(monkeypatch, tmp_path
     monkeypatch.setattr(monitor, "check_telegram", fake_check_telegram)
 
     sent_alerts = []
-
     async def fake_send_alert(a, text, **kwargs):
         sent_alerts.append(text)
         return True
@@ -460,7 +667,6 @@ async def test_telegram_http_502_single_transient_no_alert(monkeypatch, tmp_path
     monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
 
     exit_code = await monitor.run_check(False)
-    # Transient isolated 502 is suppressed on check 1
     assert exit_code == 0
     assert len(sent_alerts) == 0
 
@@ -500,7 +706,6 @@ async def test_telegram_http_502_sustained_alerts(monkeypatch, tmp_path):
     monkeypatch.setattr(monitor, "check_telegram", fake_check_telegram)
 
     sent_alerts = []
-
     async def fake_send_alert(a, text, **kwargs):
         sent_alerts.append(text)
         return True
@@ -545,17 +750,11 @@ async def test_polling_errors_count_growth_one_continuing_incident(monkeypatch, 
     monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
 
     sent_alerts = []
-
     async def fake_send_alert(a, text, **kwargs):
         sent_alerts.append(text)
         return True
 
     monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
-
-    # Run 1: 9 polling errors + 502
-    async def fake_tg(app, http):
-        return ["Telegram getMe failed: HTTP 502 Bad Gateway"]
-    monkeypatch.setattr(monitor, "check_telegram", fake_tg)
 
     # Start with sustained state (consecutive fails >= 2)
     state = monitor.load_state(state_file)
@@ -570,22 +769,20 @@ async def test_polling_errors_count_growth_one_continuing_incident(monkeypatch, 
     assert len(sent_alerts) == 1
     assert "9 polling fetch errors" in sent_alerts[0]
 
-    # Run 2: error count grows to 14 polling errors
+    # Run 2: error count grows to 14 polling errors -> NO second alert sent
     monkeypatch.setattr(
         monitor, "read_new_log_errors",
         lambda *args, **kwargs: ["Logs: 14 polling fetch errors since last check"]
     )
     await monitor.run_check(False)
-    # NO second alert sent!
     assert len(sent_alerts) == 1
 
-    # Run 3: error count grows to 20 polling errors
+    # Run 3: error count grows to 20 polling errors -> NO third alert sent
     monkeypatch.setattr(
         monitor, "read_new_log_errors",
         lambda *args, **kwargs: ["Logs: 20 polling fetch errors since last check"]
     )
     await monitor.run_check(False)
-    # NO third alert sent!
     assert len(sent_alerts) == 1
 
 
@@ -611,7 +808,6 @@ async def test_telegram_network_recovery_single_recovery_alert(monkeypatch, tmp_
     monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
 
     sent_alerts = []
-
     async def fake_send_alert(a, text, **kwargs):
         sent_alerts.append(text)
         return True
@@ -679,7 +875,6 @@ async def test_two_or_more_bots_form_group_network_incident(monkeypatch, tmp_pat
     monkeypatch.setattr(monitor, "check_telegram", fake_tg)
 
     sent_alerts = []
-
     async def fake_send_alert(a, text, **kwargs):
         sent_alerts.append(text)
         return True
@@ -728,7 +923,6 @@ async def test_pm2_stopped_and_db_errors_preserved(monkeypatch, tmp_path):
     monkeypatch.setattr(monitor, "check_db_schema", mock_db)
 
     sent_alerts = []
-
     async def fake_send_alert(a, text, **kwargs):
         sent_alerts.append(text)
         return True
@@ -776,14 +970,12 @@ async def test_bot_blocked_errors_completely_suppressed(monkeypatch, tmp_path):
     monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
 
     sent_alerts = []
-
     async def fake_send_alert(a, text, **kwargs):
         sent_alerts.append(text)
         return True
 
     monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
 
-    # With include_existing_log_errors=True, it reads the error log containing blocked lines
     exit_code = await monitor.run_check(True)
     assert exit_code == 0
     assert len(sent_alerts) == 0
@@ -791,11 +983,9 @@ async def test_bot_blocked_errors_completely_suppressed(monkeypatch, tmp_path):
 
 def test_generated_telegram_methods_pass_aiogram_pydantic_validation():
     """All generated Telegram message texts pass aiogram and Pydantic model validation."""
-    alert_1 = monitor.format_ai_balance_alert("KIE", ["tg_someonelikeyouai02_bot_legacy", "tg_someonewithyou01_bot_new"])
-    alert_2 = monitor.format_ai_balance_recovery_alert("KIE", ["tg_someonelikeyouai02_bot_legacy"], "15 минут")
-    alert_3 = monitor.format_recovery_alert(1, "45 минут", bot_names=["tg_someonewithyou01_bot_new"])
-    alert_4 = monitor.format_recovery_alert(3, "1 час 20 минут")
-    alert_5 = monitor.format_issues_alert(
+    alert_1 = monitor.format_recovery_alert(1, "45 минут", bot_names=["tg_someonewithyou01_bot_new"])
+    alert_2 = monitor.format_recovery_alert(3, "1 час 20 минут")
+    alert_3 = monitor.format_issues_alert(
         all_issues=[
             ("tg_someonewithyou01_bot_new", [
                 "Telegram getMe failed: HTTP 502 {'ok': False, 'error_code': 502, 'description': 'Bad Gateway'}",
@@ -809,11 +999,26 @@ def test_generated_telegram_methods_pass_aiogram_pydantic_validation():
         total_tg_bots=17,
         proxy_status="настроен (http://127.0.0.1:3128)",
     )
-    alert_6 = format_provider_balance_alert_message("KIE", 1.91)
-    alert_7 = format_provider_recovery_message("KIE", 50.0)
+    alert_4 = _format_incident_message_text(
+        provider="KIE",
+        operation="image_generation",
+        model_scope="seedream-v4",
+        incident_type="insufficient_balance_quota",
+        detail_code="credits_exhausted",
+        evidence_tier="CONFIRMED_STRUCTURED",
+        event_type="opened",
+    )
+    alert_5 = _format_incident_message_text(
+        provider="KIE",
+        operation="image_generation",
+        model_scope="seedream-v4",
+        incident_type="insufficient_balance_quota",
+        detail_code="credits_exhausted",
+        evidence_tier="CONFIRMED_STRUCTURED",
+        event_type="resolved",
+    )
 
-    for text in (alert_1, alert_2, alert_3, alert_4, alert_5, alert_6, alert_7):
-        # Validate that text can be instantiated into aiogram SendMessage method
+    for text in (alert_1, alert_2, alert_3, alert_4, alert_5):
         method = SendMessage(chat_id=272982544, text=text[:3900], parse_mode="HTML")
         assert method.chat_id == 272982544
         assert len(method.text) > 0

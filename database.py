@@ -2938,6 +2938,76 @@ class PaymentNotificationOutbox(Base):
 
 
 # ============================================================================
+# AI Incident Management Models
+# ============================================================================
+
+class AIProviderIncidentModel(Base):
+    __tablename__ = 'ai_provider_incidents'
+    __table_args__ = (
+        Index(
+            'uq_active_ai_incident',
+            'origin_instance_id',
+            'provider',
+            'credential_scope',
+            'operation',
+            'model_scope',
+            'incident_type',
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+            postgresql_where=text("status = 'active'"),
+        ),
+        Index('ix_ai_incident_lookup', 'origin_instance_id', 'status'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    origin_instance_id = Column(String(64), nullable=False)
+    companion_instance_id = Column(String(64), nullable=True)
+    provider = Column(String(64), nullable=False)
+    credential_scope = Column(String(64), nullable=False)
+    operation = Column(String(64), nullable=False)
+    model_scope = Column(String(128), nullable=False, default='*')
+    incident_type = Column(String(64), nullable=False)
+    evidence_tier = Column(String(32), nullable=False, default='CONFIRMED_STRUCTURED')
+    detail_code = Column(String(128), nullable=False, default='unspecified')
+    http_status = Column(Integer, nullable=True)
+    classification_source = Column(String(64), nullable=False, default='provider_structured')
+    status = Column(String(32), nullable=False, default='active')  # 'active', 'resolved', 'superseded'
+    occurrence_count = Column(Integer, nullable=False, default=1)
+    reminder_cycle = Column(Integer, nullable=False, default=0)
+    first_seen_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_alerted_at = Column(DateTime, nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+
+
+class AIIncidentNotificationModel(Base):
+    __tablename__ = 'ai_incident_notifications'
+    __table_args__ = (
+        Index('uq_ai_notif_cycle', 'incident_id', 'event_type', 'cycle_index', 'recipient_id', unique=True),
+        Index('ix_ai_notif_worker_scan', 'authorized_instance_id', 'status', 'next_retry_at'),
+        Index('ix_ai_notif_lease_recovery', 'authorized_instance_id', 'status', 'lease_until'),
+    )
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    incident_id = Column(Integer, ForeignKey('ai_provider_incidents.id', ondelete='CASCADE'), nullable=False)
+    event_type = Column(String(32), nullable=False)               # 'opened', 'repeat_reminder', 'resolved', 'fallback_used'
+    cycle_index = Column(Integer, nullable=False, default=0)
+    recipient_id = Column(BigInteger, nullable=False)             # Telegram ID администратора
+    authorized_instance_id = Column(String(64), nullable=False)   # PM2-имя companion Telegram-бота, имеющего BOT_TOKEN
+    message_text = Column(Text, nullable=False)
+    status = Column(String(32), nullable=False, default='pending')# 'pending', 'processing', 'delivered', 'failed_terminal', 'cancelled'
+    claim_token = Column(String(64), nullable=True)
+    lease_until = Column(DateTime, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=5)
+    next_retry_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    delivered_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ============================================================================
 # Certificate Followup Scenario Models
 # ============================================================================
 
