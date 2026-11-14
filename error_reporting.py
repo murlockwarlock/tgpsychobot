@@ -605,6 +605,19 @@ async def notify_admins_about_error(
     if trace and trace.strip() and trace.strip() != "NoneType: None":
         message_lines.append(f"Traceback: <code>{html.escape(_shorten(trace, 1800))}</code>")
 
+    if classification == "insufficient_balance_quota" or (
+        root_exception is not None and type(root_exception).__name__ == "InsufficientBalanceError"
+    ):
+        provider_name = (provider or "unknown").strip().upper()
+        bal_key = f"balance:{provider_name}"
+        if not _insufficient_balance_cooldown.should_send(bal_key):
+            log.info(
+                "Suppressed repeated admin notification for %s (%s) due to active cooldown",
+                provider_name,
+                bal_key,
+            )
+            return
+
     admin_text = "\n".join(message_lines)
     admin_ids = await get_all_admin_ids()
     for admin_id in admin_ids:
@@ -616,6 +629,18 @@ async def notify_admins_about_error(
 
 _terminal_failure_cooldown = KeyedAlertCooldown(timedelta(minutes=30))
 _output_budget_cooldown = KeyedAlertCooldown(timedelta(minutes=30))
+_insufficient_balance_cooldown = KeyedAlertCooldown(timedelta(hours=6))
+
+
+def reset_insufficient_balance_cooldown(provider: str | None = None) -> None:
+    """Reset insufficient balance alert cooldown, e.g. after balance replenishment."""
+    if provider:
+        norm = provider.strip()
+        _insufficient_balance_cooldown.reset(f"balance:{norm}")
+        _insufficient_balance_cooldown.reset(f"balance:{norm.upper()}")
+        _insufficient_balance_cooldown.reset(f"balance:{norm.lower()}")
+    else:
+        _insufficient_balance_cooldown.reset_all()
 
 
 def extract_error_metadata(

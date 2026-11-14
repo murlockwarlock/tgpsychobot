@@ -507,22 +507,23 @@ async def check_kie_credit_balance(bot: Bot):
             threshold = float(getattr(config, "kie_credit_alert_threshold", 0) or 0)
             base_url = (getattr(config, "kie_base_url", None) or "https://api.kie.ai").rstrip("/")
 
-            if not api_key or threshold <= 0:
+            if not api_key:
                 if config.kie_credit_alert_sent:
                     config.kie_credit_alert_sent = False
                     await session.commit()
                 return
 
+            effective_threshold = threshold if threshold > 0 else 2.0
             remaining_credits = await get_kie_remaining_credits(api_key, base_url)
 
-            if remaining_credits < threshold:
+            if remaining_credits < effective_threshold:
                 if not config.kie_credit_alert_sent:
                     config.kie_credit_alert_sent = True
                     await session.commit()
                     text = (
                         "⚠️ <b>Низкий баланс KIE</b>\n\n"
                         f"Остаток кредитов: <b>{remaining_credits}</b>\n"
-                        f"Порог уведомления: <b>{threshold}</b>\n\n"
+                        f"Порог уведомления: <b>{effective_threshold}</b>\n\n"
                         "Пополните баланс KIE, чтобы генерации и мультимодальные запросы не остановились."
                     )
                     for admin_id in await get_all_admin_ids():
@@ -534,6 +535,11 @@ async def check_kie_credit_balance(bot: Bot):
                 if config.kie_credit_alert_sent:
                     config.kie_credit_alert_sent = False
                     await session.commit()
+                    try:
+                        from error_reporting import reset_insufficient_balance_cooldown
+                        reset_insufficient_balance_cooldown("KIE")
+                    except Exception:
+                        pass
     except AIServiceError as exc:
         log.error("KIE credit balance check failed: %s", exc, exc_info=exc)
         if _kie_credit_error_alert_cooldown.should_send():
