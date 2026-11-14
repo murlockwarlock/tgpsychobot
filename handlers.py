@@ -7580,6 +7580,23 @@ async def process_api_input(message: Message, state: FSMContext, bot: Bot):
         await session.execute(stmt)
         await session.commit()
 
+    if is_key and value:
+        try:
+            from ai_incident_manager import handle_key_rotation
+            b_url = None
+            if provider.upper() == "KIE":
+                async with async_session_maker() as session:
+                    cfg_now = await session.get(AIConfig, 1)
+                    b_url = getattr(cfg_now, "kie_base_url", None)
+            await handle_key_rotation(
+                origin_instance_id=None,
+                provider=provider,
+                new_key=value,
+                base_url=b_url,
+            )
+        except Exception as rot_exc:
+            logging.warning("Failed to rotate key incidents for %s: %s", provider, rot_exc)
+
     await state.clear()
 
     if data.get("settings_message_id") and data.get("settings_chat_id") and data.get("settings_provider"):

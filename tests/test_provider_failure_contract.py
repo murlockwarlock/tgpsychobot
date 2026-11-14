@@ -566,3 +566,74 @@ async def test_kie_image_creation_failures_have_no_duplicate_task(monkeypatch, c
 
     assert create_calls == 1
     assert raised.value.failure.classification == expected
+
+
+@pytest.mark.asyncio
+async def test_openrouter_key_endpoint_and_limit_null_semantics():
+    """Verify OpenRouter GET /api/v1/key endpoint, limit=null semantics, and error handling."""
+    from provider_adapters import check_openrouter_key, ProviderAdapterError
+
+    # 1. limit=null: No limit on key, does NOT mean account credits exist
+    def mock_handler_null_limit(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://openrouter.ai/api/v1/key"
+        assert request.headers["authorization"] == "Bearer sk-or-test-key"
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "label": "Prod Key",
+                    "usage": 12.34,
+                    "limit": None,
+                    "is_free_tier": False,
+                    "rate_limit": {"requests": 10, "interval": "10s"},
+                }
+            },
+        )
+
+    res_null = await check_openrouter_key(
+        "sk-or-test-key",
+        transport=httpx.MockTransport(mock_handler_null_limit),
+    )
+    assert res_null["has_key_limit"] is False
+    assert res_null["key_limit"] is None
+    assert res_null["key_usage"] == 12.34
+    assert res_null["key_limit_remaining"] is None
+    assert res_null["is_free_tier"] is False
+
+    # 2. Configured limit: limit - usage
+    def mock_handler_with_limit(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "label": "Capped Key",
+                    "usage": 5.0,
+                    "limit": 20.0,
+                    "is_free_tier": False,
+                }
+            },
+        )
+
+    res_limit = await check_openrouter_key(
+        "sk-or-test-key",
+        transport=httpx.MockTransport(mock_handler_with_limit),
+    )
+    assert res_limit["has_key_limit"] is True
+    assert res_limit["key_limit"] == 20.0
+    assert res_limit["key_usage"] == 5.0
+    assert res_limit["key_limit_remaining"] == 15.0
+
+    # 3. 401 unauthorized fails closed with ProviderAdapterError
+    def mock_handler_401(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={"error": {"code": 401, "message": "User key not found"}},
+        )
+
+    with pytest.raises(ProviderAdapterError) as raised:
+        await check_openrouter_key(
+            "sk-or-invalid",
+            transport=httpx.MockTransport(mock_handler_401),
+        )
+    assert raised.value.failure.classification == "auth"
+

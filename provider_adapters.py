@@ -1779,3 +1779,68 @@ async def verify_openrouter_catalog(
             "mismatches": mismatches,
         }
     return result
+
+
+async def check_openrouter_key(
+    api_key: str,
+    timeout: float = 15.0,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, Any]:
+    """Inspect OpenRouter key details via GET https://openrouter.ai/api/v1/key.
+
+    Contract notice:
+    - Official OpenRouter endpoint is GET /api/v1/key (not /api/v1/auth/key).
+    - 'limit' being None indicates that NO limit is configured for this specific API key.
+      It does NOT imply that the underlying account has credits or sufficient balance!
+    - Full account balance check requires /api/v1/credits with a management key.
+    - True operational recovery for OpenRouter cannot be determined by limit=null alone;
+      it is confirmed exclusively by a successful operational call (e.g., HTTP 200 on chat/vision).
+    """
+    if not api_key or not str(api_key).strip():
+        raise ValueError("api_key is required")
+
+    from provider_failures import parse_provider_failure
+
+    client, _ = build_provider_http_client("OpenRouter", timeout=timeout, transport=transport)
+    headers = {
+        "Authorization": f"Bearer {str(api_key).strip()}",
+        "Content-Type": "application/json",
+    }
+    async with client:
+        response = await client.get("https://openrouter.ai/api/v1/key", headers=headers)
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = {}
+
+        failure = parse_provider_failure(
+            "OpenRouter",
+            "key_check",
+            response.status_code,
+            payload,
+            getattr(response, "headers", None) or {},
+        )
+        if failure is not None:
+            raise ProviderAdapterError(f"OpenRouter key check failed: {failure.detail_code}", failure=failure)
+
+        data = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else {}
+        limit = data.get("limit")
+        usage = data.get("usage")
+        is_free_tier = data.get("is_free_tier", False)
+        rate_limit = data.get("rate_limit")
+
+        limit_val = float(limit) if limit is not None else None
+        usage_val = float(usage) if usage is not None else None
+        limit_remaining = (limit_val - usage_val) if (limit_val is not None and usage_val is not None) else None
+
+        return {
+            "key_limit": limit_val,
+            "has_key_limit": limit_val is not None,
+            "key_usage": usage_val,
+            "key_limit_remaining": limit_remaining,
+            "is_free_tier": bool(is_free_tier),
+            "rate_limit": rate_limit,
+            "raw_data": data,
+        }
+

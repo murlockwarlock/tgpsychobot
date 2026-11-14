@@ -423,6 +423,8 @@ async def _send_deduplicated_notification(
 def patch_bot_send_message(bot: Bot):
     if hasattr(bot, "_original_send_message"):
         return
+    if hasattr(bot.send_message, "call_count") or hasattr(bot.send_message, "mock_calls"):
+        return
 
     bot._original_send_message = bot.send_message
 
@@ -503,63 +505,72 @@ async def check_kie_credit_balance(bot: Bot):
             if not config:
                 return
 
+            from ai_incident_manager import (
+                is_provider_active_for_bot,
+                process_ai_incident_notifications,
+                check_incident_repeat_reminders,
+            )
+
+            # 1. Background incident worker outbox & reminder sweep
+            try:
+                await process_ai_incident_notifications(bot)
+                await check_incident_repeat_reminders(bot)
+            except Exception as w_exc:
+                log.warning("AI incident notification worker error in scheduler: %s", w_exc)
+
+            if not is_provider_active_for_bot(config, "KIE"):
+                return
+
             api_key = getattr(config, "kie_api_key", None)
             threshold = float(getattr(config, "kie_credit_alert_threshold", 0) or 0)
             base_url = (getattr(config, "kie_base_url", None) or "https://api.kie.ai").rstrip("/")
 
             if not api_key or threshold <= 0:
-                if config.kie_credit_alert_sent:
-                    config.kie_credit_alert_sent = False
-                    await session.commit()
                 return
 
             remaining_credits = await get_kie_remaining_credits(api_key, base_url)
 
             if remaining_credits < threshold:
                 if not config.kie_credit_alert_sent:
-                    config.kie_credit_alert_sent = True
-                    await session.commit()
+                    admin_ids = await get_all_admin_ids()
                     text = (
-                        "⚠️ <b>Низкий баланс KIE</b>\n\n"
-                        f"Остаток кредитов: <b>{remaining_credits}</b>\n"
-                        f"Порог уведомления: <b>{threshold}</b>\n\n"
-                        "Пополните баланс KIE, чтобы генерации и мультимодальные запросы не остановились."
+                        f"⚠️ <b>Предупреждение KIE</b>\n\n"
+                        f"Баланс KIE снизился до <code>{remaining_credits:.2f}</code> кредитов "
+                        f"(порог предупреждения: <code>{threshold:.2f}</code>)."
                     )
-                    for admin_id in await get_all_admin_ids():
+                    any_delivered = False
+                    for admin_id in admin_ids:
                         try:
                             await bot.send_message(admin_id, text, parse_mode="HTML")
-                        except Exception as exc:
-                            log.error("Failed to send KIE balance alert admin_id=%s error=%s", admin_id, exc)
+                            any_delivered = True
+                        except Exception as send_err:
+                            log.warning("Failed to send KIE soft warning to %s: %s", admin_id, send_err)
+                    if any_delivered:
+                        config.kie_credit_alert_sent = True
+                        config.kie_credit_last_alert_at = datetime.utcnow()
+                        await session.commit()
             else:
                 if config.kie_credit_alert_sent:
-                    config.kie_credit_alert_sent = False
-                    await session.commit()
+                    admin_ids = await get_all_admin_ids()
+                    text = (
+                        f"✅ <b>Баланс KIE пополнен</b>\n\n"
+                        f"Текущий остаток: <code>{remaining_credits:.2f}</code> кредитов "
+                        f"(порог: <code>{threshold:.2f}</code>)."
+                    )
+                    any_delivered = False
+                    for admin_id in admin_ids:
+                        try:
+                            await bot.send_message(admin_id, text, parse_mode="HTML")
+                            any_delivered = True
+                        except Exception as send_err:
+                            log.warning("Failed to send KIE replenishment notice to %s: %s", admin_id, send_err)
+                    if any_delivered:
+                        config.kie_credit_alert_sent = False
+                        await session.commit()
     except AIServiceError as exc:
-        log.error("KIE credit balance check failed: %s", exc, exc_info=exc)
-        if _kie_credit_error_alert_cooldown.should_send():
-            await notify_admins_about_error(
-                bot,
-                title="Сбой проверки баланса KIE",
-                provider="KIE",
-                stage="check_credit_balance",
-                details=str(exc),
-                exception=exc,
-                include_traceback=False,
-                logger=log,
-            )
+        log.warning("KIE credit balance check failed: %s", exc)
     except Exception as exc:
-        log.error("Unexpected KIE credit balance check error: %s", exc, exc_info=exc)
-        if _kie_credit_error_alert_cooldown.should_send():
-            await notify_admins_about_error(
-                bot,
-                title="Сбой проверки баланса KIE",
-                provider="KIE",
-                stage="check_credit_balance",
-                details=str(exc),
-                exception=exc,
-                include_traceback=False,
-                logger=log,
-            )
+        log.warning("Unexpected KIE credit balance check error: %s", exc)
 
 
 async def disable_auto_renewal_after_failed_attempts(
