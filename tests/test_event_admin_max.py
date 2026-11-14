@@ -2089,7 +2089,8 @@ async def test_max_reschedule_and_copy_flow(db_session_maker, mock_client, state
     assert (await states.get(456)).state == "max_event_reschedule_starts_at"
 
     mock_client.send_message.reset_mock()
-    await max_admin_events.receive_reschedule(mock_client, states, chat_id=123, user_id=456, raw_dt="12.11.2026 20:00")
+    future_resched_dt = (datetime.utcnow() + timedelta(days=5)).strftime("%d.%m.%Y 20:00")
+    await max_admin_events.receive_reschedule(mock_client, states, chat_id=123, user_id=456, raw_dt=future_resched_dt)
     assert await states.get(456) is None
     assert any("Мероприятие перенесено" in call.kwargs["text"] for call in mock_client.send_message.call_args_list)
 
@@ -2101,7 +2102,8 @@ async def test_max_reschedule_and_copy_flow(db_session_maker, mock_client, state
     assert (await states.get(456)).state == "max_event_copy_starts_at"
 
     mock_client.send_message.reset_mock()
-    await max_admin_events.receive_copy_starts_at(mock_client, states, chat_id=123, user_id=456, raw_dt="15.11.2026 19:00")
+    future_copy_dt = (datetime.utcnow() + timedelta(days=7)).strftime("%d.%m.%Y 19:00")
+    await max_admin_events.receive_copy_starts_at(mock_client, states, chat_id=123, user_id=456, raw_dt=future_copy_dt)
     assert await states.get(456) is None
     assert any("Сценарий успешно скопирован" in call.kwargs["text"] for call in mock_client.send_message.call_args_list)
 
