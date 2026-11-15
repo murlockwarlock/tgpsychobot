@@ -83,12 +83,9 @@ def admin_dispatcher():
     import automation_admin
     import handlers
 
-    if handlers.router.parent_router is not None:
-        handlers = importlib.reload(handlers)
-    if automation_admin.router.parent_router is not None:
-        automation_admin = importlib.reload(automation_admin)
-    if admin_content_authoring.router.parent_router is not None:
-        admin_content_authoring = importlib.reload(admin_content_authoring)
+    for module in (handlers, automation_admin, admin_content_authoring):
+        if hasattr(module, "router"):
+            module.router._parent_router = None
 
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(handlers.router)
@@ -96,8 +93,8 @@ def admin_dispatcher():
     dispatcher.include_router(admin_content_authoring.router)
     yield dispatcher
     for module in (admin_content_authoring, automation_admin, handlers):
-        if module.router.parent_router is not None:
-            importlib.reload(module)
+        if hasattr(module, "router"):
+            module.router._parent_router = None
 
 
 class RecordingSession(BaseSession):

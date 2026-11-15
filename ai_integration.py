@@ -4585,6 +4585,7 @@ async def analyze_image_content(
             if fb_stage_budget >= min_useful_budget:
                 fb_eligible = True
 
+    from ai_incident_manager import get_provider_account_fingerprint, record_ai_provider_failure
     prim_b_url = _get_kie_base_url(config) if primary_provider == "KIE" else None
     prim_cred_scope = get_provider_account_fingerprint(primary_api_key, prim_b_url)
     fb_cred_scope = None
@@ -4593,7 +4594,6 @@ async def analyze_image_content(
     inc_fb = None
     if not fb_eligible and last_error is not None:
         try:
-            from ai_incident_manager import get_provider_account_fingerprint, record_ai_provider_failure
             inc_prim = await record_ai_provider_failure(
                 None,
                 primary_provider,
