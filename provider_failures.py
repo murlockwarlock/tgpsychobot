@@ -135,6 +135,7 @@ KNOWN_TECHNICAL_CODES: frozenset[str] = frozenset(
         "quota_exceeded",
         "access_policy",
         "unsupported_region",
+        "superseded_by_key_rotation",
     }
 )
 OPENROUTER_TYPES = frozenset("context_length_exceeded max_tokens_exceeded token_limit_exceeded string_too_long authentication permission_denied payment_required rate_limit_exceeded provider_overloaded provider_unavailable invalid_request invalid_prompt not_found precondition_failed payload_too_large unprocessable content_policy_violation refusal invalid_image image_too_large image_too_small unsupported_image_format image_not_found image_download_failed server timeout unmapped".split())

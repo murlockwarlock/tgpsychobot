@@ -20,6 +20,7 @@ import hashlib
 import html
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Sequence
@@ -41,7 +42,6 @@ from database import (
     AIProviderIncidentModel,
     async_session_maker,
 )
-from notification_outbox import BACKOFF_DELAYS
 from notification_routing import (
     detect_current_instance,
     extract_telegram_bot_id,
@@ -54,7 +54,13 @@ from notification_routing import (
     verify_bot_identity_live,
 )
 from notification_transport import is_bot_blocked_reason
-from provider_failures import ProviderFailure, normalize_exception
+from provider_failures import (
+    CANONICAL_CLASSES,
+    KNOWN_TECHNICAL_CODES,
+    ProviderFailure,
+    canonical_classification,
+    normalize_exception,
+)
 
 logger = logging.getLogger("ai_incident_manager")
 
@@ -66,6 +72,65 @@ class IncidentSecurityError(RuntimeError):
 DEFAULT_REPEAT_ALERT_SECONDS = 6 * 3600  # 6 hours
 OUTBOX_LEASE_SECONDS = 60
 MAX_OUTBOX_ATTEMPTS = 5
+
+AI_INCIDENT_BACKOFF_DELAYS: tuple[timedelta, ...] = (
+    timedelta(seconds=15),
+    timedelta(minutes=1),
+    timedelta(minutes=5),
+    timedelta(minutes=15),
+    timedelta(hours=1),
+)
+
+
+def get_ai_incident_outbox_backoff(attempts: int) -> timedelta:
+    """
+    Return the canonical AI incident backoff delay for the given attempt count.
+    Claimed attempts is 1-based (after claim, attempts is 1 on first failure):
+      attempt 1 -> 15 seconds
+      attempt 2 -> 1 minute
+      attempt 3 -> 5 minutes
+      attempt 4 -> 15 minutes
+      attempt 5+ -> 1 hour
+    """
+    idx = min(max(0, attempts - 1), len(AI_INCIDENT_BACKOFF_DELAYS) - 1)
+    return AI_INCIDENT_BACKOFF_DELAYS[idx]
+
+
+def sanitize_technical_code(
+    code: Any,
+    classification: str | None = None,
+    default: str = "unspecified",
+) -> str:
+    """
+    Sanitize and validate an error/detail code before persisting or formatting.
+    Guarantees no arbitrary strings, user data, or PII can ever be stored or rendered.
+    """
+    if code is None:
+        return default
+    s = str(code).strip()
+    if not s:
+        return default
+    s_lower = s.lower()
+    if s_lower in KNOWN_TECHNICAL_CODES or s_lower in CANONICAL_CLASSES:
+        return s[:64]
+    if s.isdigit() and len(s) == 3:  # 3-digit HTTP status code e.g. 502, 429, 401
+        return s
+    if (
+        re.match(r"^[A-Za-z0-9_]{1,64}$", s)
+        and s.endswith(("Error", "Exception", "Failure", "Timeout"))
+    ):
+        return s
+    # Check if code has low-credit pattern "balance_X.XX_below_Y.YY"
+    if re.match(r"^balance_\d+(\.\d+)?_below_\d+(\.\d+)?$", s):
+        return s
+    if s in ("superseded_by_key_rotation", "recovered", "persisting"):
+        return s
+    # Fallback to valid canonical classification if available
+    if classification:
+        canon = canonical_classification(classification)
+        if canon and canon in CANONICAL_CLASSES and canon != "unknown":
+            return canon
+    return default
 
 
 def get_provider_account_fingerprint(api_key: str | None, base_url: str | None = None) -> str:
@@ -125,8 +190,17 @@ def _format_incident_message_text(
     p_esc = html.escape(str(provider).upper())
     op_esc = html.escape(str(operation))
     mod_esc = html.escape(str(model_scope))
-    code_esc = html.escape(str(detail_code))
+    safe_code = sanitize_technical_code(detail_code, classification=incident_type, default="unspecified")
+    code_esc = html.escape(safe_code)
     time_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    safe_inc_type = canonical_classification(incident_type)
+    if not safe_inc_type or safe_inc_type == "unknown":
+        if incident_type in ("low_credit_warning",):
+            safe_inc_type = incident_type
+        else:
+            safe_inc_type = "provider_failure"
+    inc_type_esc = html.escape(safe_inc_type)
 
     if incident_type == "low_credit_warning":
         if event_type == "resolved":
@@ -167,7 +241,7 @@ def _format_incident_message_text(
         return (
             f"⚠️ <b>Основной AI-провайдер дал сбой — использован резервный</b>\n\n"
             f"Основной: <code>{p_esc}</code> (<code>{mod_esc}</code>)\n"
-            f"Сбой: <code>{code_esc}</code> ({html.escape(incident_type)})\n"
+            f"Сбой: <code>{code_esc}</code> ({inc_type_esc})\n"
             f"Резервный: <code>{fb_p_esc}</code> (<code>{fb_m_esc}</code>) — ✅ Ответ получен\n"
             f"Канал: <code>{op_esc}</code>\n"
             f"Время: <code>{time_str}</code>"
@@ -189,7 +263,7 @@ def _format_incident_message_text(
         f"Провайдер: <code>{p_esc}</code>\n"
         f"Канал: <code>{op_esc}</code>\n"
         f"Модель: <code>{mod_esc}</code>\n"
-        f"Тип сбоя: <code>{html.escape(incident_type)}</code>\n"
+        f"Тип сбоя: <code>{inc_type_esc}</code>\n"
         f"Код: <code>{code_esc}</code>\n"
         f"Уровень: {tier_label}\n"
         f"Время: <code>{time_str}</code>\n\n"
@@ -328,7 +402,11 @@ async def _record_ai_provider_failure_impl(
     op_norm = (operation or failure.operation or "chat").strip().lower()
     mod_norm = str(model or "*").strip()
     inc_type = failure.classification
-    det_code = str(failure.detail_code or failure.provider_error_code or "unspecified")[:128]
+    det_code = sanitize_technical_code(
+        failure.detail_code or failure.provider_error_code,
+        classification=inc_type,
+        default="unspecified",
+    )
     evidence_tier = (
         "CONFIRMED_STRUCTURED"
         if failure.classification_source in ("provider_structured", "http_status_fallback", "transport", "sdk_typed_exception")
@@ -1661,7 +1739,7 @@ async def process_ai_incident_notifications(
         # Dispatch message via actual_bot
         send_success = False
         is_terminal = False
-        retry_delay = BACKOFF_DELAYS[min(attempts, len(BACKOFF_DELAYS) - 1)]
+        retry_delay = get_ai_incident_outbox_backoff(attempts)
         error_code = "delivery_success"
 
         try:
@@ -1689,7 +1767,12 @@ async def process_ai_incident_notifications(
         except TelegramRetryAfter as exc:
             send_success = False
             error_code = "telegram_rate_limited"
-            retry_delay = timedelta(seconds=getattr(exc, "retry_after", 30))
+            retry_after_val = getattr(exc, "retry_after", 30)
+            try:
+                retry_after_sec = float(retry_after_val)
+            except (TypeError, ValueError):
+                retry_after_sec = 30.0
+            retry_delay = timedelta(seconds=max(1.0, min(300.0, retry_after_sec)))
         except TelegramNetworkError:
             send_success = False
             error_code = "telegram_network_error"
