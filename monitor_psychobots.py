@@ -1465,6 +1465,37 @@ def _queue_issue_notification(
             }
 
 
+async def _flush_pending_issue_notifications(
+    apps: list[dict],
+    pending_notifications: dict,
+    state: dict,
+) -> bool:
+    """
+    Deliver all queued issue notifications in order.
+    Ensures that for each successfully delivered notification:
+    - cooldown is committed to state via record_alert_delivered(flat_remaining, state)
+    - the delivered item is safely removed from pending_notifications
+    If any delivery fails, stops and returns False, keeping remaining notifications for retry.
+    """
+    issue_keys = [
+        k for k in sorted(pending_notifications.keys())
+        if k == "issue" or k.startswith("issue_")
+    ]
+    all_delivered = True
+    for k in issue_keys:
+        p_issue = pending_notifications[k]
+        delivered = await _deliver_notification(apps, p_issue, state)
+        if delivered:
+            flat_remaining = p_issue.get("flat_remaining")
+            if flat_remaining:
+                record_alert_delivered(flat_remaining, state)
+            pending_notifications.pop(k, None)
+        else:
+            all_delivered = False
+            break
+    return all_delivered
+
+
 async def run_check(
     include_existing_log_errors: bool,
     lock_path: str | None = None,
@@ -1604,19 +1635,7 @@ async def run_check(
         else:
             if INCIDENT_SHARED_NETWORK in active_incidents or "recovery" in pending_notifications:
                 # 1. Flush pending issue notifications if any before sending recovery
-                issue_keys = [
-                    k for k in sorted(pending_notifications.keys())
-                    if k == "issue" or k.startswith("issue_")
-                ]
-                all_issues_delivered = True
-                for k in issue_keys:
-                    p_issue = pending_notifications[k]
-                    issue_delivered = await _deliver_notification(apps, p_issue, state)
-                    if issue_delivered:
-                        pending_notifications.pop(k, None)
-                    else:
-                        all_issues_delivered = False
-                        break
+                all_issues_delivered = await _flush_pending_issue_notifications(apps, pending_notifications, state)
 
                 # 2. ONLY proceed to recovery if all incident alerts have been confirmed delivered!
                 if all_issues_delivered:
@@ -1678,19 +1697,7 @@ async def run_check(
             if inc_k.startswith("network_") and inc_k != INCIDENT_SHARED_NETWORK:
                 bot_name = inc_k[len("network_"):]
                 if bot_name not in affected_net_bots and not is_shared_network:
-                    issue_keys = [
-                        k for k in sorted(pending_notifications.keys())
-                        if k == "issue" or k.startswith("issue_")
-                    ]
-                    all_issues_delivered = True
-                    for k in issue_keys:
-                        p_issue = pending_notifications[k]
-                        issue_delivered = await _deliver_notification(apps, p_issue, state)
-                        if issue_delivered:
-                            pending_notifications.pop(k, None)
-                        else:
-                            all_issues_delivered = False
-                            break
+                    all_issues_delivered = await _flush_pending_issue_notifications(apps, pending_notifications, state)
 
                     if all_issues_delivered:
                         rec_k = f"recovery_{inc_k}"
@@ -1742,24 +1749,9 @@ async def run_check(
             _queue_issue_notification(pending_notifications, alert_text, now, flat_remaining=flat_remaining)
 
         # Deliver all queued issue notifications in order
-        issue_keys = [
-            k for k in sorted(pending_notifications.keys())
-            if k == "issue" or k.startswith("issue_")
-        ]
-        all_delivered = True
-        for k in issue_keys:
-            p_issue = pending_notifications[k]
-            delivered = await _deliver_notification(apps, p_issue, state)
-            if delivered:
-                notif_flat = p_issue.get("flat_remaining")
-                if notif_flat:
-                    record_alert_delivered(notif_flat, state)
-                pending_notifications.pop(k, None)
-            else:
-                all_delivered = False
-                break
+        all_delivered = await _flush_pending_issue_notifications(apps, pending_notifications, state)
 
-        if all_delivered and issue_keys:
+        if all_delivered:
             inc = active_incidents.get(INCIDENT_SHARED_NETWORK)
             if inc and (should_alert_shared_network or int(inc.get("last_alerted", 0)) == 0):
                 inc["last_alerted"] = now

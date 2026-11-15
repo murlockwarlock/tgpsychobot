@@ -8122,15 +8122,30 @@ async def test_autobus_monitor_run_check_full_control_loop_lifecycle(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_database_check_and_migrate_adds_missing_max_attempts(tmp_path):
-    """Blocker 2: Verify _check_and_migrate adds max_attempts and next_retry_at to ai_incident_notifications if missing."""
-    from sqlalchemy.ext.asyncio import create_async_engine
+async def test_production_init_db_migration_ai_incident_notifications_sqlite(tmp_path, monkeypatch):
+    """Blocker 4: Verify production database.init_db() migrates ai_incident_notifications on SQLite:
+    - Adds missing max_attempts (default 6) and next_retry_at columns
+    - Backfills next_retry_at = created_at for pending and processing rows
+    - Leaves next_retry_at as NULL for delivered and failed_terminal rows
+    - Is idempotent across multiple init_db() calls
+    """
+    import database
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import text, inspect
 
-    db_path = tmp_path / "test_migration.db"
+    db_path = tmp_path / "prod_migration_test.db"
     test_engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    test_session_maker = async_sessionmaker(test_engine, expire_on_commit=False, class_=AsyncSession)
 
-    # Create table WITHOUT max_attempts and next_retry_at
+    monkeypatch.setattr(database, "engine", test_engine)
+    monkeypatch.setattr(database, "async_session_maker", test_session_maker)
+
+    t_pending = datetime(2026, 1, 1, 10, 0, 0)
+    t_processing = datetime(2026, 1, 2, 10, 0, 0)
+    t_delivered = datetime(2026, 1, 3, 10, 0, 0)
+    t_failed = datetime(2026, 1, 4, 10, 0, 0)
+
+    # 1. Create table WITHOUT max_attempts and next_retry_at
     async with test_engine.begin() as conn:
         await conn.execute(text("""
             CREATE TABLE ai_provider_incidents (
@@ -8163,37 +8178,735 @@ async def test_database_check_and_migrate_adds_missing_max_attempts(tmp_path):
                 attempts INTEGER NOT NULL DEFAULT 0,
                 delivered_at TIMESTAMP,
                 last_error TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL
             )
         """))
+        # Insert incident
+        await conn.execute(text("""
+            INSERT INTO ai_provider_incidents (id, provider, operation, model, credential_scope, incident_type, status, detail_code, origin_instance_id, companion_instance_id)
+            VALUES (1, 'KIE', 'chat', 'model-1', 'scope-1', 'provider_5xx', 'active', '500', 'inst1', 'inst1')
+        """))
+        # Insert rows across all 4 statuses
+        await conn.execute(text("""
+            INSERT INTO ai_incident_notifications (id, incident_id, event_type, recipient_id, authorized_instance_id, message_text, status, created_at, updated_at)
+            VALUES (1, 1, 'opened', 100, 'inst1', 'msg1', 'pending', :t_pend, :t_pend),
+                   (2, 1, 'opened', 101, 'inst1', 'msg2', 'processing', :t_proc, :t_proc),
+                   (3, 1, 'opened', 102, 'inst1', 'msg3', 'delivered', :t_deliv, :t_deliv),
+                   (4, 1, 'opened', 103, 'inst1', 'msg4', 'failed_terminal', :t_fail, :t_fail)
+        """), {"t_pend": t_pending, "t_proc": t_processing, "t_deliv": t_delivered, "t_fail": t_failed})
 
-    def _check_cols(sync_conn):
+    def _get_columns(sync_conn):
         insp = inspect(sync_conn)
         return [c['name'] for c in insp.get_columns('ai_incident_notifications')]
 
     async with test_engine.connect() as conn:
-        cols_before = await conn.run_sync(_check_cols)
+        cols_before = await conn.run_sync(_get_columns)
         assert 'max_attempts' not in cols_before
         assert 'next_retry_at' not in cols_before
 
-    def _run_migrate(sync_conn):
-        insp = inspect(sync_conn)
-        if insp.has_table('ai_incident_notifications'):
-            ai_notif_cols = [c['name'] for c in insp.get_columns('ai_incident_notifications')]
-            if 'max_attempts' not in ai_notif_cols:
-                sync_conn.execute(text("ALTER TABLE ai_incident_notifications ADD COLUMN max_attempts INTEGER DEFAULT 6 NOT NULL"))
-            if 'next_retry_at' not in ai_notif_cols:
-                sync_conn.execute(text("ALTER TABLE ai_incident_notifications ADD COLUMN next_retry_at TIMESTAMP"))
+    # 2. Run REAL production init_db()
+    await database.init_db()
 
-    async with test_engine.begin() as conn:
-        await conn.run_sync(_run_migrate)
-
+    # 3. Verify columns and backfill values
     async with test_engine.connect() as conn:
-        cols_after = await conn.run_sync(_check_cols)
+        cols_after = await conn.run_sync(_get_columns)
         assert 'max_attempts' in cols_after
         assert 'next_retry_at' in cols_after
 
+        res = await conn.execute(text("SELECT id, status, max_attempts, next_retry_at, created_at FROM ai_incident_notifications ORDER BY id"))
+        rows = {r[0]: r for r in res.fetchall()}
+
+        # Row 1 (pending): max_attempts == 6, next_retry_at == created_at
+        assert rows[1][2] == 6
+        assert rows[1][3] is not None
+        assert str(rows[1][3])[:19] == str(t_pending)[:19]
+
+        # Row 2 (processing): max_attempts == 6, next_retry_at == created_at
+        assert rows[2][2] == 6
+        assert rows[2][3] is not None
+        assert str(rows[2][3])[:19] == str(t_processing)[:19]
+
+        # Row 3 (delivered): max_attempts == 6, next_retry_at is NULL
+        assert rows[3][2] == 6
+        assert rows[3][3] is None
+
+        # Row 4 (failed_terminal): max_attempts == 6, next_retry_at is NULL
+        assert rows[4][2] == 6
+        assert rows[4][3] is None
+
+    # 4. Verify idempotency - run production init_db() a second time
+    await database.init_db()
+
     await test_engine.dispose()
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_production_init_db_migration_ai_incident_notifications_postgresql(pg_test_session_maker, monkeypatch):
+    """Blocker 4: Verify production database.init_db() migrates ai_incident_notifications on real PostgreSQL:
+    - Adds missing max_attempts (default 6) and next_retry_at columns
+    - Backfills next_retry_at = created_at for pending and processing rows
+    - Leaves next_retry_at as NULL for delivered and failed_terminal rows
+    - Is idempotent across multiple init_db() calls
+    """
+    import database
+    from sqlalchemy import text, inspect
+
+    test_engine = pg_test_session_maker.kw['bind']
+    monkeypatch.setattr(database, "engine", test_engine)
+    monkeypatch.setattr(database, "async_session_maker", pg_test_session_maker)
+
+    t_pending = datetime(2026, 1, 1, 10, 0, 0)
+    t_processing = datetime(2026, 1, 2, 10, 0, 0)
+    t_delivered = datetime(2026, 1, 3, 10, 0, 0)
+    t_failed = datetime(2026, 1, 4, 10, 0, 0)
+
+    # 1. Create table WITHOUT max_attempts and next_retry_at
+    async with test_engine.begin() as conn:
+        await conn.execute(text("DROP TABLE IF EXISTS ai_incident_notifications CASCADE"))
+        await conn.execute(text("""
+            CREATE TABLE ai_incident_notifications (
+                id BIGSERIAL PRIMARY KEY,
+                incident_id INTEGER NOT NULL REFERENCES ai_provider_incidents(id) ON DELETE CASCADE,
+                event_type VARCHAR(32) NOT NULL,
+                cycle_index INTEGER NOT NULL DEFAULT 0,
+                recipient_id BIGINT NOT NULL,
+                authorized_instance_id VARCHAR(64) NOT NULL,
+                message_text TEXT NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                claim_token VARCHAR(64),
+                lease_until TIMESTAMP,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                delivered_at TIMESTAMP,
+                last_error TEXT,
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL
+            )
+        """))
+        # Insert rows across all 4 statuses
+        await conn.execute(text("""
+            INSERT INTO ai_incident_notifications (incident_id, event_type, recipient_id, authorized_instance_id, message_text, status, created_at, updated_at)
+            VALUES (1, 'opened', 100, 'inst1', 'msg1', 'pending', :t_pend, :t_pend),
+                   (1, 'opened', 101, 'inst1', 'msg2', 'processing', :t_proc, :t_proc),
+                   (1, 'opened', 102, 'inst1', 'msg3', 'delivered', :t_deliv, :t_deliv),
+                   (1, 'opened', 103, 'inst1', 'msg4', 'failed_terminal', :t_fail, :t_fail)
+        """), {"t_pend": t_pending, "t_proc": t_processing, "t_deliv": t_delivered, "t_fail": t_failed})
+
+    def _get_columns(sync_conn):
+        insp = inspect(sync_conn)
+        return [c['name'] for c in insp.get_columns('ai_incident_notifications')]
+
+    async with test_engine.connect() as conn:
+        cols_before = await conn.run_sync(_get_columns)
+        assert 'max_attempts' not in cols_before
+        assert 'next_retry_at' not in cols_before
+
+    # 2. Run REAL production init_db()
+    await database.init_db()
+
+    # 3. Verify columns and backfill values
+    async with test_engine.connect() as conn:
+        cols_after = await conn.run_sync(_get_columns)
+        assert 'max_attempts' in cols_after
+        assert 'next_retry_at' in cols_after
+
+        res = await conn.execute(text("SELECT id, status, max_attempts, next_retry_at, created_at FROM ai_incident_notifications ORDER BY id"))
+        rows = {r[0]: r for r in res.fetchall()}
+
+        # Row 1 (pending): max_attempts == 6, next_retry_at == created_at
+        assert rows[1][2] == 6
+        assert rows[1][3] is not None
+        assert str(rows[1][3])[:19] == str(t_pending)[:19]
+
+        # Row 2 (processing): max_attempts == 6, next_retry_at == created_at
+        assert rows[2][2] == 6
+        assert rows[2][3] is not None
+        assert str(rows[2][3])[:19] == str(t_processing)[:19]
+
+        # Row 3 (delivered): max_attempts == 6, next_retry_at is NULL
+        assert rows[3][2] == 6
+        assert rows[3][3] is None
+
+        # Row 4 (failed_terminal): max_attempts == 6, next_retry_at is NULL
+        assert rows[4][2] == 6
+        assert rows[4][3] is None
+
+    # 4. Verify idempotency - run production init_db() a second time
+    await database.init_db()
+
+
+@pytest.mark.asyncio
+async def test_no_fictitious_provider_5xx_classification(test_db_session_maker, monkeypatch):
+    """
+    Blocker 1: Eliminate fictitious provider_5xx classification.
+    - An unknown error with retryable=True must NOT be classified as provider_5xx if http_status is None.
+    - It must be classified as 'unknown'.
+    - An unknown error with retryable=False must be classified as 'unknown'.
+    - An authentic HTTP 503 error must be classified as 'provider_5xx' with http_status=503.
+    - A TimeoutError must be classified as 'timeout'.
+    - An authentic RateLimitError / 429 must be classified as 'rate_limit'.
+    - AIProviderIncidentModel must store authentic http_status and classification_source.
+    """
+    inst_def = {"pm2_name": "tg_veraveda777_bot_legacy", "platform": "telegram", "platform_id": 8281390498, "admins": [272982544], "username": "veraveda777_bot"}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[272982544]))
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_token_no_fictitious_5xx")
+
+    from provider_failures import ProviderFailure
+
+    # 1. Unknown error with retryable=True (transient glitch without HTTP 5xx code)
+    err_retryable_true = Exception("Transient unclassified network anomaly")
+    err_retryable_true.failure = ProviderFailure(
+        provider="KIE",
+        operation="chat",
+        classification=None,
+        detail_code="transient_glitch",
+        retryable=True,
+        http_status=None,
+        classification_source="inferred_message",
+    )
+    inc_1 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=err_retryable_true,
+        operation="chat",
+        model="kie-chat-1",
+        credential_scope="scope_retryable_true",
+        enqueue_notification=False,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_1 is not None
+    assert inc_1.incident_type == "unknown", "Unclassified error with retryable=True must NOT be fabricated as provider_5xx"
+    assert inc_1.http_status is None
+    assert inc_1.classification_source == "inferred_message"
+
+    # 2. Unknown error with retryable=False
+    err_retryable_false = ValueError("Unmapped parameter error")
+    err_retryable_false.failure = ProviderFailure(
+        provider="KIE",
+        operation="chat",
+        classification=None,
+        detail_code="bad_param",
+        retryable=False,
+        http_status=None,
+        classification_source="inferred_message",
+    )
+    inc_2 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=err_retryable_false,
+        operation="chat",
+        model="kie-chat-2",
+        credential_scope="scope_retryable_false",
+        enqueue_notification=False,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_2 is not None
+    assert inc_2.incident_type == "unknown"
+    assert inc_2.http_status is None
+
+    # 3. Authentic HTTP 503 Service Unavailable
+    err_503 = Exception("Service Unavailable")
+    err_503.failure = ProviderFailure(
+        provider="KIE",
+        operation="chat",
+        classification="provider_5xx",
+        detail_code="503",
+        retryable=True,
+        http_status=503,
+        classification_source="http_status_fallback",
+    )
+    inc_3 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=err_503,
+        operation="chat",
+        model="kie-chat-3",
+        credential_scope="scope_503",
+        enqueue_notification=False,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_3 is not None
+    assert inc_3.incident_type == "provider_5xx", "Authentic HTTP 503 must be classified as provider_5xx"
+    assert inc_3.http_status == 503
+    assert inc_3.classification_source == "http_status_fallback"
+
+    # 4. Authentic TimeoutError
+    inc_4 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=TimeoutError("Request timed out after 30s"),
+        operation="chat",
+        model="kie-chat-4",
+        credential_scope="scope_timeout",
+        enqueue_notification=False,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_4 is not None
+    assert inc_4.incident_type == "timeout"
+
+    # 5. SDK Typed Rate Limit (429)
+    err_429 = Exception("Rate limit exceeded")
+    err_429.failure = ProviderFailure(
+        provider="KIE",
+        operation="chat",
+        classification="rate_limit",
+        detail_code="429",
+        retryable=True,
+        http_status=429,
+        classification_source="sdk_typed_exception",
+    )
+    inc_5 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=err_429,
+        operation="chat",
+        model="kie-chat-5",
+        credential_scope="scope_rate_limit",
+        enqueue_notification=False,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_5 is not None
+    assert inc_5.incident_type == "rate_limit"
+    assert inc_5.http_status == 429
+    assert inc_5.classification_source == "sdk_typed_exception"
+
+
+@pytest.mark.asyncio
+async def test_autobus_cooldown_in_all_delivery_paths_network_recovery(tmp_path, monkeypatch):
+    """
+    Blocker 2: Verify Autobus cooldown is committed in all delivery paths, including network recovery branch.
+    Scenario:
+    1. Run 1: Network is down (Telegram HTTP post fails), DB issue is detected.
+       - Issue alert queued to pending_notifications.
+       - Delivery fails -> notification remains in pending_notifications.
+       - Cooldown is NOT yet committed.
+    2. Run 2: Network recovers (check_telegram succeeds, HTTP post succeeds).
+       - Recovery branch flushes pending issue notifications via _flush_pending_issue_notifications.
+       - Alert is confirmed delivered via Telegram HTTP.
+       - Cooldown is committed to state.
+       - pending_notifications is cleared.
+    3. Run 3: Same DB issue is still detected.
+       - Cooldown is active -> repeat alert is suppressed! Zero HTTP calls.
+    """
+    import monitor_psychobots as monitor
+    import aiohttp
+
+    lock_file = str(tmp_path / "monitor_cooldown.lock")
+    state_file = str(tmp_path / "state_cooldown.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "tg_autobusbusbot_new")
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_TOKEN", "8346799080:AAFtest_autobus_token_12345")
+
+    app1 = {
+        "name": "tg_autobusbusbot_new",
+        "status": "online",
+        "token": "8346799080:AAFtest_autobus_token_12345",
+        "error_log": str(tmp_path / "empty1.log"),
+        "owner_ids": [272982544],
+    }
+    app2 = {
+        "name": "tg_veraveda777_bot_legacy",
+        "status": "online",
+        "token": "8281390498:AAFtest_veraveda_token",
+        "error_log": str(tmp_path / "empty2.log"),
+        "owner_ids": [272982544],
+    }
+    apps = [app1, app2]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    (tmp_path / "empty1.log").write_text("", encoding="utf-8")
+    (tmp_path / "empty2.log").write_text("", encoding="utf-8")
+
+    async def clean_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_payment_webhooks", clean_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", clean_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", clean_async)
+
+    # DB schema always reports an issue on app1
+    async def db_issue(app, *args, **kwargs):
+        if app["name"] == "tg_autobusbusbot_new":
+            return ["DB: missing migration 003"]
+        return []
+    monkeypatch.setattr(monitor, "check_db_schema", db_issue)
+
+    posted_calls = []
+    http_should_succeed = False
+    tg_check_results = {
+        "tg_autobusbusbot_new": ["Telegram: connection error [tg_autobusbusbot_new]"],
+        "tg_veraveda777_bot_legacy": ["Telegram: connection error [tg_veraveda777_bot_legacy]"],
+    }
+
+    class MockHttpTelegramResponse:
+        def __init__(self, url, json=None, **kwargs):
+            self.url = url
+            self.json_payload = json
+            self.status = 200 if http_should_succeed else 500
+
+        async def __aenter__(self):
+            posted_calls.append({"url": self.url, "json": self.json_payload})
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def json(self, content_type=None):
+            if self.status == 200:
+                return {"ok": True, "result": {"message_id": 999}}
+            return {"ok": False, "error_code": 500, "description": "Telegram gateway unavailable"}
+
+    monkeypatch.setattr(
+        aiohttp.ClientSession,
+        "post",
+        lambda self, url, json=None, **kwargs: MockHttpTelegramResponse(url, json=json, **kwargs),
+    )
+    async def fake_check_telegram(app, *args, **kwargs):
+        return list(tg_check_results.get(app["name"], []))
+    monkeypatch.setattr(monitor, "check_telegram", fake_check_telegram)
+
+    # Run 1: Network down + DB error -> delivery fails
+    exit_code_1 = await monitor.run_check(include_existing_log_errors=True)
+    assert exit_code_1 == 1
+    state_1 = monitor.load_state(state_file)
+    pending_1 = state_1.get("pending_notifications", {})
+    assert len(pending_1) > 0, "Failed delivery must leave issue in pending_notifications"
+    assert monitor.should_alert(["tg_autobusbusbot_new: DB: missing migration 003"], state_1) is True
+
+    # Run 2: Network recovers (Telegram check clean, HTTP post succeeds)
+    posted_calls.clear()
+    http_should_succeed = True
+    tg_check_results.clear()
+
+    exit_code_2 = await monitor.run_check(include_existing_log_errors=True)
+    assert len(posted_calls) >= 1
+
+    state_2 = monitor.load_state(state_file)
+    pending_2 = state_2.get("pending_notifications", {})
+    assert not any(k == "issue" or k.startswith("issue_") for k in pending_2)
+    assert monitor.should_alert(["tg_autobusbusbot_new: DB: missing migration 003"], state_2) is False, (
+        "Cooldown must be committed upon delivery in network recovery branch"
+    )
+
+    # Run 3: Same DB issue is still returned, network is clean
+    posted_calls.clear()
+    exit_code_3 = await monitor.run_check(include_existing_log_errors=True)
+    assert exit_code_3 == 1
+    assert len(posted_calls) == 0, "Duplicate DB issue alert must be suppressed by cooldown committed in recovery branch"
+
+
+async def _run_lease_recovery_max_attempts_lifecycle_verification(session_maker, monkeypatch):
+    inst_def = {
+        "pm2_name": "tg_veraveda777_bot_legacy",
+        "platform": "telegram",
+        "platform_id": 8281390498,
+        "admins": [272982544],
+        "username": "veraveda777_bot",
+    }
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[272982544]))
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_token_lease_bounds")
+
+    tg_calls = []
+
+    class MockTgBot:
+        def __init__(self, token="8281390498:AAFtest_token_lease_bounds"):
+            self.token = token
+            self.id = 8281390498
+            self.get_me = AsyncMock(return_value=TgUser(id=8281390498, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+        async def send_message(self, *args, **kwargs):
+            tg_calls.append(kwargs)
+            return MagicMock(message_id=555)
+
+    bot = MockTgBot()
+
+    # Create parent incident
+    async with session_maker() as session:
+        inc = AIProviderIncidentModel(
+            provider="KIE",
+            operation="chat",
+            model_scope="kie-v1",
+            credential_scope="scope_lease_test",
+            incident_type="provider_5xx",
+            status="active",
+            detail_code="500",
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            companion_instance_id="tg_veraveda777_bot_legacy",
+        )
+        session.add(inc)
+        await session.commit()
+        await session.refresh(inc)
+        inc_id = inc.id
+
+    past_lease = datetime.utcnow() - timedelta(minutes=10)
+
+    # 1. attempts = 1, max_attempts = 3, lease expired -> should be claimed and retried (attempt 2)
+    async with session_maker() as session:
+        notif1 = AIIncidentNotificationModel(
+            incident_id=inc_id,
+            event_type="opened",
+            cycle_index=0,
+            recipient_id=272982544,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            message_text="Alert lease 1",
+            status="processing",
+            claim_token="old_worker_1",
+            lease_until=past_lease,
+            attempts=1,
+            max_attempts=3,
+            next_retry_at=None,
+        )
+        session.add(notif1)
+        await session.commit()
+        await session.refresh(notif1)
+        notif1_id = notif1.id
+
+    tg_calls.clear()
+    await process_ai_incident_notifications(bot, session_maker=session_maker)
+    assert len(tg_calls) == 1, "Expired lease with attempts < max_attempts must be claimed and delivered"
+    async with session_maker() as session:
+        r1 = await session.get(AIIncidentNotificationModel, notif1_id)
+        assert r1.status == "delivered"
+        assert r1.attempts == 2
+
+    # 2. attempts = 2, max_attempts = 3, lease expired -> Telegram fails -> reaches max_attempts (3) and becomes failed_terminal
+    async with session_maker() as session:
+        notif2 = AIIncidentNotificationModel(
+            incident_id=inc_id,
+            event_type="opened",
+            cycle_index=1,
+            recipient_id=272982544,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            message_text="Alert lease 2",
+            status="processing",
+            claim_token="old_worker_2",
+            lease_until=past_lease,
+            attempts=2,
+            max_attempts=3,
+            next_retry_at=None,
+        )
+        session.add(notif2)
+        await session.commit()
+        await session.refresh(notif2)
+        notif2_id = notif2.id
+
+    class FailingBot:
+        def __init__(self, token="8281390498:AAFtest_token_lease_bounds"):
+            self.token = token
+            self.id = 8281390498
+            self.get_me = AsyncMock(return_value=TgUser(id=8281390498, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+        async def send_message(self, *args, **kwargs):
+            tg_calls.append(kwargs)
+            raise RuntimeError("Telegram network timeout")
+
+    fail_bot = FailingBot()
+    tg_calls.clear()
+    await process_ai_incident_notifications(fail_bot, session_maker=session_maker)
+    assert len(tg_calls) == 1
+    async with session_maker() as session:
+        r2 = await session.get(AIIncidentNotificationModel, notif2_id)
+        assert r2.status == "failed_terminal"
+        assert r2.attempts == 3
+        assert r2.next_retry_at is None
+
+    # 3. attempts == max_attempts (3 == 3), lease expired:
+    # Must be finalized to 'failed_terminal' WITHOUT calling Telegram and WITHOUT incrementing attempts!
+    async with session_maker() as session:
+        notif3 = AIIncidentNotificationModel(
+            incident_id=inc_id,
+            event_type="opened",
+            cycle_index=2,
+            recipient_id=272982544,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            message_text="Alert lease 3",
+            status="processing",
+            claim_token="crashed_worker_3",
+            lease_until=past_lease,
+            attempts=3,
+            max_attempts=3,
+            next_retry_at=None,
+        )
+        session.add(notif3)
+        await session.commit()
+        await session.refresh(notif3)
+        notif3_id = notif3.id
+
+    tg_calls.clear()
+    await process_ai_incident_notifications(bot, session_maker=session_maker)
+    assert len(tg_calls) == 0, "Expired lease with attempts == max_attempts must NOT trigger Telegram call"
+    async with session_maker() as session:
+        r3 = await session.get(AIIncidentNotificationModel, notif3_id)
+        assert r3.status == "failed_terminal"
+        assert r3.attempts == 3, "Attempts must stay at max_attempts without increment"
+        assert r3.next_retry_at is None
+        assert r3.last_error == "lease_expired_max_attempts_exhausted"
+
+    # 4. attempts > max_attempts (4 > 3), lease expired:
+    # Must also be finalized to 'failed_terminal' without Telegram call
+    async with session_maker() as session:
+        notif4 = AIIncidentNotificationModel(
+            incident_id=inc_id,
+            event_type="opened",
+            cycle_index=3,
+            recipient_id=272982544,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            message_text="Alert lease 4",
+            status="processing",
+            claim_token="crashed_worker_4",
+            lease_until=past_lease,
+            attempts=4,
+            max_attempts=3,
+            next_retry_at=None,
+        )
+        session.add(notif4)
+        await session.commit()
+        await session.refresh(notif4)
+        notif4_id = notif4.id
+
+    tg_calls.clear()
+    await process_ai_incident_notifications(bot, session_maker=session_maker)
+    assert len(tg_calls) == 0
+    async with session_maker() as session:
+        r4 = await session.get(AIIncidentNotificationModel, notif4_id)
+        assert r4.status == "failed_terminal"
+        assert r4.attempts == 4
+        assert r4.next_retry_at is None
+
+    # 5. Concurrent workers competing on expired lease: CAS guarantees exactly one winner
+    async with session_maker() as session:
+        notif5 = AIIncidentNotificationModel(
+            incident_id=inc_id,
+            event_type="opened",
+            cycle_index=4,
+            recipient_id=272982544,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            message_text="Alert lease concurrent",
+            status="processing",
+            claim_token="crashed_worker_5",
+            lease_until=past_lease,
+            attempts=1,
+            max_attempts=3,
+            next_retry_at=None,
+        )
+        session.add(notif5)
+        await session.commit()
+        await session.refresh(notif5)
+        notif5_id = notif5.id
+
+    tg_calls.clear()
+    await asyncio.gather(
+        process_ai_incident_notifications(bot, session_maker=session_maker),
+        process_ai_incident_notifications(bot, session_maker=session_maker),
+        process_ai_incident_notifications(bot, session_maker=session_maker),
+        process_ai_incident_notifications(bot, session_maker=session_maker),
+        process_ai_incident_notifications(bot, session_maker=session_maker),
+    )
+    assert len(tg_calls) == 1, "Concurrent lease recovery must result in exactly 1 claim and delivery"
+    async with session_maker() as session:
+        r5 = await session.get(AIIncidentNotificationModel, notif5_id)
+        assert r5.status == "delivered"
+        assert r5.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_ai_outbox_lease_recovery_strictly_respects_max_attempts_sqlite(test_db_session_maker, monkeypatch):
+    """Blocker 3: Verify outbox lease recovery bounds on SQLite."""
+    await _run_lease_recovery_max_attempts_lifecycle_verification(test_db_session_maker, monkeypatch)
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_ai_outbox_lease_recovery_strictly_respects_max_attempts(pg_test_session_maker, monkeypatch):
+    """Blocker 3: Verify outbox lease recovery bounds on real PostgreSQL."""
+    await _run_lease_recovery_max_attempts_lifecycle_verification(pg_test_session_maker, monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_send_terminal_alert_title_and_diagnostic_sanitization(test_db_session_maker, monkeypatch):
+    """
+    Blocker 5: Verify title and diagnostic sanitization in send_terminal_ai_failure_alert:
+    - Dynamic title with PII (e.g. Patient_12345, user_9999, token_secret) is redacted to [REDACTED].
+    - Non-formatted HTML characters in title are escaped.
+    - Static Russian titles (e.g. 'Терминальный сбой анализа изображения') are preserved with bold header.
+    - Secrets in diagnostics are masked by sanitize_secret_values.
+    """
+    import error_reporting
+    inst_def = {"pm2_name": "tg_veraveda777_bot_legacy", "platform": "telegram", "platform_id": 8281390498, "admins": [272982544], "username": "veraveda777_bot"}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[272982544]))
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_token_title_sanitization")
+
+    # 1. Dynamic title with PII tokens and unescaped HTML characters
+    pii_title = "Failed for Patient_54321 and user_8888 with token_secret_123 <bad_tag>"
+    await error_reporting.send_terminal_ai_failure_alert(
+        title=pii_title,
+        primary_provider="OpenAI",
+        primary_model="gpt-4o",
+        request_type="chat",
+        details="Detail information",
+        session_maker=test_db_session_maker,
+    )
+
+    async with test_db_session_maker() as session:
+        notifs = (await session.execute(
+            select(AIIncidentNotificationModel).order_by(AIIncidentNotificationModel.id.desc())
+        )).scalars().all()
+        assert len(notifs) >= 1
+        msg = notifs[0].message_text
+        assert "Patient_54321" not in msg
+        assert "user_8888" not in msg
+        assert "token_secret_123" not in msg
+        assert "[REDACTED]" in msg
+        assert "&lt;bad_tag&gt;" in msg
+
+    # 2. Static Russian title
+    static_title = "Терминальный сбой анализа изображения"
+    await error_reporting.send_terminal_ai_failure_alert(
+        title=static_title,
+        primary_provider="Gemini",
+        primary_model="gemini-2.0-flash",
+        request_type="vision",
+        details="Vision timeout",
+        session_maker=test_db_session_maker,
+    )
+
+    async with test_db_session_maker() as session:
+        notifs2 = (await session.execute(
+            select(AIIncidentNotificationModel).order_by(AIIncidentNotificationModel.id.desc())
+        )).scalars().all()
+        msg2 = notifs2[0].message_text
+        assert "Терминальный сбой анализа изображения" in msg2
+        assert "🚨 <b>[Telegram] Терминальный сбой анализа изображения</b>" in msg2
+
+    # 3. Secret in diagnostics/details
+    secret_details = "Authorization: Bearer sk-ant-api03-secret123456789012345678901234567890"
+    await error_reporting.send_terminal_ai_failure_alert(
+        title="Valid Title",
+        primary_provider="OpenAI",
+        primary_model="gpt-4o",
+        request_type="chat",
+        details=secret_details,
+        session_maker=test_db_session_maker,
+    )
+
+    async with test_db_session_maker() as session:
+        notifs3 = (await session.execute(
+            select(AIIncidentNotificationModel).order_by(AIIncidentNotificationModel.id.desc())
+        )).scalars().all()
+        msg3 = notifs3[0].message_text
+        assert "sk-ant-api03-secret123456789012345678901234567890" not in msg3
+
 
 

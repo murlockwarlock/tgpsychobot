@@ -2297,6 +2297,11 @@ async def init_db():
                     sync_conn.execute(text("ALTER TABLE ai_incident_notifications ADD COLUMN max_attempts INTEGER DEFAULT 6 NOT NULL"))
                 if 'next_retry_at' not in ai_notif_cols:
                     sync_conn.execute(text("ALTER TABLE ai_incident_notifications ADD COLUMN next_retry_at TIMESTAMP"))
+                    sync_conn.execute(text(
+                        "UPDATE ai_incident_notifications "
+                        "SET next_retry_at = created_at "
+                        "WHERE next_retry_at IS NULL AND status IN ('pending', 'processing')"
+                    ))
 
             return legacy_system_messages_migrated
 

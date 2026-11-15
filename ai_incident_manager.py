@@ -409,7 +409,7 @@ async def _record_ai_provider_failure_impl(
     elif str(raw_cls) in ("low_credit_warning",):
         inc_type = str(raw_cls)
     else:
-        inc_type = "provider_5xx" if getattr(failure, "retryable", False) else "unknown"
+        inc_type = "unknown"
     det_code = sanitize_technical_code(
         failure.detail_code or failure.provider_error_code,
         classification=inc_type,
@@ -535,6 +535,8 @@ async def _record_ai_provider_failure_impl(
                 incident_type=inc_type,
                 detail_code=det_code,
                 evidence_tier=evidence_tier,
+                http_status=getattr(failure, "http_status", None),
+                classification_source=getattr(failure, "classification_source", "provider_structured"),
                 status=target_status,
                 occurrence_count=1,
                 reminder_cycle=0,
@@ -562,6 +564,7 @@ async def _record_ai_provider_failure_impl(
                         occurrence_count=AIProviderIncidentModel.occurrence_count + 1,
                         last_seen_at=now,
                         detail_code=det_code,
+                        http_status=getattr(failure, "http_status", None),
                     )
                 )
 
@@ -1658,7 +1661,10 @@ async def process_ai_incident_notifications(
                     or_(
                         and_(
                             AIIncidentNotificationModel.status == "pending",
-                            AIIncidentNotificationModel.next_retry_at <= now,
+                            or_(
+                                AIIncidentNotificationModel.next_retry_at <= now,
+                                AIIncidentNotificationModel.next_retry_at.is_(None),
+                            ),
                         ),
                         and_(
                             AIIncidentNotificationModel.status == "processing",
@@ -1682,6 +1688,32 @@ async def process_ai_incident_notifications(
         ts_now = datetime.utcnow()
 
         async with sm() as session:
+            # 1. Check for expired lease rows that have already exhausted max_attempts (attempts >= max_attempts).
+            # Finalize immediately to 'failed_terminal' without making any further attempt or calling Telegram.
+            finalize_exhausted_stmt = (
+                update(AIIncidentNotificationModel)
+                .where(
+                    AIIncidentNotificationModel.id == row_id,
+                    AIIncidentNotificationModel.authorized_instance_id == current_bot_instance_id,
+                    AIIncidentNotificationModel.status == "processing",
+                    AIIncidentNotificationModel.lease_until < ts_now,
+                    AIIncidentNotificationModel.attempts >= AIIncidentNotificationModel.max_attempts,
+                )
+                .values(
+                    status="failed_terminal",
+                    next_retry_at=None,
+                    last_error="lease_expired_max_attempts_exhausted",
+                    updated_at=ts_now,
+                )
+            )
+            fin_res = await session.execute(finalize_exhausted_stmt)
+            if fin_res.rowcount > 0:
+                await session.commit()
+                return False
+
+            # 2. Atomic claim statement:
+            # - For 'pending' rows: allowed as long as status == 'pending' (and next_retry_at <= ts_now or None)
+            # - For 'processing' rows with expired lease: allowed ONLY if attempts < max_attempts
             claim_stmt = (
                 update(AIIncidentNotificationModel)
                 .where(
@@ -1690,11 +1722,15 @@ async def process_ai_incident_notifications(
                     or_(
                         and_(
                             AIIncidentNotificationModel.status == "pending",
-                            AIIncidentNotificationModel.next_retry_at <= ts_now,
+                            or_(
+                                AIIncidentNotificationModel.next_retry_at <= ts_now,
+                                AIIncidentNotificationModel.next_retry_at.is_(None),
+                            ),
                         ),
                         and_(
                             AIIncidentNotificationModel.status == "processing",
                             AIIncidentNotificationModel.lease_until < ts_now,
+                            AIIncidentNotificationModel.attempts < AIIncidentNotificationModel.max_attempts,
                         ),
                     ),
                 )

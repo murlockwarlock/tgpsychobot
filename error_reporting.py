@@ -923,7 +923,12 @@ async def send_terminal_ai_failure_alert(
     fb_p = fallback_provider or "none"
 
     if title:
-        alert_title = sanitize_secret_values(str(title))
+        t_str = sanitize_secret_values(str(title))
+        t_str = re.sub(r"(?i)\b(patient|user|client|customer|token|secret)[_-]?\w+\b", "[REDACTED]", t_str)
+        if t_str.startswith("🚨 <b>") or t_str.startswith("<b>"):
+            alert_title = t_str if t_str.endswith("\n\n") else f"{t_str}\n\n"
+        else:
+            alert_title = f"🚨 <b>[{platform_norm}] {html.escape(t_str)}</b>\n\n"
     elif request_type == "vision":
         alert_title = f"🚨 <b>[{platform_norm}] Сбой ИИ при анализе изображения</b>\n\n"
     else:
