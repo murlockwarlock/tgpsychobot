@@ -125,13 +125,21 @@ def _format_incident_message_text(
     if incident_type == "low_credit_warning":
         if event_type == "resolved":
             return (
-                f"✅ <b>Баланс KIE пополнен</b>\n\n"
+                f"✅ <b>Баланс {p_esc} пополнен</b>\n\n"
                 f"Провайдер: <code>{p_esc}</code>\n"
                 f"Время: <code>{time_str}</code>\n"
                 f"Статус: Баланс превысил порог предупреждения."
             )
+        if event_type == "repeat_reminder":
+            return (
+                f"⏰ <b>Напоминание: низкий баланс {p_esc}</b>\n\n"
+                f"Провайдер: <code>{p_esc}</code>\n"
+                f"Код: <code>{code_esc}</code>\n"
+                f"Время: <code>{time_str}</code>\n"
+                f"Статус: Баланс остается ниже порога предупреждения."
+            )
         return (
-            f"⚠️ <b>Предупреждение KIE: низкий баланс</b>\n\n"
+            f"⚠️ <b>Предупреждение {p_esc}: низкий баланс</b>\n\n"
             f"Провайдер: <code>{p_esc}</code>\n"
             f"Код: <code>{code_esc}</code>\n"
             f"Время: <code>{time_str}</code>"
@@ -631,6 +639,20 @@ async def _handle_key_rotation_impl(
                 )
             )
 
+        if prov_norm == "KIE":
+            # Reconcile kie_credit_alert_sent with whether new_fp has an active low_credit_warning
+            stmt_active_warn = select(AIProviderIncidentModel).where(
+                AIProviderIncidentModel.provider == "KIE",
+                AIProviderIncidentModel.credential_scope == new_fp,
+                AIProviderIncidentModel.incident_type == "low_credit_warning",
+                AIProviderIncidentModel.status == "active",
+            )
+            has_active_warn = (await session.scalar(stmt_active_warn)) is not None
+            from database import AIConfig
+            ai_cfg = await session.get(AIConfig, 1)
+            if ai_cfg and ai_cfg.kie_credit_alert_sent != has_active_warn:
+                ai_cfg.kie_credit_alert_sent = has_active_warn
+
         await session.commit()
 
     logger.info(
@@ -872,9 +894,27 @@ async def check_incident_repeat_reminders(
         authorized_instance_id = companion_def["pm2_name"]
 
         for inc in stale_incidents:
-            new_cycle = inc.reminder_cycle + 1
-            inc.reminder_cycle = new_cycle
-            inc.last_alerted_at = now
+            old_cycle = inc.reminder_cycle
+            new_cycle = old_cycle + 1
+
+            # Explicit CAS atomic update: only bump if cycle has not changed and last_alerted_at <= threshold
+            stmt_cas = (
+                update(AIProviderIncidentModel)
+                .where(
+                    AIProviderIncidentModel.id == inc.id,
+                    AIProviderIncidentModel.status == "active",
+                    AIProviderIncidentModel.reminder_cycle == old_cycle,
+                    AIProviderIncidentModel.last_alerted_at <= threshold,
+                )
+                .values(
+                    reminder_cycle=new_cycle,
+                    last_alerted_at=now,
+                )
+            )
+            cas_res = await session.execute(stmt_cas)
+            if cas_res.rowcount != 1:
+                # Concurrent worker already claimed and advanced this cycle
+                continue
 
             msg_text = _format_incident_message_text(
                 provider=inc.provider,

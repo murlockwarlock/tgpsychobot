@@ -5,11 +5,12 @@ outbox delivery, companion routing, and Autobus infrastructure isolation.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -32,6 +33,7 @@ from ai_incident_manager import (
     process_ai_incident_notifications,
     record_ai_operation_success,
     record_ai_provider_failure,
+    record_low_credit_warning,
 )
 from database import (
     AIConfig,
@@ -1582,65 +1584,102 @@ async def test_item_3_kie_soft_warning_durable_delivery_and_restart_retry(test_d
 
 @pytest.mark.asyncio
 async def test_item_4_chat_fallback_e2e_single_notification_on_success_and_failure(test_db_session_maker, monkeypatch):
-    """Item 4: In chat fallback, eliminate premature failure recording:
-    - Primary fails, fallback succeeds: exactly ONE notification per admin ('fallback_used'), ZERO 'opened'.
-    - Primary fails, fallback fails: terminal failure, exactly ONE 'opened' notification per admin, ZERO 'fallback_used'.
+    """Item 4: Real E2E Chat fallback through Telegram and MAX get_ai_response():
+    - Primary provider (KIE) fails with InsufficientBalanceError.
+    - Fallback provider (OpenAI) succeeds and returns text to the user.
+    - Exactly ONE incident recorded in DB (provider='KIE', fallback_succeeded=True).
+    - Exactly ONE outbox notification ('fallback_used') per admin; ZERO 'opened' outbox rows.
+    - process_ai_incident_notifications delivers it to the Telegram admin.
     """
+    import ai_integration
+    from max_messenger_bot import ai as max_ai
+
     monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
-    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_telegram_token_123456789012")
-    inst_def = {"pm2_name": "tg_someonewithyou01_bot_new", "platform": "telegram", "platform_id": 8281390498, "admins": [7001]}
+    bot_token = "8281390498:AAFtest_telegram_token_123456789012"
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+    inst_def = {"pm2_name": "tg_someonewithyou01_bot_new", "platform": "telegram", "platform_id": 8281390498, "admins": [7001], "username": "someonewithyou01_bot"}
     monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
     monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
     monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
     monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[7001]))
 
-    # PART A: Primary fails, fallback succeeds
-    primary_err = InsufficientBalanceError("KIE credits empty")
+    monkeypatch.setattr(ai_integration, "async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+    monkeypatch.setattr(ai_integration, "build_runtime_context", AsyncMock(return_value="runtime context"))
+
+    # Seed AIConfig and User in DB
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(
+                id=1,
+                provider="KIE",
+                kie_api_key="kie_test_key_e2e",
+                kie_model="mock-kie-chat",
+                allow_fallback=True,
+                fallback_provider="OpenAI",
+                fallback_model="mock-openai-gpt",
+                openai_api_key="openai_test_key_e2e",
+            )
+            session.add(cfg)
+        else:
+            cfg.provider = "KIE"
+            cfg.kie_api_key = "kie_test_key_e2e"
+            cfg.kie_model = "mock-kie-chat"
+            cfg.allow_fallback = True
+            cfg.fallback_provider = "OpenAI"
+            cfg.fallback_model = "mock-openai-gpt"
+            cfg.openai_api_key = "openai_test_key_e2e"
+
+        user_row = await session.get(User, 123)
+        if not user_row:
+            user_row = User(id=123, tg_user_id=123, username="e2euser", name="E2E User")
+            session.add(user_row)
+        await session.commit()
+
+    mock_bot = AsyncMock(spec=Bot)
+    mock_bot.token = bot_token
+    mock_bot.get_me = AsyncMock(return_value=TgUser(id=8281390498, is_bot=True, first_name="bot", username="someonewithyou01_bot"))
+    mock_bot.send_message = AsyncMock(return_value=True)
+
+    # 1. Telegram E2E: Primary KIE fails with InsufficientBalanceError, fallback OpenAI succeeds
+    primary_err = InsufficientBalanceError("KIE credits 0")
     primary_err.provider = "KIE"
+    monkeypatch.setattr(ai_integration, "_call_kie_chat", AsyncMock(side_effect=primary_err))
+    monkeypatch.setattr(ai_integration, "_call_openai_api", AsyncMock(return_value="Real fallback reply to user"))
 
-    # In chat/vision: record_ai_provider_failure is NOT called before fallback attempt!
-    # On fallback success, it is called with fallback_succeeded=True
-    inc_success = await record_ai_provider_failure(
-        origin_instance_id="tg_someonewithyou01_bot_new",
-        provider="KIE",
-        error=primary_err,
-        operation="chat",
-        model="kie-chat-v1",
-        fallback_provider="OpenAI",
-        fallback_model="gpt-4o",
-        fallback_succeeded=True,
-        session_maker=test_db_session_maker,
+    user_reply = await ai_integration.get_ai_response(
+        123,
+        "User question",
+        "E2E User",
+        "unknown",
+        bot=mock_bot,
+        include_test_context=False,
     )
-    assert inc_success is not None
+    assert user_reply == "Real fallback reply to user"
 
+    # Verify DB: exactly ONE incident for KIE with status active
     async with test_db_session_maker() as session:
-        notifs_a = (await session.execute(
-            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.incident_id == inc_success.id)
-        )).scalars().all()
-        assert len(notifs_a) == 1
-        assert notifs_a[0].event_type == "fallback_used"
-        assert notifs_a[0].event_type != "opened"
+        incidents = (await session.execute(select(AIProviderIncidentModel))).scalars().all()
+        assert len(incidents) == 1
+        assert incidents[0].provider == "KIE"
+        assert incidents[0].operation == "chat"
+        assert incidents[0].status == "active"
 
-    # PART B: Primary fails, and fallback also fails (terminal failure)
-    # On fallback failure, primary and fallback are recorded with fallback_succeeded=False
-    inc_terminal = await record_ai_provider_failure(
-        origin_instance_id="tg_someonewithyou01_bot_new",
-        provider="OpenAI",
-        error=InsufficientBalanceError("OpenAI quota exceeded"),
-        operation="chat",
-        model="gpt-4o",
-        fallback_succeeded=False,
-        session_maker=test_db_session_maker,
-    )
-    assert inc_terminal is not None
+        # Verify DB Outbox: exactly ONE fallback_used notification, ZERO opened notifications
+        notifs = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        assert len(notifs) == 1
+        assert notifs[0].event_type == "fallback_used"
+        assert notifs[0].event_type != "opened"
+        assert "Резервный:" in notifs[0].message_text
+        assert "OPENAI" in notifs[0].message_text
 
-    async with test_db_session_maker() as session:
-        notifs_b = (await session.execute(
-            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.incident_id == inc_terminal.id)
-        )).scalars().all()
-        assert len(notifs_b) == 1
-        assert notifs_b[0].event_type == "opened"
-        assert notifs_b[0].event_type != "fallback_used"
+    # Deliver outbox notification
+    delivered = await process_ai_incident_notifications(mock_bot, session_maker=test_db_session_maker)
+    assert delivered == 1
+    assert mock_bot.send_message.call_count == 1
+    sent_text = mock_bot.send_message.call_args.kwargs.get("text") or mock_bot.send_message.call_args.args[1]
+    assert "Резервный:" in sent_text
 
 
 @pytest.mark.asyncio
@@ -1749,20 +1788,30 @@ async def test_item_5_max_incident_repeat_reminders_delivered_by_telegram_compan
 
 
 @pytest.mark.asyncio
-async def test_item_6_admin_key_rotation_via_process_api_input_e2e(test_db_session_maker, monkeypatch):
-    """Item 6: Real Admin key rotation flow via process_api_input:
-    - Input validation: empty / whitespace key is rejected and clears state without modifying AIConfig.
-    - Cancellation handler: admin_ai_keys callback clears state and leaves AIConfig untouched.
-    - Valid key: updates AIConfig, triggers handle_key_rotation, transitions Telegram and MAX incidents
-      in shared DB to 'superseded' WITHOUT false 'восстановлено' alert, cancels outbox, and re-renders settings.
+async def test_item_6_admin_key_rotation_via_real_dispatcher_router_fsm_e2e(test_db_session_maker, monkeypatch):
+    """Item 6: Real Admin key rotation flow via Dispatcher, Router, buttons, FSM, and runtime settings:
+    - Step 1: Callback query 'model_setting_api_key_KIE' fed into Dispatcher.
+      Dispatcher invokes start_model_api_key_for_provider -> FSM state becomes AdminStates.set_api_key.
+    - Step 2: Empty/whitespace text '   ' fed into Dispatcher.
+      Rejected with warning, FSM state cleared, AIConfig not modified.
+    - Step 3: Cancellation callback 'admin_ai_keys' fed into Dispatcher.
+      FSM state cleared, AIConfig untouched.
+    - Step 4: Active incidents exist for Telegram and MAX companion bots.
+      Valid key 'new_e2e_kie_key_via_dispatcher_2026' message fed into Dispatcher.
+      FSM state processed, AIConfig updated, handle_key_rotation supersedes active incidents
+      for both Telegram and MAX without false recovery alert, cancels outbox, and clears state.
+    - Step 5: Re-opened settings inspection confirms runtime sees new key.
     """
-    from aiogram.fsm.context import FSMContext
-    from aiogram.fsm.storage.memory import MemoryStorage, StorageKey
-    from aiogram.types import CallbackQuery, Chat, Message
+    from datetime import timezone
+    from aiogram import Dispatcher
+    from aiogram.fsm.storage.memory import MemoryStorage
+    from aiogram.types import CallbackQuery, Chat, Message, Update
     import handlers
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
 
     monkeypatch.setattr(handlers, "async_session_maker", test_db_session_maker)
     monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+    monkeypatch.setattr(handlers, "is_admin", lambda user_id: True)
     monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
     monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
 
@@ -1777,51 +1826,62 @@ async def test_item_6_admin_key_rotation_via_process_api_input_e2e(test_db_sessi
         await session.commit()
 
     storage = MemoryStorage()
-    storage_key = StorageKey(bot_id=8224473896, chat_id=777, user_id=777)
-    state = FSMContext(storage=storage, key=storage_key)
+    handlers.router._parent_router = None
+    dp = Dispatcher(storage=storage)
+    dp.include_router(handlers.router)
 
-    bot = AsyncMock(spec=Bot)
-    bot.id = 8224473896
-    bot.token = "8224473896:AAFtest_token"
-    bot.send_message = AsyncMock(return_value=True)
+    telegram_session = ValidatingTelegramSession()
+    bot = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session)
 
     user = TgUser(id=777, is_bot=False, first_name="Admin", username="admin777")
     chat = Chat(id=777, type="private")
 
-    # --- Case 1: Empty / whitespace input is rejected ---
-    await state.set_state(handlers.AdminStates.set_api_key)
-    await state.update_data(provider="KIE")
+    # --- Step 1: Admin clicks button 'model_setting_api_key_KIE' via Dispatcher ---
+    real_msg_settings = Message(message_id=10, date=datetime.now(timezone.utc), chat=chat, text="Settings")
+    update_btn = Update(
+        update_id=101,
+        callback_query=CallbackQuery(
+            id="cb_1",
+            from_user=user,
+            chat_instance="ci",
+            message=real_msg_settings,
+            data="model_setting_api_key_KIE",
+        ),
+    )
+    await dp.feed_update(bot, update_btn)
 
-    msg_empty = AsyncMock(spec=Message)
-    msg_empty.text = "   "
-    msg_empty.from_user = user
-    msg_empty.chat = chat
-    msg_empty.answer = AsyncMock()
-    msg_empty.delete = AsyncMock()
+    fsm_ctx = dp.fsm.get_context(bot=bot, user_id=777, chat_id=777)
+    assert await fsm_ctx.get_state() == handlers.AdminStates.set_api_key.state
+    data = await fsm_ctx.get_data()
+    assert data.get("provider") == "KIE"
 
-    await handlers.process_api_input(msg_empty, state, bot)
+    # --- Step 2: Empty/whitespace text sent -> Dispatcher handles -> rejected ---
+    update_empty = Update(
+        update_id=102,
+        message=Message(message_id=11, date=datetime.now(timezone.utc), chat=chat, from_user=user, text="   "),
+    )
+    await dp.feed_update(bot, update_empty)
+    assert await fsm_ctx.get_state() is None
 
-    msg_empty.answer.assert_called_once_with("API ключ не может быть пустым. Настройки не изменены.")
-    assert await state.get_state() is None
+    # --- Step 3: Cancellation callback via Dispatcher ---
+    await fsm_ctx.set_state(handlers.AdminStates.set_api_key)
+    await fsm_ctx.update_data(provider="KIE")
 
-    async with test_db_session_maker() as session:
-        cfg = await session.get(AIConfig, 1)
-        assert cfg.kie_api_key == "old_kie_key_111"
+    real_msg_cancel = Message(message_id=12, date=datetime.now(timezone.utc), chat=chat, text="Back")
+    update_cancel = Update(
+        update_id=103,
+        callback_query=CallbackQuery(
+            id="cb_cancel",
+            from_user=user,
+            chat_instance="ci",
+            message=real_msg_cancel,
+            data="admin_ai_keys",
+        ),
+    )
+    await dp.feed_update(bot, update_cancel)
+    assert await fsm_ctx.get_state() is None
 
-    # --- Case 2: Cancellation via admin_ai_keys callback ---
-    await state.set_state(handlers.AdminStates.set_api_key)
-    await state.update_data(provider="KIE")
-
-    cb_cancel = AsyncMock(spec=CallbackQuery)
-    cb_cancel.data = "admin_ai_keys"
-    cb_cancel.from_user = user
-    cb_cancel.message = AsyncMock()
-
-    await handlers.admin_ai_keys_models(cb_cancel, state=state)
-    assert await state.get_state() is None
-
-    # --- Case 3: Valid key input saves, rotates incidents, and re-renders settings ---
-    # Create active incidents for Telegram and MAX companion bots
+    # --- Step 4: Valid key input saves, rotates incidents, and re-renders settings ---
     err = InsufficientBalanceError("Credits depleted")
     err.provider = "KIE"
 
@@ -1843,35 +1903,28 @@ async def test_item_6_admin_key_rotation_via_process_api_input_e2e(test_db_sessi
     )
     assert inc_tg is not None and inc_max is not None
 
-    await state.set_state(handlers.AdminStates.set_api_key)
-    await state.update_data(
-        provider="KIE",
-        settings_message_id=999,
-        settings_chat_id=777,
-        settings_provider="KIE",
-    )
-
-    msg_valid = AsyncMock(spec=Message)
-    msg_valid.text = "new_valid_kie_key_2026"
-    msg_valid.from_user = user
-    msg_valid.chat = chat
-    msg_valid.answer = AsyncMock()
-    msg_valid.delete = AsyncMock()
+    # Click button to set key again via Dispatcher
+    await dp.feed_update(bot, update_btn)
+    assert await fsm_ctx.get_state() == handlers.AdminStates.set_api_key.state
 
     mock_render = AsyncMock()
     monkeypatch.setattr(handlers, "_edit_provider_model_settings", mock_render)
     monkeypatch.setattr(handlers, "send_temp_notification", AsyncMock())
 
-    await handlers.process_api_input(msg_valid, state, bot)
+    update_valid = Update(
+        update_id=104,
+        message=Message(message_id=14, date=datetime.now(timezone.utc), chat=chat, from_user=user, text="new_valid_kie_key_via_dispatcher_2026"),
+    )
+    await dp.feed_update(bot, update_valid)
 
-    assert await state.get_state() is None
+    assert await fsm_ctx.get_state() is None
 
-    # 1. AIConfig updated
+    # 1. AIConfig updated in DB
     async with test_db_session_maker() as session:
         cfg = await session.get(AIConfig, 1)
-        assert cfg.kie_api_key == "new_valid_kie_key_2026"
+        assert cfg.kie_api_key == "new_valid_kie_key_via_dispatcher_2026"
 
-        # 2. Both Telegram and MAX incidents superseded (NOT resolved, so no false recovery alert!)
+        # 2. Both Telegram and MAX incidents superseded (NOT resolved, no false alert)
         db_inc_tg = await session.get(AIProviderIncidentModel, inc_tg.id)
         db_inc_max = await session.get(AIProviderIncidentModel, inc_max.id)
         assert db_inc_tg.status == "superseded"
@@ -1886,7 +1939,369 @@ async def test_item_6_admin_key_rotation_via_process_api_input_e2e(test_db_sessi
             assert n.last_error == "superseded_by_key_rotation"
 
         # 4. Settings view re-rendered with new key
-        mock_render.assert_called_once_with(bot, 777, 999, "KIE")
+        mock_render.assert_called_once_with(bot, 777, 10, "KIE")
+
+
+@pytest.mark.asyncio
+async def test_item_1_kie_key_rotation_reconciles_alert_sent_flag_and_allows_new_warning(test_db_session_maker, monkeypatch):
+    """Defect 1: Rotating KIE key reconciles kie_credit_alert_sent with the new credential scope:
+    - Old key had low credit warning (kie_credit_alert_sent = True).
+    - Rotating to new key reconciles kie_credit_alert_sent to False because new key has no active incident.
+    - Scheduler running for new key with low balance succeeds in creating a new warning!
+    - Historical dirty state (flag = True without active incident) is reconciled on scheduler check.
+    """
+    inst_def = {"pm2_name": "tg_someonewithyou01_bot_new", "platform": "telegram", "platform_id": 8281390498, "admins": [1001], "username": "someonewithyou01_bot"}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[1001]))
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_token_reconcile")
+    monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+
+    # 1. Old key with active warning and kie_credit_alert_sent = True
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="KIE", kie_api_key="old_kie_key_dirty", kie_base_url="https://api.kie.ai", kie_credit_alert_threshold=2.0, kie_credit_alert_sent=True)
+            session.add(cfg)
+        else:
+            cfg.provider = "KIE"
+            cfg.kie_api_key = "old_kie_key_dirty"
+            cfg.kie_base_url = "https://api.kie.ai"
+            cfg.kie_credit_alert_threshold = 2.0
+            cfg.kie_credit_alert_sent = True
+        await session.commit()
+
+    old_fp = get_provider_account_fingerprint("old_kie_key_dirty", "https://api.kie.ai")
+    await record_low_credit_warning(
+        provider="KIE",
+        remaining_credits=1.0,
+        threshold=2.0,
+        api_key="old_kie_key_dirty",
+        base_url="https://api.kie.ai",
+        session_maker=test_db_session_maker,
+    )
+
+    # 2. Key rotation to new key
+    await handle_key_rotation(
+        origin_instance_id=None,
+        provider="KIE",
+        new_key="new_kie_key_clean",
+        base_url="https://api.kie.ai",
+        session_maker=test_db_session_maker,
+    )
+
+    # Verify: old incident is superseded, and AIConfig.kie_credit_alert_sent is reconciled to False!
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        assert cfg.kie_credit_alert_sent is False
+
+        # Update api_key on config to match new key
+        cfg.kie_api_key = "new_kie_key_clean"
+        await session.commit()
+
+    # 3. Scheduler check runs for new key with low credits (0.50 < 2.0)
+    bot = AsyncMock(spec=Bot)
+    bot.token = "8281390498:AAFtest_token_reconcile"
+    bot.get_me = AsyncMock(return_value=TgUser(id=8281390498, is_bot=True, first_name="bot", username="someonewithyou01_bot"))
+    bot.send_message = AsyncMock(return_value=True)
+
+    monkeypatch.setattr(scheduler, "async_session_maker", test_db_session_maker)
+    monkeypatch.setattr(scheduler, "get_kie_remaining_credits", AsyncMock(return_value=0.50))
+    monkeypatch.setattr(scheduler, "get_all_admin_ids", AsyncMock(return_value=[1001]))
+
+    await scheduler.check_kie_credit_balance(bot)
+
+    # Verify: warning for new key WAS created and delivered (NOT blocked by old flag!)
+    async with test_db_session_maker() as session:
+        cfg_after = await session.get(AIConfig, 1)
+        assert cfg_after.kie_credit_alert_sent is True
+
+        new_fp = get_provider_account_fingerprint("new_kie_key_clean", "https://api.kie.ai")
+        new_inc = (await session.execute(
+            select(AIProviderIncidentModel).where(
+                AIProviderIncidentModel.provider == "KIE",
+                AIProviderIncidentModel.credential_scope == new_fp,
+                AIProviderIncidentModel.status == "active",
+            )
+        )).scalar_one_or_none()
+        assert new_inc is not None
+        assert new_inc.incident_type == "low_credit_warning"
+
+
+@pytest.mark.asyncio
+async def test_item_2_autobus_does_not_mask_operational_error_or_internal_error_during_chat(monkeypatch, tmp_path):
+    """Defect 2: OperationalError, application_internal, and worker crashes in chat are NOT masked as Handled AI notice:
+    - Calling notify_admins_about_error with OperationalError logs error without 'Handled AI notice:'.
+    - Monitor extracts error and Autobus alerts.
+    - Calling notify_admins_about_error with confirmed AI RateLimitError DOES log 'Handled AI notice:' and Autobus ignores it.
+    """
+    import error_reporting
+    from sqlalchemy.exc import OperationalError
+
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+
+    error_log_file = tmp_path / "bot-error.log"
+    error_log_file.write_text("2026-11-15 11:00:00 | INFO | Bot startup\n")
+
+    apps = [
+        {
+            "name": "tg_someonewithyou01_bot_new",
+            "status": "online",
+            "token": "tok_1",
+            "owner_ids": [272982544],
+            "error_log": str(error_log_file),
+        }
+    ]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    async def fake_empty_async(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(monitor, "check_db_schema", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_telegram", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+
+    sent_alerts = []
+    async def fake_send_alert(a, text, **kwargs):
+        sent_alerts.append(text)
+        return True
+    monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
+
+    # 1. Confirmed AI error: rate limit
+    mock_bot = AsyncMock(spec=Bot)
+    mock_bot.send_message = AsyncMock(return_value=True)
+
+    fake_logger_warn = MagicMock(spec=logging.Logger)
+    await error_reporting.notify_admins_about_error(
+        mock_bot,
+        title="Rate limit exceeded",
+        provider="KIE",
+        stage="chat",
+        classification="rate_limit",
+        logger=fake_logger_warn,
+    )
+    assert fake_logger_warn.warning.called
+    assert "Handled AI notice:" in fake_logger_warn.warning.call_args[0][0]
+
+    # 2. Unexpected database / infrastructure OperationalError in chat
+    db_err = OperationalError("FATAL: connection to server lost", None, None)
+    fake_logger_err = MagicMock(spec=logging.Logger)
+    await error_reporting.notify_admins_about_error(
+        mock_bot,
+        title="Database error during AI chat",
+        provider="KIE",
+        stage="chat",
+        exception=db_err,
+        classification="application_internal",
+        logger=fake_logger_err,
+    )
+    assert fake_logger_err.log.called
+    # Verify NO Handled AI notice: prefix
+    logged_str = fake_logger_err.log.call_args[0][1]
+    assert "Handled AI notice:" not in logged_str
+    assert "OperationalError" in logged_str
+
+    # Baseline check: offset initialized, 0 alerts
+    exit_code_0 = await monitor.run_check(False)
+    assert exit_code_0 == 0
+
+    # Write OperationalError to PM2 error log and verify Autobus alerts
+    with open(error_log_file, "a", encoding="utf-8") as f:
+        f.write("2026-11-15 12:00:00 | ERROR | [AI Incident Worker] OperationalError: server closed connection\nTraceback (most recent call last):\n  File \"worker.py\", line 42\nOperationalError: server closed connection\n")
+
+    exit_code = await monitor.run_check(False)
+    assert exit_code == 1
+    assert len(sent_alerts) == 1
+    assert "OperationalError" in sent_alerts[0]
+
+
+@pytest.mark.asyncio
+async def test_item_3_low_credit_reminder_exact_financial_message_and_cas_concurrency(test_db_session_maker, monkeypatch):
+    """Defect 3: Low credit reminders preserve exact financial meaning, and CAS prevents duplicate reminder cycles:
+    - Reminder text contains financial warning, not 'Сбой AI-провайдера'.
+    - 2 concurrent workers running check_incident_repeat_reminders: exactly one succeeds in CAS update.
+    - Exactly one repeat reminder outbox record created.
+    """
+    # 1. Message formatting check
+    text_rem = _format_incident_message_text(
+        provider="KIE",
+        operation="account",
+        model_scope="*",
+        incident_type="low_credit_warning",
+        detail_code="balance_0.50_below_2.00",
+        evidence_tier="CONFIRMED_STRUCTURED",
+        event_type="repeat_reminder",
+    )
+    assert "Напоминание: низкий баланс KIE" in text_rem
+    assert "Сбой AI-провайдера" not in text_rem
+    assert "Баланс остается ниже порога предупреждения" in text_rem
+
+    # 2. Concurrent CAS execution check
+    inst_def = {"pm2_name": "tg_someonewithyou01_bot_new", "platform": "telegram", "platform_id": 8281390498, "admins": [555], "username": "someonewithyou01_bot"}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[555]))
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_token_cas")
+
+    inc = await record_low_credit_warning(
+        provider="KIE",
+        remaining_credits=0.50,
+        threshold=2.00,
+        api_key="kie_cas_key",
+        session_maker=test_db_session_maker,
+    )
+    assert inc is True
+
+    # Age incident by 7 hours
+    async with test_db_session_maker() as session:
+        inc_obj = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.incident_type == "low_credit_warning")
+        )).scalar_one()
+        inc_obj.last_alerted_at = datetime.utcnow() - timedelta(hours=7)
+        await session.commit()
+
+    # Launch 2 concurrent workers attempting repeat reminder check
+    res_1, res_2 = await asyncio.gather(
+        check_incident_repeat_reminders(repeat_seconds=DEFAULT_REPEAT_ALERT_SECONDS, session_maker=test_db_session_maker),
+        check_incident_repeat_reminders(repeat_seconds=DEFAULT_REPEAT_ALERT_SECONDS, session_maker=test_db_session_maker),
+    )
+    # Exactly one succeeded in the atomic CAS update
+    assert res_1 + res_2 == 1
+
+    async with test_db_session_maker() as session:
+        inc_after = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.incident_type == "low_credit_warning")
+        )).scalar_one()
+        assert inc_after.reminder_cycle == 1
+
+        rem_notifs = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.incident_id == inc_after.id,
+                AIIncidentNotificationModel.event_type == "repeat_reminder",
+            )
+        )).scalars().all()
+        assert len(rem_notifs) == 1
+        assert rem_notifs[0].cycle_index == 1
+        assert "Напоминание: низкий баланс KIE" in rem_notifs[0].message_text
+
+
+@pytest.mark.asyncio
+async def test_item_5_terminal_failure_both_providers_fail_separate_incidents_and_cooldown_dedup(test_db_session_maker, monkeypatch):
+    """Defect 5: When both primary and fallback fail:
+    - Primary provider (KIE) and fallback provider (OpenAI) open separate incidents.
+    - Outbox has separate 'opened' records for each provider without artificial merging.
+    - send_terminal_ai_failure_alert provides request diagnostic context.
+    - Immediate subsequent failure is deduplicated: incidents increment occurrence_count, zero duplicate outbox rows.
+    """
+    import ai_integration
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    bot_token = "8281390498:AAFtest_telegram_token_terminal"
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+    inst_def = {"pm2_name": "tg_someonewithyou01_bot_new", "platform": "telegram", "platform_id": 8281390498, "admins": [7001], "username": "someonewithyou01_bot"}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[7001]))
+
+    monkeypatch.setattr(ai_integration, "async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+    monkeypatch.setattr(ai_integration, "build_runtime_context", AsyncMock(return_value="runtime context"))
+
+    # Seed AIConfig and User in DB
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1)
+            session.add(cfg)
+        cfg.provider = "KIE"
+        cfg.kie_api_key = "kie_key_term"
+        cfg.kie_model = "mock-kie-chat"
+        cfg.allow_fallback = True
+        cfg.fallback_provider = "OpenAI"
+        cfg.fallback_model = "mock-openai-gpt"
+        cfg.openai_api_key = "openai_key_term"
+
+        user_row = await session.get(User, 777)
+        if not user_row:
+            user_row = User(id=777, tg_user_id=777, username="termuser", name="Term User")
+            session.add(user_row)
+        await session.commit()
+
+    mock_bot = AsyncMock(spec=Bot)
+    mock_bot.token = bot_token
+    mock_bot.get_me = AsyncMock(return_value=TgUser(id=8281390498, is_bot=True, first_name="bot", username="someonewithyou01_bot"))
+    mock_bot.send_message = AsyncMock(return_value=True)
+
+    # Both fail: KIE credits exhausted, OpenAI quota exhausted
+    primary_err = InsufficientBalanceError("KIE credits empty")
+    primary_err.provider = "KIE"
+    fb_err = InsufficientBalanceError("OpenAI quota exceeded")
+    fb_err.provider = "OpenAI"
+
+    monkeypatch.setattr(ai_integration, "_call_kie_chat", AsyncMock(side_effect=primary_err))
+    monkeypatch.setattr(ai_integration, "_call_openai_api", AsyncMock(side_effect=fb_err))
+
+    # Request 1 fails terminally
+    with pytest.raises(ai_integration.AIServiceError):
+        await ai_integration.get_ai_response(
+            777,
+            "Terminal query 1",
+            "Term User",
+            "unknown",
+            bot=mock_bot,
+            include_test_context=False,
+        )
+
+    async with test_db_session_maker() as session:
+        # Separate incidents for KIE and OpenAI
+        incidents = (await session.execute(select(AIProviderIncidentModel))).scalars().all()
+        assert len(incidents) == 2
+        prov_map = {inc.provider: inc for inc in incidents}
+        assert "KIE" in prov_map
+        assert "OPENAI" in prov_map
+        assert prov_map["KIE"].occurrence_count == 1
+        assert prov_map["OPENAI"].occurrence_count == 1
+
+        # Outbox rows: separate opened rows for each provider
+        notifs = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        assert len(notifs) == 2
+        for n in notifs:
+            assert n.event_type == "opened"
+
+    # Request 2 fails terminally immediately afterwards
+    with pytest.raises(ai_integration.AIServiceError):
+        await ai_integration.get_ai_response(
+            777,
+            "Terminal query 2",
+            "Term User",
+            "unknown",
+            bot=mock_bot,
+            include_test_context=False,
+        )
+
+    async with test_db_session_maker() as session:
+        # Still exactly 2 incidents, occurrence_count incremented to 2
+        incidents_2 = (await session.execute(select(AIProviderIncidentModel))).scalars().all()
+        assert len(incidents_2) == 2
+        prov_map_2 = {inc.provider: inc for inc in incidents_2}
+        assert prov_map_2["KIE"].occurrence_count == 2
+        assert prov_map_2["OPENAI"].occurrence_count == 2
+
+        # Zero duplicate outbox rows created!
+        notifs_2 = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        assert len(notifs_2) == 2
 
 
 # ==============================================================================

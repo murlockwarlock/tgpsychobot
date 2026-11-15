@@ -528,6 +528,22 @@ async def check_kie_credit_balance(bot: Bot):
             if not api_key or threshold <= 0:
                 return
 
+            from ai_incident_manager import get_provider_account_fingerprint
+            from database import AIProviderIncidentModel
+            from sqlalchemy import select
+
+            current_fp = get_provider_account_fingerprint(api_key, base_url)
+            stmt_active_warn = select(AIProviderIncidentModel).where(
+                AIProviderIncidentModel.provider == "KIE",
+                AIProviderIncidentModel.credential_scope == current_fp,
+                AIProviderIncidentModel.incident_type == "low_credit_warning",
+                AIProviderIncidentModel.status == "active",
+            )
+            has_active_warn = (await session.scalar(stmt_active_warn)) is not None
+            if config.kie_credit_alert_sent != has_active_warn:
+                config.kie_credit_alert_sent = has_active_warn
+                await session.commit()
+
             remaining_credits = await get_kie_remaining_credits(api_key, base_url)
 
             if remaining_credits < threshold:

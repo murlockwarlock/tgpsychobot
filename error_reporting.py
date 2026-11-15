@@ -546,10 +546,23 @@ async def notify_admins_about_error(
     if extra:
         log_lines.append(f"extra={_safe_extra_text(extra)}")
 
-    from provider_failures import OPERATOR_CLASSES, RETRYABLE_CLASSES
+    from provider_failures import OPERATOR_CLASSES, RETRYABLE_CLASSES, ProviderFailure
+    from sqlalchemy.exc import SQLAlchemyError
+
+    err_target = root_exception or exception
+    err_type_name = type(err_target).__name__ if err_target is not None else ""
+    is_infra_or_db_error = (
+        isinstance(err_target, (SQLAlchemyError, ConnectionError, OSError))
+        or any(k in err_type_name for k in ("OperationalError", "DatabaseError", "ProgrammingError", "IntegrityError", "InterfaceError"))
+    )
+    is_internal_class = classification in {"application_internal", "unknown", None}
+
+    # Strict typed contract: handled AI notice ONLY for confirmed provider failures (retryable / operator quota)
     is_handled_ai = (
-        classification in (OPERATOR_CLASSES | RETRYABLE_CLASSES)
-        or (provider and stage in ("chat", "vision", "transcription", "image_generation", "image_edit", "ai_provider_fallback", "check_credit_balance"))
+        not is_infra_or_db_error
+        and not is_internal_class
+        and classification in (OPERATOR_CLASSES | RETRYABLE_CLASSES)
+        and (provider is not None or isinstance(getattr(exception, "failure", None), ProviderFailure))
     )
 
     if is_handled_ai:
