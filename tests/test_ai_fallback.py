@@ -510,7 +510,7 @@ async def test_successful_fallback_does_not_raise_or_emit_generic_ai_failure(mon
     import ai_integration
 
     fallback_notice = AsyncMock()
-    monkeypatch.setattr(ai_integration, "_notify_ai_fallback_used", fallback_notice)
+    monkeypatch.setattr(ai_integration, "send_ai_fallback_used_alert", fallback_notice)
     result, _, fallback = await _run_telegram(
         monkeypatch,
         ai_integration.AIResponseError("KIE chat returned empty content"),

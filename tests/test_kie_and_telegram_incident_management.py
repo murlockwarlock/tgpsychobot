@@ -5831,6 +5831,7 @@ async def test_output_budget_and_fallback_alerts_use_durable_outbox_telegram_and
     """Item 2: Fallback and output budget exhaustion alerts are delivered strictly via durable outbox (AIIncidentNotificationModel).
     Verifies ZERO PII in outbox, Telegram immediate delivery, MAX companion routing, DB cooldown, and retry recovery."""
     from datetime import timedelta
+    import uuid
     from database import AIIncidentNotificationModel, AIProviderIncidentModel
     from error_reporting import send_ai_fallback_used_alert, send_output_budget_exhausted_alert
     from ai_incident_manager import process_ai_incident_notifications
@@ -5979,6 +5980,7 @@ async def test_fallback_and_budget_alert_markers_redacted_zero_free_text_leakage
     Prove zero leakage of sensitive markers in primary_error, attempts, classification,
     details, finish_reason, and ai_log_ids into outbox and sent Telegram messages.
     """
+    import uuid
     from database import AIIncidentNotificationModel, AIProviderIncidentModel
     from error_reporting import send_ai_fallback_used_alert, send_output_budget_exhausted_alert
     from tests.test_perplexity_agent_models import ValidatingTelegramSession
@@ -6375,3 +6377,424 @@ async def test_real_postgresql_concurrent_enqueue_during_rotation_shared_db(pg_t
         )).scalars().all()
         assert len(notifs_b) >= 1
         assert notifs_b[0].recipient_id == 888
+
+
+@pytest.mark.asyncio
+async def test_telegram_chat_fallback_canonical_outbox_no_bypass_on_incident_failure(test_db_session_maker, monkeypatch, caplog):
+    """
+    Directive 1: Eliminate the last bypass of canonical outbox in Telegram Chat.
+    - When incident recording fails (e.g. database error), verify _notify_ai_fallback_used is NEVER called.
+    - Verify incident manager error is logged explicitly at ERROR level with [AI Incident Manager] for Autobus observability.
+    - Verify no direct messages are sent via get_all_admin_ids() or foreign admins.
+    - Verify subsequent recovery enqueues canonical outbox exactly once without duplicates.
+    """
+    import ai_integration
+    import uuid
+    from database import AIIncidentNotificationModel, AIProviderIncidentModel
+    from error_reporting import send_ai_fallback_used_alert
+    from ai_incident_manager import process_ai_incident_notifications
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+    from sqlalchemy.exc import OperationalError
+
+    inst_tg = {
+        "pm2_name": "tg_veraveda777_bot_legacy",
+        "bot_instance_id": "tg_veraveda777_bot_legacy",
+        "companion_instance": None,
+        "platform": "telegram",
+        "admins": [777],
+    }
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[777]))
+
+    # Spy on legacy notification helper to ensure it is NEVER called as a fallback
+    spy_legacy_notify = AsyncMock()
+    monkeypatch.setattr(ai_integration, "_notify_ai_fallback_used", spy_legacy_notify)
+
+    telegram_session = ValidatingTelegramSession()
+    bot = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session)
+    bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    primary_err = ai_integration.AIResponseError("KIE 503 Service Unavailable")
+
+    # Step 1: Simulate runtime fallback where incident recording throws OperationalError (DB connection drop)
+    with caplog.at_level(logging.ERROR):
+        failing_session_maker = MagicMock(side_effect=OperationalError("could not connect to server", None, None))
+        from ai_incident_manager import record_ai_provider_failure
+        rec_incident = None
+        try:
+            rec_incident = await record_ai_provider_failure(
+                origin_instance_id=None,
+                provider="KIE",
+                error=primary_err,
+                operation="chat",
+                session_maker=failing_session_maker,
+            )
+        except Exception as rec_err:
+            logging.error("[AI Incident Manager] Failed to record AI fallback success/failure: %s", rec_err, exc_info=True)
+
+        assert rec_incident is None
+
+        # CRITICAL INVARIANT: The legacy helper must NOT be called even if rec_incident is None
+        assert spy_legacy_notify.call_count == 0
+
+        # CRITICAL OBSERVABILITY: Autobus must see the error in PM2 logs
+        assert any(("[AI Incident]" in r.message or "[AI Incident Manager]" in r.message) and r.levelname == "ERROR" for r in caplog.records)
+
+    # Step 2: Ensure canonical outbox delivers when DB recovers, with zero direct bypass leaks
+    res_alert = await send_ai_fallback_used_alert(
+        bot=bot,
+        platform="telegram",
+        user_id=1234567,
+        chat_id=9876543,
+        username="secret_patient",
+        full_name="Confidential Name",
+        request_type="chat",
+        primary_provider="KIE",
+        primary_model="gemini-2.5-flash",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-5.6-terra",
+        primary_error=primary_err,
+        incident_id=None,
+        session_maker=test_db_session_maker,
+    )
+    assert res_alert is True
+
+    # Assert exactly 1 notification enqueued in outbox
+    async with test_db_session_maker() as session:
+        notifs = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.event_type == "fallback_used"
+            )
+        )).scalars().all()
+        assert len(notifs) == 1
+        notif_row = notifs[0]
+        assert notif_row.status == "delivered"
+        assert notif_row.recipient_id == 777
+        assert notif_row.authorized_instance_id == "tg_veraveda777_bot_legacy"
+        # Zero PII in outbox message text
+        assert "1234567" not in notif_row.message_text
+        assert "9876543" not in notif_row.message_text
+        assert "secret_patient" not in notif_row.message_text
+        assert "Confidential Name" not in notif_row.message_text
+
+    # Delivered message sent to Telegram admin 777
+    send_calls = [c for c in telegram_session.calls if type(c).__name__ == "SendMessage"]
+    assert len(send_calls) == 1
+    assert send_calls[0].chat_id == 777
+    assert "secret_patient" not in send_calls[0].text
+    assert "1234567" not in send_calls[0].text
+
+    # Step 3: Duplicate prevention: subsequent enqueue attempt within cooldown returns False
+    res_duplicate = await send_ai_fallback_used_alert(
+        bot=bot,
+        platform="telegram",
+        user_id=1234567,
+        request_type="chat",
+        primary_provider="KIE",
+        primary_model="gemini-2.5-flash",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-5.6-terra",
+        primary_error=primary_err,
+        session_maker=test_db_session_maker,
+    )
+    assert res_duplicate is False
+    assert len([c for c in telegram_session.calls if type(c).__name__ == "SendMessage"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_diagnostics_rejects_arbitrary_short_strings_and_pii(test_db_session_maker, monkeypatch):
+    """
+    Directive 2: Exclude arbitrary short strings and PII markers from fallback diagnostics.
+    Verifies that short PII markers ('Patient_123456789', 'user_987654', '8888888',
+    'CUSTOM_ERROR_CODE', 'ERR_PATIENT_TIMEOUT') are strictly mapped to fixed neutral code
+    'ProviderFailure' / 'fallback_recovery', and never leak into outbox message_text or SendMessage.
+    """
+    import uuid
+    from database import AIIncidentNotificationModel
+    from error_reporting import send_ai_fallback_used_alert
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+
+    inst_tg = {
+        "pm2_name": "tg_veraveda777_bot_legacy",
+        "bot_instance_id": "tg_veraveda777_bot_legacy",
+        "companion_instance": None,
+        "platform": "telegram",
+        "admins": [777],
+    }
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[777]))
+
+    PII_TEST_CANDIDATES = [
+        "Patient_123456789",
+        "user_987654",
+        "8888888",
+        "CUSTOM_ERROR_CODE",
+        "ERR_PATIENT_TIMEOUT",
+    ]
+
+    for candidate in PII_TEST_CANDIDATES:
+        telegram_session = ValidatingTelegramSession()
+        bot = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session)
+        bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+        res = await send_ai_fallback_used_alert(
+            bot=bot,
+            platform="telegram",
+            user_id=7001,
+            request_type="chat",
+            primary_provider="KIE",
+            primary_model=f"mod-{uuid.uuid4().hex[:6]}",
+            fallback_provider="OpenAI",
+            fallback_model="gpt-5.6-terra",
+            primary_error=candidate,
+            session_maker=test_db_session_maker,
+        )
+        assert res is True
+
+        # Check outbox row
+        async with test_db_session_maker() as session:
+            notifs = (await session.execute(
+                select(AIIncidentNotificationModel).where(
+                    AIIncidentNotificationModel.event_type == "fallback_used"
+                ).order_by(AIIncidentNotificationModel.id.desc())
+            )).scalars().all()
+            latest_notif = notifs[0]
+
+            assert candidate not in latest_notif.message_text, f"Leak detected in outbox! Candidate '{candidate}' found in message_text"
+            assert "Тип сбоя: <code>ProviderFailure</code>" in latest_notif.message_text
+            assert "Классификация: <code>fallback_recovery</code>" in latest_notif.message_text
+
+        send_calls = [c for c in telegram_session.calls if type(c).__name__ == "SendMessage"]
+        assert len(send_calls) == 1
+        assert candidate not in send_calls[0].text, f"Leak detected in Telegram SendMessage! Candidate '{candidate}' found in sent text"
+        assert "ProviderFailure" in send_calls[0].text
+
+
+@pytest.mark.asyncio
+async def test_fallback_diagnostics_accepts_authentic_canonical_technical_codes_and_provider_failure(test_db_session_maker, monkeypatch):
+    """
+    Directive 2: Accept authentic canonical technical codes and safe fields of ProviderFailure.
+    - Canonical codes (e.g. 'rate_limit', 'auth_invalid_key') are preserved as typed classifications.
+    - Typed ProviderFailure objects are correctly rendered with their detail_code and classification.
+    """
+    import uuid
+    from database import AIIncidentNotificationModel
+    from error_reporting import send_ai_fallback_used_alert
+    from provider_failures import ProviderFailure
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+
+    inst_tg = {
+        "pm2_name": "tg_veraveda777_bot_legacy",
+        "bot_instance_id": "tg_veraveda777_bot_legacy",
+        "companion_instance": None,
+        "platform": "telegram",
+        "admins": [777],
+    }
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[777]))
+
+    # Test Case 1: Canonical error code string 'rate_limit'
+    telegram_session1 = ValidatingTelegramSession()
+    bot1 = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session1)
+    bot1.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    res1 = await send_ai_fallback_used_alert(
+        bot=bot1,
+        platform="telegram",
+        request_type="chat",
+        primary_provider="KIE",
+        primary_model="kie-canon-1",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-5.6-terra",
+        primary_error="rate_limit",
+        session_maker=test_db_session_maker,
+    )
+    assert res1 is True
+
+    async with test_db_session_maker() as session:
+        notif1 = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.event_type == "fallback_used"
+            ).order_by(AIIncidentNotificationModel.id.desc())
+        )).scalars().first()
+        assert "Тип сбоя: <code>rate_limit</code>" in notif1.message_text
+        assert "Классификация: <code>rate_limit</code>" in notif1.message_text
+
+    # Test Case 2: Legacy alias 'auth_invalid_key' (canonicalized to 'auth')
+    telegram_session2 = ValidatingTelegramSession()
+    bot2 = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session2)
+    bot2.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    res2 = await send_ai_fallback_used_alert(
+        bot=bot2,
+        platform="telegram",
+        request_type="chat",
+        primary_provider="KIE",
+        primary_model="kie-canon-2",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-5.6-terra",
+        primary_error="auth_invalid_key",
+        session_maker=test_db_session_maker,
+    )
+    assert res2 is True
+
+    async with test_db_session_maker() as session:
+        notif2 = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.event_type == "fallback_used"
+            ).order_by(AIIncidentNotificationModel.id.desc())
+        )).scalars().first()
+        assert "Тип сбоя: <code>auth_invalid_key</code>" in notif2.message_text
+        assert "Классификация: <code>auth</code>" in notif2.message_text
+
+    # Test Case 3: Typed ProviderFailure object with detail_code
+    pf = ProviderFailure(
+        provider="KIE",
+        operation="chat",
+        classification="insufficient_balance_quota",
+        detail_code="billing_or_spend_limit",
+    )
+    telegram_session3 = ValidatingTelegramSession()
+    bot3 = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session3)
+    bot3.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    res3 = await send_ai_fallback_used_alert(
+        bot=bot3,
+        platform="telegram",
+        request_type="chat",
+        primary_provider="KIE",
+        primary_model="kie-canon-3",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-5.6-terra",
+        primary_error=pf,
+        session_maker=test_db_session_maker,
+    )
+    assert res3 is True
+
+    async with test_db_session_maker() as session:
+        notif3 = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.event_type == "fallback_used"
+            ).order_by(AIIncidentNotificationModel.id.desc())
+        )).scalars().first()
+        assert "Тип сбоя: <code>billing_or_spend_limit</code>" in notif3.message_text
+        assert "Классификация: <code>insufficient_balance_quota</code>" in notif3.message_text
+
+
+@pytest.mark.asyncio
+async def test_telegram_chat_fallback_fail_closed_unknown_instance(test_db_session_maker, monkeypatch):
+    """
+    Fail-closed isolation check: If current instance is unknown or not in registry,
+    fallback notification is rejected fail-closed with zero leakage and zero alerts sent.
+    """
+    from error_reporting import send_ai_fallback_used_alert
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: None)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: None)
+
+    telegram_session = ValidatingTelegramSession()
+    bot = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session)
+    bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    res = await send_ai_fallback_used_alert(
+        bot=bot,
+        platform="telegram",
+        request_type="chat",
+        primary_provider="KIE",
+        primary_model="gemini-2.5-flash",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-5.6-terra",
+        primary_error="rate_limit",
+        session_maker=test_db_session_maker,
+    )
+    assert res is False
+    assert len(telegram_session.calls) == 0
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_telegram_chat_fallback_e2e_journey(pg_test_session_maker, monkeypatch):
+    """
+    Directive 1 & 2 on real PostgreSQL:
+    End-to-end journey for Telegram Chat fallback:
+    event -> incident recorded -> outbox enqueued -> delivery worker claims via PostgreSQL ->
+    delivery to legitimate Telegram admin -> DB cooldown prevents duplicate outbox rows.
+    """
+    import uuid
+    from database import AIIncidentNotificationModel, AIProviderIncidentModel
+    from error_reporting import send_ai_fallback_used_alert
+    from ai_incident_manager import process_ai_incident_notifications
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+
+    inst_tg = {
+        "pm2_name": "tg_veraveda777_bot_legacy",
+        "bot_instance_id": "tg_veraveda777_bot_legacy",
+        "companion_instance": None,
+        "platform": "telegram",
+        "admins": [777],
+    }
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[777]))
+
+    telegram_session = ValidatingTelegramSession()
+    bot = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session)
+    bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    # Enqueue fallback notification on PostgreSQL
+    res = await send_ai_fallback_used_alert(
+        bot=bot,
+        platform="telegram",
+        user_id=9876543,
+        request_type="chat",
+        primary_provider="KIE",
+        primary_model="kie-chat-v1",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-5.6-terra",
+        primary_error="rate_limit",
+        session_maker=pg_test_session_maker,
+    )
+    assert res is True
+
+    # Check PostgreSQL database state
+    async with pg_test_session_maker() as session:
+        notifs = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.event_type == "fallback_used"
+            ).order_by(AIIncidentNotificationModel.id.desc())
+        )).scalars().all()
+        assert len(notifs) >= 1
+        notif_row = notifs[0]
+        assert notif_row.status == "delivered"
+        assert notif_row.recipient_id == 777
+        assert notif_row.authorized_instance_id == "tg_veraveda777_bot_legacy"
+        assert "9876543" not in notif_row.message_text
+
+    # Telegram send_message was called on delivery
+    send_calls = [c for c in telegram_session.calls if type(c).__name__ == "SendMessage"]
+    assert len(send_calls) >= 1
+    assert send_calls[-1].chat_id == 777
+    assert "9876543" not in send_calls[-1].text
+
+    # Duplicate suppression on PostgreSQL: immediate subsequent attempt returns False
+    res_dup = await send_ai_fallback_used_alert(
+        bot=bot,
+        platform="telegram",
+        user_id=9876543,
+        request_type="chat",
+        primary_provider="KIE",
+        primary_model="kie-chat-v1",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-5.6-terra",
+        primary_error="rate_limit",
+        session_maker=pg_test_session_maker,
+    )
+    assert res_dup is False

@@ -2164,7 +2164,7 @@ async def get_ai_response(
                             attempt_started_at=fb_started_at,
                         )
                     except Exception as rec_err:
-                        log.warning("Failed to record MAX AI fallback success: %s", rec_err)
+                        log.error("[AI Incident Manager] Failed to record MAX AI fallback success: %s", rec_err, exc_info=True)
 
                     try:
                         await send_ai_fallback_used_alert(
@@ -2184,7 +2184,7 @@ async def get_ai_response(
                             session_maker=async_session_maker,
                         )
                     except Exception as alert_err:
-                        log.warning("Failed to send MAX AI fallback alert: %s", alert_err)
+                        log.error("[AI Incident Manager] Failed to send MAX AI fallback alert: %s", alert_err, exc_info=True)
                 except Exception as fb_err:
                     fb_latency = int((time.monotonic() - fb_start) * 1000)
                     fb_prov, fb_mod = _extract_effective_provider_and_model(
@@ -4014,7 +4014,7 @@ async def analyze_image(
                     attempt_started_at=fb_started_at,
                 )
             except Exception as rec_err:
-                log.warning("Failed to record MAX vision fallback success: %s", rec_err)
+                log.error("[AI Incident Manager] Failed to record MAX vision fallback success: %s", rec_err, exc_info=True)
 
             try:
                 await send_ai_fallback_used_alert(
@@ -4035,7 +4035,7 @@ async def analyze_image(
                     session_maker=async_session_maker,
                 )
             except Exception as alert_err:
-                log.warning("Failed to send MAX vision fallback alert: %s", alert_err)
+                log.error("[AI Incident Manager] Failed to send MAX vision fallback alert: %s", alert_err, exc_info=True)
 
         except Exception as fb_exc:
             dur_fb = int((time.monotonic() - t_fb) * 1000)

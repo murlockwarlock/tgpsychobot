@@ -117,6 +117,26 @@ _CODE_GROUPS = {
     "unknown": "unmapped",
 }
 CODE_CLASSES = {code: cls for cls, codes in _CODE_GROUPS.items() for code in codes.split()}
+KNOWN_TECHNICAL_CODES: frozenset[str] = frozenset(
+    CANONICAL_CLASSES
+    | frozenset(LEGACY_ALIASES.keys())
+    | frozenset(CODE_CLASSES.keys())
+    | {
+        "billing_or_spend_limit",
+        "billing_or_credit_exhaustion",
+        "spend_limit",
+        "size_incompatible",
+        "invalid_model_or_parameter",
+        "not_found",
+        "security_policy",
+        "content_policy_violation",
+        "openrouter_in_flight_budget",
+        "rate_limit_exceeded",
+        "quota_exceeded",
+        "access_policy",
+        "unsupported_region",
+    }
+)
 OPENROUTER_TYPES = frozenset("context_length_exceeded max_tokens_exceeded token_limit_exceeded string_too_long authentication permission_denied payment_required rate_limit_exceeded provider_overloaded provider_unavailable invalid_request invalid_prompt not_found precondition_failed payload_too_large unprocessable content_policy_violation refusal invalid_image image_too_large image_too_small unsupported_image_format image_not_found image_download_failed server timeout unmapped".split())
 _OPENROUTER_HTTP_LIKE_CODES = frozenset({400, 401, 402, 403, 404, 408, 409, 413, 422, 429, 500, 501, 502, 503, 504})
 _BALANCE_QUOTA_MESSAGE_MARKERS = (

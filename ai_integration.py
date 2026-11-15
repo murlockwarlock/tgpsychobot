@@ -438,9 +438,9 @@ async def _notify_ai_fallback_used(
         await notify_admins_about_error(
             bot,
             title="Основной AI-провайдер не сработал — использован резервный",
-            user_id=getattr(user, "id", None),
-            username=getattr(user, "username", None),
-            full_name=getattr(user, "full_name", None),
+            user_id=None,
+            username=None,
+            full_name=None,
             provider=primary_provider,
             model=primary_model,
             stage="ai_provider_fallback",
@@ -2542,6 +2542,7 @@ async def get_ai_response(
                         fallback_succeeded=False,
                         credential_scope=prim_cred_scope,
                         attempt_started_at=primary_started_at,
+                        session_maker=async_session_maker,
                     )
                 except Exception as rec_err:
                     logging.warning("Failed to record AI provider failure: %s", rec_err)
@@ -2590,6 +2591,7 @@ async def get_ai_response(
                         incident_id=getattr(inc_primary, "id", None),
                         credential_scope=prim_cred_scope,
                         attempt_started_at=primary_started_at,
+                        session_maker=async_session_maker,
                     )
                     service_err = AIServiceError(
                         "Основной AI-провайдер не сработал, резервный провайдер не настроен"
@@ -2655,6 +2657,7 @@ async def get_ai_response(
                         fallback_succeeded=False,
                         credential_scope=prim_cred_scope,
                         attempt_started_at=primary_started_at,
+                        session_maker=async_session_maker,
                     )
                 except Exception as rec_err:
                     logging.warning("Failed to record AI provider failure: %s", rec_err)
@@ -2796,6 +2799,7 @@ async def get_ai_response(
                         fallback_succeeded=True,
                         credential_scope=prim_cred_scope,
                         attempt_started_at=primary_started_at,
+                        session_maker=async_session_maker,
                     )
                     fb_b_url = _get_kie_base_url(ai_config) if fb_prov == "KIE" else None
                     await record_ai_operation_success(
@@ -2807,7 +2811,7 @@ async def get_ai_response(
                         attempt_started_at=fallback_started_at,
                     )
                 except Exception as rec_err:
-                    logging.warning("Failed to record AI fallback success/failure: %s", rec_err)
+                    logging.error("[AI Incident Manager] Failed to record AI fallback success/failure: %s", rec_err, exc_info=True)
 
                 try:
                     await send_ai_fallback_used_alert(
@@ -2828,18 +2832,7 @@ async def get_ai_response(
                         session_maker=async_session_maker,
                     )
                 except Exception as alert_err:
-                    logging.warning("Failed to send AI fallback alert: %s", alert_err)
-
-                if rec_incident is None:
-                    await _notify_ai_fallback_used(
-                        bot,
-                        user=user,
-                        primary_provider=primary_prov,
-                        primary_model=primary_mod,
-                        fallback_provider=fb_prov,
-                        fallback_model=fb_mod,
-                        error=primary_err,
-                    )
+                    logging.error("[AI Incident Manager] Failed to send AI fallback alert: %s", alert_err, exc_info=True)
             except Exception as fb_err:
                 fallback_latency = int((time.monotonic() - fallback_start) * 1000)
                 fb_prov, fb_mod = extract_effective_provider_and_model(
@@ -4869,7 +4862,7 @@ async def analyze_image_content(
                     attempt_started_at=fb_started_at,
                 )
             except Exception as rec_err:
-                logging.warning("Failed to record vision fallback success: %s", rec_err)
+                logging.error("[AI Incident Manager] Failed to record vision fallback success: %s", rec_err, exc_info=True)
 
             if execution_context is not None and execution_context.bot is not None:
                 try:
@@ -4892,7 +4885,7 @@ async def analyze_image_content(
                         session_maker=async_session_maker,
                     )
                 except Exception as alert_err:
-                    logging.warning("Failed to send vision fallback alert: %s", alert_err)
+                    logging.error("[AI Incident Manager] Failed to send vision fallback alert: %s", alert_err, exc_info=True)
 
             return fb_res
         except Exception as fb_exc:

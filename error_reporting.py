@@ -917,7 +917,18 @@ async def send_terminal_ai_failure_alert(
     else:
         alert_title = title or f"🚨 <b>[{platform_norm}] Сбой ИИ в текстовом диалоге</b>\n\n"
 
-    err_type_str = error_type or (type(exception).__name__ if exception is not None else "AIServiceError")
+    from provider_failures import KNOWN_TECHNICAL_CODES
+    if error_type and (
+        error_type.lower() in KNOWN_TECHNICAL_CODES
+        or error_type in _ERROR_CLASS_DESCRIPTIONS
+        or (re.match(r"^[A-Za-z0-9_]{1,64}$", error_type) and error_type.endswith(("Error", "Exception", "Failure", "Timeout")))
+    ):
+        err_type_str = error_type
+    elif exception is not None:
+        t_name = type(exception).__name__
+        err_type_str = t_name if re.match(r"^[A-Za-z0-9_]{1,64}$", t_name) else "AIServiceError"
+    else:
+        err_type_str = "AIServiceError"
 
     ai_log_line = "\nAI Log: не удалось сохранить"
     if ai_log_ids:
@@ -1188,7 +1199,7 @@ async def send_ai_fallback_used_alert(
     session_maker: Any = None,
 ) -> bool:
     """Send realtime notification via durable outbox that reserve AI provider was used successfully."""
-    from provider_failures import ProviderFailure, CANONICAL_CLASSES, canonical_classification
+    from provider_failures import ProviderFailure, CANONICAL_CLASSES, KNOWN_TECHNICAL_CODES, canonical_classification
 
     clean_primary_prov = re.sub(r"[^A-Za-z0-9_\-\.]", "", str(primary_provider or failed_provider or "Unknown"))[:32] or "Unknown"
     clean_primary_mod = re.sub(r"[^A-Za-z0-9_\-\./:]", "", str(primary_model or failed_model or "—"))[:64] or "—"
@@ -1204,24 +1215,30 @@ async def send_ai_fallback_used_alert(
     cls_candidate = None
 
     if isinstance(err_target, ProviderFailure):
-        code = err_target.detail_code or err_target.provider_error_type or ""
-        if re.match(r"^[A-Za-z0-9_]{1,64}$", code):
-            err_type_str = code
         cls_candidate = err_target.classification
+        code = err_target.detail_code or err_target.provider_error_type or ""
+        code_norm = code.strip().lower()
+        if code_norm in KNOWN_TECHNICAL_CODES or code_norm in _ERROR_CLASS_DESCRIPTIONS:
+            err_type_str = code.strip()
+        elif err_target.classification in CANONICAL_CLASSES and err_target.classification != "unknown":
+            err_type_str = err_target.classification
+        else:
+            err_type_str = "ProviderFailure"
     elif isinstance(err_target, Exception):
         t_name = type(err_target).__name__
         if re.match(r"^[A-Za-z0-9_]{1,64}$", t_name):
             err_type_str = t_name
         cls_candidate = getattr(err_target, "classification", None)
     elif isinstance(err_target, str):
-        # Strictly accept canonical error code token or identifier; NEVER split lines or guess exception class from arbitrary strings
+        # Strictly accept only verified canonical technical codes; NEVER use regex or accept arbitrary free text
         s_code = err_target.strip()
-        if s_code in CANONICAL_CLASSES or s_code in _ERROR_CLASS_DESCRIPTIONS:
+        s_norm = s_code.lower()
+        if s_norm in KNOWN_TECHNICAL_CODES or s_norm in _ERROR_CLASS_DESCRIPTIONS:
             err_type_str = s_code
-        elif re.match(r"^[A-Za-z0-9_]{1,32}$", s_code) and not any(c.isspace() for c in s_code):
-            err_type_str = s_code
+            cls_candidate = s_norm
         else:
             err_type_str = "ProviderFailure"
+            cls_candidate = None
     else:
         err_type_str = "ProviderFailure"
 
