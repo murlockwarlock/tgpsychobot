@@ -5919,7 +5919,9 @@ async def set_ai_provider(callback: CallbackQuery, bot: Bot):
 
 
 @router.callback_query(F.data == "admin_ai_keys")
-async def admin_ai_keys_models(callback: CallbackQuery):
+async def admin_ai_keys_models(callback: CallbackQuery, state: FSMContext | None = None):
+    if state is not None:
+        await state.clear()
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
 
@@ -7543,6 +7545,11 @@ async def process_api_input(message: Message, state: FSMContext, bot: Bot):
     current_state = await state.get_state()
     is_key = current_state == AdminStates.set_api_key.state
     value = message.text.strip() if message.text else None
+
+    if is_key and not value:
+        await message.answer("API ключ не может быть пустым. Настройки не изменены.")
+        await state.clear()
+        return
 
     if not is_key:
         try:

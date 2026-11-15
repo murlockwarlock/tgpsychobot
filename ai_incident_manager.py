@@ -50,6 +50,7 @@ from notification_routing import (
     resolve_companion_telegram_instance,
     resolve_target_admin_ids,
     resolve_target_bot_token,
+    verify_bot_identity_live,
 )
 from notification_transport import is_bot_blocked_reason
 from provider_failures import ProviderFailure, normalize_exception
@@ -641,6 +642,193 @@ async def _handle_key_rotation_impl(
     return superseded_count
 
 
+async def record_low_credit_warning(
+    provider: str,
+    remaining_credits: float,
+    threshold: float,
+    api_key: str,
+    base_url: str | None = None,
+    session_maker: Any = None,
+) -> bool:
+    """
+    Record a soft warning for low credit balance via durable outbox.
+    Creates an active incident with incident_type='low_credit_warning' and outbox rows for each admin.
+    """
+    try:
+        current_inst = detect_current_instance()
+        if not current_inst:
+            return False
+        companion_def = resolve_companion_telegram_instance(current_inst)
+        if not companion_def:
+            return False
+
+        sm = session_maker or async_session_maker
+        now = datetime.utcnow()
+        prov_norm = (provider or "KIE").strip().upper()
+        fp = get_provider_account_fingerprint(api_key, base_url)
+        origin_id = current_inst["pm2_name"]
+        companion_id = companion_def.get("pm2_name")
+        auth_instance_id = companion_def["pm2_name"]
+
+        async with sm() as session:
+            stmt = select(AIProviderIncidentModel).where(
+                AIProviderIncidentModel.origin_instance_id == origin_id,
+                AIProviderIncidentModel.provider == prov_norm,
+                AIProviderIncidentModel.credential_scope == fp,
+                AIProviderIncidentModel.operation == "account",
+                AIProviderIncidentModel.model_scope == "*",
+                AIProviderIncidentModel.incident_type == "low_credit_warning",
+                AIProviderIncidentModel.status == "active",
+            )
+            existing = await session.scalar(stmt)
+            if existing:
+                existing.last_seen_at = now
+                existing.detail_code = f"balance_{remaining_credits:.2f}_below_{threshold:.2f}"
+                await session.commit()
+                return True
+
+            inc = AIProviderIncidentModel(
+                origin_instance_id=origin_id,
+                companion_instance_id=companion_id,
+                provider=prov_norm,
+                credential_scope=fp,
+                operation="account",
+                model_scope="*",
+                incident_type="low_credit_warning",
+                evidence_tier="CONFIRMED_STRUCTURED",
+                detail_code=f"balance_{remaining_credits:.2f}_below_{threshold:.2f}",
+                status="active",
+                occurrence_count=1,
+                reminder_cycle=0,
+                first_seen_at=now,
+                last_seen_at=now,
+                last_alerted_at=now,
+            )
+            try:
+                async with session.begin_nested():
+                    session.add(inc)
+                    await session.flush()
+            except IntegrityError:
+                existing = await session.scalar(stmt)
+                if not existing:
+                    return False
+                inc = existing
+
+            admin_ids = await resolve_target_admin_ids(companion_def, current_instance=current_inst, session=session)
+            msg_text = (
+                f"⚠️ <b>Предупреждение {prov_norm}: низкий баланс</b>\n\n"
+                f"Баланс {prov_norm} снизился до <code>{remaining_credits:.2f}</code> кредитов "
+                f"(порог предупреждения: <code>{threshold:.2f}</code>)."
+            )
+            for admin_id in admin_ids:
+                if not is_valid_telegram_user_id(admin_id):
+                    continue
+                notif = AIIncidentNotificationModel(
+                    incident_id=inc.id,
+                    event_type="opened",
+                    cycle_index=0,
+                    recipient_id=admin_id,
+                    authorized_instance_id=auth_instance_id,
+                    message_text=msg_text,
+                    status="pending",
+                    attempts=0,
+                    max_attempts=MAX_OUTBOX_ATTEMPTS,
+                    next_retry_at=now,
+                )
+                try:
+                    async with session.begin_nested():
+                        session.add(notif)
+                        await session.flush()
+                except IntegrityError:
+                    pass
+
+            await session.commit()
+            return True
+    except Exception as exc:
+        logger.warning("[AI Incident] Failed to record low credit warning: %s", exc)
+        return False
+
+
+async def resolve_low_credit_warning(
+    provider: str,
+    remaining_credits: float,
+    threshold: float,
+    api_key: str,
+    base_url: str | None = None,
+    session_maker: Any = None,
+) -> bool:
+    """
+    Resolve active low credit warning incident and enqueue resolved notifications for all admins.
+    """
+    try:
+        current_inst = detect_current_instance()
+        if not current_inst:
+            return False
+        companion_def = resolve_companion_telegram_instance(current_inst)
+        if not companion_def:
+            return False
+
+        sm = session_maker or async_session_maker
+        now = datetime.utcnow()
+        prov_norm = (provider or "KIE").strip().upper()
+        fp = get_provider_account_fingerprint(api_key, base_url)
+        auth_instance_id = companion_def["pm2_name"]
+
+        async with sm() as session:
+            stmt = select(AIProviderIncidentModel).where(
+                or_(
+                    AIProviderIncidentModel.origin_instance_id == current_inst["pm2_name"],
+                    AIProviderIncidentModel.companion_instance_id == current_inst["pm2_name"],
+                ),
+                AIProviderIncidentModel.provider == prov_norm,
+                AIProviderIncidentModel.credential_scope == fp,
+                AIProviderIncidentModel.operation == "account",
+                AIProviderIncidentModel.model_scope == "*",
+                AIProviderIncidentModel.incident_type == "low_credit_warning",
+                AIProviderIncidentModel.status == "active",
+            )
+            active_inc = await session.scalar(stmt)
+            if not active_inc:
+                return False
+
+            active_inc.status = "resolved"
+            active_inc.resolved_at = now
+
+            admin_ids = await resolve_target_admin_ids(companion_def, current_instance=current_inst, session=session)
+            msg_text = (
+                f"✅ <b>Баланс {prov_norm} пополнен</b>\n\n"
+                f"Текущий остаток: <code>{remaining_credits:.2f}</code> кредитов "
+                f"(порог: <code>{threshold:.2f}</code>)."
+            )
+            for admin_id in admin_ids:
+                if not is_valid_telegram_user_id(admin_id):
+                    continue
+                notif = AIIncidentNotificationModel(
+                    incident_id=active_inc.id,
+                    event_type="resolved",
+                    cycle_index=0,
+                    recipient_id=admin_id,
+                    authorized_instance_id=auth_instance_id,
+                    message_text=msg_text,
+                    status="pending",
+                    attempts=0,
+                    max_attempts=MAX_OUTBOX_ATTEMPTS,
+                    next_retry_at=now,
+                )
+                try:
+                    async with session.begin_nested():
+                        session.add(notif)
+                        await session.flush()
+                except IntegrityError:
+                    pass
+
+            await session.commit()
+            return True
+    except Exception as exc:
+        logger.warning("[AI Incident] Failed to resolve low credit warning: %s", exc)
+        return False
+
+
 async def check_incident_repeat_reminders(
     bot: Bot | None = None,
     repeat_interval_seconds: int = DEFAULT_REPEAT_ALERT_SECONDS,
@@ -663,7 +851,10 @@ async def check_incident_repeat_reminders(
 
     async with sm() as session:
         stmt = select(AIProviderIncidentModel).where(
-            AIProviderIncidentModel.origin_instance_id == current_bot_instance_id,
+            or_(
+                AIProviderIncidentModel.origin_instance_id == current_bot_instance_id,
+                AIProviderIncidentModel.companion_instance_id == current_bot_instance_id,
+            ),
             AIProviderIncidentModel.status == "active",
             AIProviderIncidentModel.last_alerted_at <= threshold,
         )
@@ -748,26 +939,33 @@ async def process_ai_incident_notifications(
 
     # Strict Bot Identity Verification
     actual_bot = bot
-    if actual_bot is not None:
-        cand_token = getattr(actual_bot, "token", None)
-        token_pid = extract_telegram_bot_id(cand_token) if cand_token else None
-        if token_pid != expected_pid:
-            logger.critical(
-                "[AI Incident Worker] Foreign bot token supplied: token ID %s != expected %s for %s. Refusing delivery.",
-                token_pid,
-                expected_pid,
-                current_bot_instance_id,
-            )
-            return 0
-    else:
-        resolved_tok = resolve_target_bot_token(current_inst, is_companion=False)
-        if not resolved_tok or extract_telegram_bot_id(resolved_tok) != expected_pid:
+    cand_token = getattr(actual_bot, "token", None) if actual_bot is not None else None
+    if cand_token is None:
+        cand_token = resolve_target_bot_token(current_inst, is_companion=False)
+        if not cand_token:
             logger.critical(
                 "[AI Incident Worker] Valid target bot token missing for %s. Fail-closed.",
                 current_bot_instance_id,
             )
             return 0
-        actual_bot = Bot(token=resolved_tok)
+        actual_bot = Bot(token=cand_token)
+
+    from notification_routing import verify_bot_identity_live
+    try:
+        await verify_bot_identity_live(
+            actual_bot or cand_token,
+            expected_username=current_inst.get("username"),
+            expected_id=expected_pid,
+            use_cache=True,
+        )
+    except Exception as id_exc:
+        logger.critical(
+            "[AI Incident Worker] Live bot identity verification failed for %s (expected_id=%s): %s. Refusing delivery.",
+            current_bot_instance_id,
+            expected_pid,
+            id_exc,
+        )
+        return 0
 
     sm = session_maker or async_session_maker
     now = datetime.utcnow()

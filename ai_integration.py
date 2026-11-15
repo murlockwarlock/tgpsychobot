@@ -1919,10 +1919,9 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
                         logging.warning("Failed to record KIE transcription failure: %s", inc_exc)
                     raise
 
-                logging.warning(
-                    "KIE transcription failed, falling back to OpenAI Whisper: model=%s error=%s",
+                logging.info(
+                    "Handled AI notice: KIE transcription fallback to OpenAI Whisper | stage=transcription | provider=KIE | model=%s",
                     model,
-                    kie_exc,
                 )
                 fb_ok = False
                 try:
@@ -2440,22 +2439,6 @@ async def get_ai_response(
             except Exception as rec_err:
                 logging.warning("Failed to record AI operation success: %s", rec_err)
         except (AIServiceError, Exception) as primary_err:
-            try:
-                from ai_incident_manager import record_ai_provider_failure
-                fb_p = getattr(ai_config, 'fallback_provider', None)
-                fb_m = getattr(ai_config, 'fallback_model', None)
-                await record_ai_provider_failure(
-                    None,
-                    primary_prov,
-                    primary_err,
-                    "chat",
-                    model=primary_mod,
-                    fallback_provider=fb_p,
-                    fallback_model=fb_m,
-                    fallback_succeeded=False,
-                )
-            except Exception as rec_err:
-                logging.warning("Failed to record AI provider failure: %s", rec_err)
             primary_latency = int((time.monotonic() - primary_start) * 1000)
             primary_prov, primary_mod = extract_effective_provider_and_model(
                 primary_capture,
@@ -2518,6 +2501,20 @@ async def get_ai_response(
             fb_provider = getattr(ai_config, 'fallback_provider', None)
             fb_model = getattr(ai_config, 'fallback_model', None)
             if not allow_fallback or not fb_provider or not fb_model:
+                try:
+                    from ai_incident_manager import record_ai_provider_failure
+                    await record_ai_provider_failure(
+                        None,
+                        primary_prov,
+                        primary_err,
+                        "chat",
+                        model=primary_mod,
+                        fallback_provider=fb_provider if allow_fallback else None,
+                        fallback_model=fb_model if allow_fallback else None,
+                        fallback_succeeded=False,
+                    )
+                except Exception as rec_err:
+                    logging.warning("Failed to record AI provider failure: %s", rec_err)
                 if allow_fallback:
                     fallback_config_error = AIServiceError(
                         "Fallback AI provider configuration is incomplete: provider and model are required"
@@ -2797,10 +2794,21 @@ async def get_ai_response(
                     from ai_incident_manager import record_ai_provider_failure
                     await record_ai_provider_failure(
                         None,
+                        primary_prov,
+                        primary_err,
+                        "chat",
+                        model=primary_mod,
+                        fallback_provider=fb_prov,
+                        fallback_model=fb_mod,
+                        fallback_succeeded=False,
+                    )
+                    await record_ai_provider_failure(
+                        None,
                         fb_prov,
                         fb_err,
                         "chat",
                         model=fb_mod,
+                        fallback_succeeded=False,
                     )
                 except Exception as rec_err:
                     logging.warning("Failed to record AI fallback failure: %s", rec_err)
@@ -4422,20 +4430,6 @@ async def analyze_image_content(
             last_classification = prim_cls
             last_failed_provider = primary_provider
             last_failed_model = primary_target_model
-            try:
-                from ai_incident_manager import record_ai_provider_failure
-                await record_ai_provider_failure(
-                    None,
-                    primary_provider,
-                    prim_exc,
-                    "vision",
-                    model=primary_target_model,
-                    fallback_provider=eff_fallback_provider if eff_allow_fallback else None,
-                    fallback_model=eff_fallback_model if eff_allow_fallback else None,
-                    fallback_succeeded=False,
-                )
-            except Exception as rec_err:
-                logging.warning("Failed to record vision primary failure: %s", rec_err)
             await _audit_attempt(
                 primary_provider,
                 primary_target_model,
@@ -4496,6 +4490,22 @@ async def analyze_image_content(
             fb_stage_budget = tracker.stage_budget("provider_fallback", aggregate_cap=15.0, min_required=min_useful_budget)
             if fb_stage_budget >= min_useful_budget:
                 fb_eligible = True
+
+    if not fb_eligible and last_error is not None:
+        try:
+            from ai_incident_manager import record_ai_provider_failure
+            await record_ai_provider_failure(
+                None,
+                primary_provider,
+                last_error,
+                "vision",
+                model=primary_target_model,
+                fallback_provider=eff_fallback_provider if eff_allow_fallback else None,
+                fallback_model=eff_fallback_model if eff_allow_fallback else None,
+                fallback_succeeded=False,
+            )
+        except Exception as rec_err:
+            logging.warning("Failed to record vision primary failure: %s", rec_err)
 
     if fb_eligible:
         fallback_attempted = True
@@ -4774,10 +4784,21 @@ async def analyze_image_content(
                 from ai_incident_manager import record_ai_provider_failure
                 await record_ai_provider_failure(
                     None,
+                    primary_provider,
+                    prim_exc,
+                    "vision",
+                    model=primary_target_model,
+                    fallback_provider=eff_fallback_provider,
+                    fallback_model=eff_fallback_model,
+                    fallback_succeeded=False,
+                )
+                await record_ai_provider_failure(
+                    None,
                     eff_fallback_provider,
                     fb_exc,
                     "vision",
                     model=eff_fallback_model,
+                    fallback_succeeded=False,
                 )
             except Exception as rec_err:
                 logging.warning("Failed to record vision fallback failure: %s", rec_err)

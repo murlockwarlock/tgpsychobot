@@ -946,23 +946,8 @@ def is_bot_blocked_or_suspended_log(text: str) -> bool:
 
 
 def is_handled_ai_log(line: str) -> bool:
-    """True if line is a handled AI provider notice, warning, or fallback event."""
-    lowered = line.lower()
-    if "handled ai notice:" in lowered:
-        return True
-    if "[ai incident]" in lowered or "[ai incident worker]" in lowered:
-        return True
-    if "stage=ai_provider_fallback" in lowered:
-        return True
-    if "kie credit balance check" in lowered:
-        return True
-    if "transcription failed, falling back" in lowered:
-        return True
-    if "failed to record ai fallback success" in lowered:
-        return True
-    if "fallback provider" in lowered and "also failed" not in lowered:
-        return True
-    return False
+    """True if line is an explicitly controlled handled AI notice (not an infrastructure error or crash)."""
+    return "handled ai notice:" in line.lower()
 
 
 def extract_log_error_summaries(chunk: str) -> list[str]:

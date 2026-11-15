@@ -1695,22 +1695,6 @@ async def get_ai_response(
             except Exception as rec_err:
                 log.warning("Failed to record MAX AI operation success: %s", rec_err)
         except (AIServiceError, Exception) as primary_err:
-            try:
-                from ai_incident_manager import record_ai_provider_failure
-                fb_p = getattr(ai_config, "fallback_provider", None)
-                fb_m = getattr(ai_config, "fallback_model", None)
-                await record_ai_provider_failure(
-                    None,
-                    primary_prov if 'primary_prov' in locals() else actual_provider,
-                    primary_err,
-                    "chat",
-                    model=primary_mod if 'primary_mod' in locals() else actual_model,
-                    fallback_provider=fb_p,
-                    fallback_model=fb_m,
-                    fallback_succeeded=False,
-                )
-            except Exception as rec_err:
-                log.warning("Failed to record MAX AI provider failure: %s", rec_err)
             primary_latency = int((time.monotonic() - primary_start) * 1000)
             primary_prov, primary_mod = _extract_effective_provider_and_model(
                 primary_capture,
@@ -1787,6 +1771,22 @@ async def get_ai_response(
                 fb_model = fb_model.strip() or None
             allow_fallback = bool(getattr(ai_config, "allow_fallback", False))
             fallback_succeeded = False
+
+            if not allow_fallback or not fb_provider or not fb_model:
+                try:
+                    from ai_incident_manager import record_ai_provider_failure
+                    await record_ai_provider_failure(
+                        None,
+                        primary_prov,
+                        primary_err,
+                        "chat",
+                        model=primary_mod,
+                        fallback_provider=fb_provider if allow_fallback else None,
+                        fallback_model=fb_model if allow_fallback else None,
+                        fallback_succeeded=False,
+                    )
+                except Exception as rec_err:
+                    log.warning("Failed to record MAX AI provider failure: %s", rec_err)
 
             if allow_fallback and (not fb_provider or not fb_model):
                 real_reason = "Fallback AI provider configuration is incomplete: provider and model are required"
@@ -2170,10 +2170,21 @@ async def get_ai_response(
                         from ai_incident_manager import record_ai_provider_failure
                         await record_ai_provider_failure(
                             None,
+                            primary_prov,
+                            primary_err,
+                            "chat",
+                            model=primary_mod,
+                            fallback_provider=fb_prov,
+                            fallback_model=fb_mod,
+                            fallback_succeeded=False,
+                        )
+                        await record_ai_provider_failure(
+                            None,
                             fb_prov,
                             fb_err,
                             "chat",
                             model=fb_mod,
+                            fallback_succeeded=False,
                         )
                     except Exception as rec_err:
                         log.warning("Failed to record MAX AI fallback failure: %s", rec_err)
@@ -2471,7 +2482,7 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
                 except Exception as inc_exc:
                     log.warning("Failed to record KIE transcription failure: %s", inc_exc)
                 raise
-            log.warning("KIE transcription failed (%s), falling back to Gemini", exc)
+            log.info("Handled AI notice: KIE transcription fallback to Gemini | stage=transcription | provider=KIE | model=%s", gemini_stt_model)
             gemini_stt_model = get_default_model(PROVIDER_GEMINI, channel="transcription")
             fb_ok = False
             try:

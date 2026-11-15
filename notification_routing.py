@@ -705,6 +705,8 @@ async def verify_bot_identity_live(
     - Diagnostic output contains only public username and ID, never raw secrets.
     """
     token_str = bot_or_token if isinstance(bot_or_token, str) else getattr(bot_or_token, "token", None)
+    if not isinstance(token_str, str):
+        token_str = None
     if use_cache and token_str:
         cache_key = _token_cache_key(token_str)
         cached = _VERIFIED_BOT_IDENTITY_CACHE.get(cache_key)
@@ -746,29 +748,33 @@ async def verify_bot_identity_live(
         if last_err is not None or me is None:
             raise RoutingError(f"Telegram getMe network request failed after {max_retries} attempts: {last_err}")
 
-        clean_user = (me.username or "").lstrip("@").lower()
-        if expected_id is not None and me.id != expected_id:
-            raise RoutingError(
-                f"Bot identity mismatch: getMe returned ID {me.id}, expected {expected_id}"
-            )
+        raw_user = getattr(me, "username", None)
+        clean_user = raw_user.lstrip("@").lower() if isinstance(raw_user, str) else ""
+        raw_id = getattr(me, "id", None)
+        if expected_id is not None:
+            if not isinstance(raw_id, int) or raw_id != expected_id:
+                raise RoutingError(
+                    f"Bot identity mismatch: getMe returned ID {raw_id}, expected {expected_id}"
+                )
         if expected_username is not None:
             clean_expected = expected_username.lstrip("@").lower()
             if clean_user != clean_expected:
                 raise RoutingError(
-                    f"Bot identity mismatch: getMe returned @{me.username}, expected @{expected_username}"
+                    f"Bot identity mismatch: getMe returned @{raw_user}, expected @{expected_username}"
                 )
         identity = {
             "verified": True,
-            "id": me.id,
-            "username": me.username,
-            "is_bot": bool(me.is_bot),
+            "id": raw_id,
+            "username": raw_user,
+            "is_bot": bool(getattr(me, "is_bot", True)),
         }
         if token_str:
             _VERIFIED_BOT_IDENTITY_CACHE[_token_cache_key(token_str)] = identity
         return identity
 
-    if hasattr(bot_ctx, "__aenter__"):
-        async with bot_ctx as bot:
+    if isinstance(bot_or_token, str):
+        from telegram_client import create_telegram_bot
+        async with create_telegram_bot(bot_or_token) as bot:
             return await _inspect(bot)
     else:
         return await _inspect(bot_ctx)

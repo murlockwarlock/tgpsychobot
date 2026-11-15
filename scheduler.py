@@ -513,8 +513,8 @@ async def check_kie_credit_balance(bot: Bot):
 
             # 1. Background incident worker outbox & reminder sweep
             try:
-                await process_ai_incident_notifications(bot)
-                await check_incident_repeat_reminders(bot)
+                await process_ai_incident_notifications(bot, session_maker=async_session_maker)
+                await check_incident_repeat_reminders(bot, session_maker=async_session_maker)
             except Exception as w_exc:
                 log.warning("AI incident notification worker error in scheduler: %s", w_exc)
 
@@ -532,43 +532,42 @@ async def check_kie_credit_balance(bot: Bot):
 
             if remaining_credits < threshold:
                 if not config.kie_credit_alert_sent:
-                    admin_ids = await get_all_admin_ids()
-                    text = (
-                        f"⚠️ <b>Предупреждение KIE</b>\n\n"
-                        f"Баланс KIE снизился до <code>{remaining_credits:.2f}</code> кредитов "
-                        f"(порог предупреждения: <code>{threshold:.2f}</code>)."
+                    from ai_incident_manager import (
+                        process_ai_incident_notifications,
+                        record_low_credit_warning,
                     )
-                    any_delivered = False
-                    for admin_id in admin_ids:
-                        try:
-                            await bot.send_message(admin_id, text, parse_mode="HTML")
-                            any_delivered = True
-                        except Exception as send_err:
-                            log.warning("Failed to send KIE soft warning to %s: %s", admin_id, send_err)
-                    if any_delivered:
+                    warned = await record_low_credit_warning(
+                        provider="KIE",
+                        remaining_credits=remaining_credits,
+                        threshold=threshold,
+                        api_key=api_key,
+                        base_url=base_url,
+                        session_maker=async_session_maker,
+                    )
+                    if warned:
                         config.kie_credit_alert_sent = True
-                        config.kie_credit_last_alert_at = datetime.utcnow()
                         await session.commit()
+                        await process_ai_incident_notifications(bot=bot, session_maker=async_session_maker)
             else:
                 if config.kie_credit_alert_sent:
-                    admin_ids = await get_all_admin_ids()
-                    text = (
-                        f"✅ <b>Баланс KIE пополнен</b>\n\n"
-                        f"Текущий остаток: <code>{remaining_credits:.2f}</code> кредитов "
-                        f"(порог: <code>{threshold:.2f}</code>)."
+                    from ai_incident_manager import (
+                        process_ai_incident_notifications,
+                        resolve_low_credit_warning,
                     )
-                    any_delivered = False
-                    for admin_id in admin_ids:
-                        try:
-                            await bot.send_message(admin_id, text, parse_mode="HTML")
-                            any_delivered = True
-                        except Exception as send_err:
-                            log.warning("Failed to send KIE replenishment notice to %s: %s", admin_id, send_err)
-                    if any_delivered:
+                    resolved = await resolve_low_credit_warning(
+                        provider="KIE",
+                        remaining_credits=remaining_credits,
+                        threshold=threshold,
+                        api_key=api_key,
+                        base_url=base_url,
+                        session_maker=async_session_maker,
+                    )
+                    if resolved:
                         config.kie_credit_alert_sent = False
                         await session.commit()
+                        await process_ai_incident_notifications(bot=bot, session_maker=async_session_maker)
     except AIServiceError as exc:
-        log.warning("KIE credit balance check failed: %s", exc)
+        log.info("Handled AI notice: KIE credit balance check failed | stage=check_credit_balance | provider=KIE")
     except Exception as exc:
         log.warning("Unexpected KIE credit balance check error: %s", exc)
 
