@@ -911,14 +911,9 @@ async def send_terminal_ai_failure_alert(
     fb_p = fallback_provider or "none"
 
     if request_type == "vision":
-        fingerprint = f"vision:{platform_norm}:{b_name}:{primary_p}:{fb_p}:{cls_str}"
         alert_title = title or f"🚨 <b>[{platform_norm}] Сбой ИИ при анализе изображения</b>\n\n"
     else:
-        fingerprint = f"{platform_norm}:{b_name}:{primary_p}:{fb_p}:{cls_str}"
         alert_title = title or f"🚨 <b>[{platform_norm}] Сбой ИИ в текстовом диалоге</b>\n\n"
-
-    if not _terminal_failure_cooldown.should_send(fingerprint):
-        return False
 
     err_type_str = error_type or (type(exception).__name__ if exception is not None else "AIServiceError")
 

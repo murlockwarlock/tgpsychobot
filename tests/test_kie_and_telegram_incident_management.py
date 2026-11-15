@@ -28,6 +28,7 @@ from ai_incident_manager import (
     DEFAULT_REPEAT_ALERT_SECONDS,
     _format_incident_message_text,
     check_incident_repeat_reminders,
+    enqueue_terminal_ai_failure_notification,
     get_provider_account_fingerprint,
     handle_key_rotation,
     process_ai_incident_notifications,
@@ -91,11 +92,21 @@ def test_schema_ddl_compilation_sqlite_and_postgresql():
     assert "ai_provider_incidents" in inc_ddl_pg
 
     # Check partial unique index on PostgreSQL
+    found_active = False
+    found_transient = False
     for idx in inc_table.indexes:
         if idx.name == "uq_active_ai_incident":
             compiled_pg = str(CreateIndex(idx).compile(dialect=pg_dialect))
             assert "WHERE status = 'active'" in compiled_pg
             assert "UNIQUE" in compiled_pg
+            found_active = True
+        elif idx.name == "uq_transient_ai_incident":
+            compiled_pg = str(CreateIndex(idx).compile(dialect=pg_dialect))
+            assert "WHERE status = 'transient'" in compiled_pg
+            assert "UNIQUE" in compiled_pg
+            found_transient = True
+    assert found_active, "uq_active_ai_incident index not found"
+    assert found_transient, "uq_transient_ai_incident index not found"
 
     # AIIncidentNotificationModel DDL
     notif_table = AIIncidentNotificationModel.__table__
@@ -3392,7 +3403,7 @@ async def test_e2e_full_chat_journey_telegram_and_max_and_admin_fsm_network_doub
 
     fsm_ctx = dp.fsm.get_context(bot=bot, user_id=777, chat_id=777)
 
-    # Step B: Test 'Выбрать модель' button navigation
+    # Step B: Test 'Выбрать модель' button navigation through to its terminal action
     update_click_model = Update(
         update_id=302,
         callback_query=CallbackQuery(
@@ -3404,10 +3415,36 @@ async def test_e2e_full_chat_journey_telegram_and_max_and_admin_fsm_network_doub
         ),
     )
     await dp.feed_update(bot, update_click_model)
-    # Re-open KIE settings
-    await dp.feed_update(bot, update_open_settings)
 
-    # Step C: Test 'Max tokens' button navigation and state
+    # Inspect rendered model choice keyboard and select a model
+    from provider_models import TELEGRAM_MODEL_CALLBACK_PREFIX, resolve_telegram_model_callback
+    model_edit_calls = [c for c in telegram_session.calls if type(c).__name__ == "EditMessageText"]
+    model_choice_btns = [
+        btn for row in model_edit_calls[-1].reply_markup.inline_keyboard for btn in row
+        if btn.callback_data and btn.callback_data.startswith(TELEGRAM_MODEL_CALLBACK_PREFIX)
+    ]
+    assert len(model_choice_btns) >= 1, "Model choice buttons must be rendered"
+    target_model_btn = model_choice_btns[0]
+    prov, ch, expected_model = resolve_telegram_model_callback(target_model_btn.callback_data)
+
+    update_select_model = Update(
+        update_id=3021,
+        callback_query=CallbackQuery(
+            id="cb_select_model",
+            from_user=admin_user,
+            chat_instance="ci_admin",
+            message=cb_msg,
+            data=target_model_btn.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, update_select_model)
+
+    # Verify AIConfig model is updated in DB to the selected model
+    async with test_db_session_maker() as session:
+        cfg_model = await session.get(AIConfig, 1)
+        assert cfg_model.kie_model == expected_model
+
+    # Step C: Test 'Max tokens' button navigation, text input, DB persistence and re-render
     update_click_tokens = Update(
         update_id=303,
         callback_query=CallbackQuery(
@@ -3420,7 +3457,36 @@ async def test_e2e_full_chat_journey_telegram_and_max_and_admin_fsm_network_doub
     )
     await dp.feed_update(bot, update_click_tokens)
     assert await fsm_ctx.get_state() == handlers.AdminStates.set_model_max_tokens.state
-    # Re-open KIE settings to reset state for next check
+
+    # Admin submits valid tokens number
+    update_enter_tokens = Update(
+        update_id=3031,
+        message=Message(
+            message_id=61,
+            date=datetime.now(timezone.utc),
+            chat=admin_chat,
+            from_user=admin_user,
+            text="2048",
+        ),
+    )
+    await dp.feed_update(bot, update_enter_tokens)
+    assert await fsm_ctx.get_state() is None
+
+    # Verify AIModelSettings is persisted in DB
+    from database import AIModelSettings
+    async with test_db_session_maker() as session:
+        cfg_now = await session.get(AIConfig, 1)
+        m_row = (await session.execute(
+            select(AIModelSettings).where(
+                AIModelSettings.provider == "KIE",
+                AIModelSettings.model == cfg_now.kie_model,
+                AIModelSettings.channel == "chat",
+            )
+        )).scalar_one_or_none()
+        assert m_row is not None
+        assert m_row.max_output_tokens == 2048
+
+    # Re-open KIE settings for next check
     await dp.feed_update(bot, update_open_settings)
 
     # Step D: Admin clicks '🔑 API-ключ' -> FSM state is set_api_key
@@ -3500,6 +3566,21 @@ async def test_e2e_full_chat_journey_telegram_and_max_and_admin_fsm_network_doub
 
     assert len(captured_keys) >= 1, "Runtime call to KIE must have occurred"
     assert captured_keys[-1] == "new_valid_admin_key_fsm_e2e_2026", "AI request must use the newly saved API key"
+
+    # Step I: Admin clicks '⬅️ Назад' on KIE settings screen -> returns to logical parent (admin_ai_keys)
+    update_back_to_keys = Update(
+        update_id=307,
+        callback_query=CallbackQuery(
+            id="cb_back_to_keys",
+            from_user=admin_user,
+            chat_instance="ci_admin",
+            message=cb_msg,
+            data=btn_back.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, update_back_to_keys)
+    last_edit_back = [c for c in telegram_session.calls if type(c).__name__ == "EditMessageText"][-1]
+    assert "Провайдеры и модели" in last_edit_back.text or "Ключи и модели" in last_edit_back.text
 
 
 @pytest.mark.asyncio
@@ -3930,3 +4011,604 @@ async def test_real_postgresql_concurrent_cas_repeat_reminders(pg_test_session_m
         for n in rem_notifs:
             assert n.cycle_index == 1
             assert n.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_admin_dispatcher_key_rotation_race_with_inflight_failure(test_db_session_maker, monkeypatch):
+    """Defect 1: Real Admin Dispatcher -> save new key -> completion of old in-flight request:
+    - Initial AIConfig has key A ('kie_key_race_alpha_111'). Zero active incidents exist prior to rotation.
+    - In-flight request starts with key A scope.
+    - Admin updates key to key B ('kie_key_race_beta_222') via real Dispatcher & Router FSM (process_api_input).
+    - Handler reads old key before updating AIConfig and calls handle_key_rotation(old_key=...).
+    - Old in-flight request fails with InsufficientBalanceError and records failure with old credential_scope.
+    - Assert: Zero active incidents in AIProviderIncidentModel.
+    - Assert: Old key failure recorded as superseded.
+    - Assert: Zero notifications enqueued in outbox.
+    """
+    from datetime import timezone
+    from aiogram import Dispatcher
+    from aiogram.fsm.storage.memory import MemoryStorage
+    from aiogram.types import CallbackQuery, Chat, Message, Update
+    import handlers
+
+    bot_token = "8224473896:AAFtest_token_veraveda"
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+    monkeypatch.setattr(handlers, "async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(side_effect=lambda user_id: user_id == 777))
+
+    key_a = "kie_key_race_alpha_111"
+    key_b = "kie_key_race_beta_222"
+    base_url = "https://api.kie.ai"
+    scope_a = get_provider_account_fingerprint(key_a, base_url)
+    scope_b = get_provider_account_fingerprint(key_b, base_url)
+
+    # 1. Initial AIConfig with key A, zero incidents
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="KIE", kie_api_key=key_a, kie_base_url=base_url)
+            session.add(cfg)
+        else:
+            cfg.provider = "KIE"
+            cfg.kie_api_key = key_a
+            cfg.kie_base_url = base_url
+            cfg.kie_credit_alert_sent = False
+        await session.commit()
+
+    storage = MemoryStorage()
+    handlers.router._parent_router = None
+    dp = Dispatcher(storage=storage)
+    dp.include_router(handlers.router)
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+    telegram_session = ValidatingTelegramSession()
+    bot = Bot(token=bot_token, session=telegram_session)
+    bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    admin_user = TgUser(id=777, is_bot=False, first_name="Admin", username="admin777")
+    admin_chat = Chat(id=777, type="private")
+    fsm_ctx = dp.fsm.get_context(bot=bot, user_id=777, chat_id=777)
+
+    # 2. Admin opens settings and clicks API key
+    cb_msg = Message(message_id=70, date=datetime.now(timezone.utc), chat=admin_chat, text="Settings")
+    await dp.feed_update(bot, Update(
+        update_id=401,
+        callback_query=CallbackQuery(
+            id="cb_open",
+            from_user=admin_user,
+            chat_instance="ci_admin",
+            message=cb_msg,
+            data="view_models_KIE",
+        ),
+    ))
+    await dp.feed_update(bot, Update(
+        update_id=402,
+        callback_query=CallbackQuery(
+            id="cb_click_key",
+            from_user=admin_user,
+            chat_instance="ci_admin",
+            message=cb_msg,
+            data="model_setting_api_key_KIE",
+        ),
+    ))
+    assert await fsm_ctx.get_state() == handlers.AdminStates.set_api_key.state
+
+    # 3. Admin enters new key B via message handled by process_api_input
+    await dp.feed_update(bot, Update(
+        update_id=403,
+        message=Message(
+            message_id=71,
+            date=datetime.now(timezone.utc),
+            chat=admin_chat,
+            from_user=admin_user,
+            text=key_b,
+        ),
+    ))
+    assert await fsm_ctx.get_state() is None
+
+    # Verify AIConfig updated
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        assert cfg.kie_api_key == key_b
+
+    # 4. Old in-flight request (which ran with key A) now completes and fails
+    err = InsufficientBalanceError("KIE credits empty on retired key A")
+    err.provider = "KIE"
+    inc_old = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=err,
+        operation="chat",
+        model="kie-v1",
+        credential_scope=scope_a,
+        session_maker=test_db_session_maker,
+    )
+
+    # 5. Verify assertions
+    assert inc_old is not None
+    assert inc_old.credential_scope == scope_a
+    assert inc_old.status == "superseded", "Old in-flight failure must be preserved as superseded"
+
+    async with test_db_session_maker() as session:
+        # Zero active incidents in DB
+        active_incs = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.status == "active")
+        )).scalars().all()
+        assert len(active_incs) == 0
+
+        # Zero pending/processing notifications in outbox
+        pending_notifs = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.status.in_(["pending", "processing"])
+            )
+        )).scalars().all()
+        assert len(pending_notifs) == 0
+
+
+@pytest.mark.asyncio
+async def test_key_rotation_reactivation_a_b_a_allows_active_incident(test_db_session_maker, monkeypatch):
+    """Defect 2: Key rotation lifecycle A -> B -> A:
+    - Step 1: Active Key A encounters operator failure -> opens active incident and enqueues notification.
+    - Step 2: Key rotated to Key B -> Key A incident superseded, notifications cancelled, tombstone exists for Key A.
+    - Step 3: Key rotated back to Key A (A -> B -> A) -> Key A is the current active key in AIConfig.
+    - Step 4: Key A encounters operator failure -> must open a NEW active incident and enqueue notifications.
+      Historical superseded record does NOT permanently block Key A.
+    """
+    bot_token = "8224473896:AAFtest_token_veraveda"
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+    monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+
+    key_a = "key_alpha_rotation_111"
+    key_b = "key_beta_rotation_222"
+    scope_a = get_provider_account_fingerprint(key_a, None)
+    scope_b = get_provider_account_fingerprint(key_b, None)
+
+    # Step 1: Initial config with Key A
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="OpenAI", openai_api_key=key_a)
+            session.add(cfg)
+        else:
+            cfg.provider = "OpenAI"
+            cfg.openai_api_key = key_a
+        await session.commit()
+
+    err = InsufficientBalanceError("Quota exceeded on key A")
+    err.provider = "OpenAI"
+    inc1 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=err,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope=scope_a,
+        session_maker=test_db_session_maker,
+    )
+    assert inc1 is not None
+    assert inc1.status == "active"
+
+    # Step 2: Rotate to Key B
+    await handle_key_rotation(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        new_key=key_b,
+        old_key=key_a,
+        session_maker=test_db_session_maker,
+    )
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.openai_api_key = key_b
+        await session.commit()
+
+    # Verify Key A incident is superseded
+    async with test_db_session_maker() as session:
+        inc1_db = await session.get(AIProviderIncidentModel, inc1.id)
+        assert inc1_db.status == "superseded"
+
+    # Step 3: Rotate back to Key A (A -> B -> A)
+    await handle_key_rotation(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        new_key=key_a,
+        old_key=key_b,
+        session_maker=test_db_session_maker,
+    )
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.openai_api_key = key_a
+        await session.commit()
+
+    # Step 4: Key A fails again
+    err2 = InsufficientBalanceError("Quota exceeded again on re-activated key A")
+    err2.provider = "OpenAI"
+    inc2 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=err2,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope=scope_a,
+        session_maker=test_db_session_maker,
+    )
+
+    # Assert new active incident is successfully opened!
+    assert inc2 is not None
+    assert inc2.status == "active", "Re-activated Key A failure must open an active incident"
+    assert inc2.id != inc1.id
+
+    # Verify outbox has pending notification for the new active incident
+    async with test_db_session_maker() as session:
+        notifs = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.incident_id == inc2.id,
+                AIIncidentNotificationModel.status == "pending",
+            )
+        )).scalars().all()
+        assert len(notifs) >= 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_ai_failure_db_enqueue_failed_allows_immediate_retry(test_db_session_maker, monkeypatch):
+    """Defect 3: DB enqueue failure does not poison local in-memory cooldown; immediate retry succeeds."""
+    from error_reporting import send_terminal_ai_failure_alert
+    import ai_incident_manager
+
+    bot_token = "8224473896:AAFtest_token_veraveda"
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+    monkeypatch.setattr("error_reporting.async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+
+    real_enqueue = ai_incident_manager.enqueue_terminal_ai_failure_notification
+    fail_first = True
+
+    async def flaky_enqueue(*args, **kwargs):
+        nonlocal fail_first
+        if fail_first:
+            fail_first = False
+            raise RuntimeError("Database connection lost during outbox enqueue")
+        return await real_enqueue(*args, **kwargs)
+
+    monkeypatch.setattr("ai_incident_manager.enqueue_terminal_ai_failure_notification", flaky_enqueue)
+
+    mock_bot = AsyncMock(spec=Bot)
+    mock_bot.token = bot_token
+    mock_bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    # Attempt 1: Fails due to DB error
+    res1 = await send_terminal_ai_failure_alert(
+        mock_bot,
+        primary_provider="Deepseek",
+        primary_model="deepseek-chat",
+        classification="timeout",
+        error_message="Gateway timeout",
+        session_maker=test_db_session_maker,
+    )
+    assert res1 is False
+
+    # Attempt 2: Immediate retry must NOT be blocked by any in-memory cooldown!
+    res2 = await send_terminal_ai_failure_alert(
+        mock_bot,
+        primary_provider="Deepseek",
+        primary_model="deepseek-chat",
+        classification="timeout",
+        error_message="Gateway timeout",
+        session_maker=test_db_session_maker,
+    )
+    assert res2 is True
+
+    # Verify notification exists in DB
+    async with test_db_session_maker() as session:
+        notifs = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.event_type == "terminal_failure",
+            )
+        )).scalars().all()
+        assert len(notifs) >= 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_ai_failure_cooldown_survives_restart(test_db_session_maker, monkeypatch):
+    """Defect 3: DB-backed cooldown persists across process restarts (in-memory state cleared)."""
+    from error_reporting import send_terminal_ai_failure_alert, _terminal_failure_cooldown
+
+    bot_token = "8224473896:AAFtest_token_veraveda"
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+    monkeypatch.setattr("error_reporting.async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+
+    mock_bot = AsyncMock(spec=Bot)
+    mock_bot.token = bot_token
+    mock_bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    # Initial alert succeeds
+    res1 = await send_terminal_ai_failure_alert(
+        mock_bot,
+        primary_provider="Deepseek",
+        primary_model="deepseek-chat",
+        classification="provider_down",
+        session_maker=test_db_session_maker,
+    )
+    assert res1 is True
+
+    # Simulate process restart: clear any residual in-memory state
+    _terminal_failure_cooldown._last_sent.clear()
+
+    # Second alert within 30 minutes must be suppressed by durable DB cooldown
+    res2 = await send_terminal_ai_failure_alert(
+        mock_bot,
+        primary_provider="Deepseek",
+        primary_model="deepseek-chat",
+        classification="provider_down",
+        session_maker=test_db_session_maker,
+    )
+    assert res2 is False
+
+
+@pytest.mark.asyncio
+async def test_terminal_ai_failure_key_rotation_not_suppressed_by_old_cooldown(test_db_session_maker, monkeypatch):
+    """Defect 3: Failure on a new rotated key is not suppressed by previous key's cooldown."""
+    from error_reporting import send_terminal_ai_failure_alert
+
+    bot_token = "8224473896:AAFtest_token_veraveda"
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+    monkeypatch.setattr("error_reporting.async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+
+    mock_bot = AsyncMock(spec=Bot)
+    mock_bot.token = bot_token
+    mock_bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    key_1 = "old_deepseek_key_111"
+    key_2 = "new_deepseek_key_222"
+
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="Deepseek", deepseek_api_key=key_1)
+            session.add(cfg)
+        else:
+            cfg.provider = "Deepseek"
+            cfg.deepseek_api_key = key_1
+        await session.commit()
+
+    # Terminal alert on old key 1
+    res1 = await send_terminal_ai_failure_alert(
+        mock_bot,
+        primary_provider="Deepseek",
+        primary_model="deepseek-chat",
+        classification="rate_limit",
+        session_maker=test_db_session_maker,
+    )
+    assert res1 is True
+
+    # Rotate key to key 2
+    await handle_key_rotation(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="Deepseek",
+        new_key=key_2,
+        old_key=key_1,
+        session_maker=test_db_session_maker,
+    )
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.deepseek_api_key = key_2
+        await session.commit()
+
+    # Terminal alert on new key 2 must NOT be suppressed by key 1 cooldown
+    res2 = await send_terminal_ai_failure_alert(
+        mock_bot,
+        primary_provider="Deepseek",
+        primary_model="deepseek-chat",
+        classification="rate_limit",
+        session_maker=test_db_session_maker,
+    )
+    assert res2 is True
+
+
+@pytest.mark.asyncio
+async def test_terminal_ai_failure_concurrent_processes_and_partial_admin_delivery(test_db_session_maker, monkeypatch):
+    """Defect 3: Concurrent processes deduplicate outbox enqueues, and worker handles partial delivery & retry."""
+    from error_reporting import send_terminal_ai_failure_alert
+    from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError
+
+    bot_token = "8224473896:AAFtest_token_veraveda"
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+    monkeypatch.setattr("error_reporting.async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+
+    # 3 configured admins
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[1001, 1002, 1003]))
+
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="Claude", claude_api_key="claude_test_concurrent_key")
+            session.add(cfg)
+        else:
+            cfg.provider = "Claude"
+            cfg.claude_api_key = "claude_test_concurrent_key"
+        await session.commit()
+
+    # Step 1: 2 concurrent processes call send_terminal_ai_failure_alert simultaneously
+    res = await asyncio.gather(
+        send_terminal_ai_failure_alert(
+            bot=None,
+            primary_provider="Claude",
+            primary_model="claude-3-opus",
+            classification="service_unavailable",
+            session_maker=test_db_session_maker,
+        ),
+        send_terminal_ai_failure_alert(
+            bot=None,
+            primary_provider="Claude",
+            primary_model="claude-3-opus",
+            classification="service_unavailable",
+            session_maker=test_db_session_maker,
+        ),
+    )
+    # Exactly one succeeded in enqueuing, the other was suppressed by DB cooldown
+    assert True in res
+
+    # Verify exactly 3 notification rows exist (1 for each admin)
+    async with test_db_session_maker() as session:
+        notifs = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.event_type == "terminal_failure",
+            )
+        )).scalars().all()
+        assert len(notifs) == 3
+
+    # Step 2: Outbox worker dispatches to the 3 admins:
+    # Admin 1001 succeeds, Admin 1002 encounters rate limit (retryable), Admin 1003 is blocked (terminal)
+    async def mock_send(chat_id, text, **kwargs):
+        if chat_id == 1001:
+            return True
+        elif chat_id == 1002:
+            raise TelegramRetryAfter(method=None, message="Rate limit", retry_after=5)
+        elif chat_id == 1003:
+            raise TelegramForbiddenError(method=None, message="Forbidden: bot was blocked by the user")
+
+    mock_bot = AsyncMock(spec=Bot)
+    mock_bot.token = bot_token
+    mock_bot.send_message = AsyncMock(side_effect=mock_send)
+    mock_bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    delivered = await process_ai_incident_notifications(mock_bot, session_maker=test_db_session_maker)
+    assert delivered == 1
+
+    # Verify per-recipient outbox statuses
+    async with test_db_session_maker() as session:
+        n_1001 = (await session.execute(
+            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.recipient_id == 1001)
+        )).scalar_one()
+        assert n_1001.status == "delivered"
+
+        n_1002 = (await session.execute(
+            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.recipient_id == 1002)
+        )).scalar_one()
+        assert n_1002.status == "pending"
+        assert n_1002.attempts == 1
+
+        n_1003 = (await session.execute(
+            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.recipient_id == 1003)
+        )).scalar_one()
+        assert n_1003.status == "failed_terminal"
+
+    # Step 3: Fast-forward time for retry of 1002
+    async with test_db_session_maker() as session:
+        n_1002 = (await session.execute(
+            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.recipient_id == 1002)
+        )).scalar_one()
+        n_1002.next_retry_at = datetime.utcnow() - timedelta(seconds=1)
+        await session.commit()
+
+    # Retry delivery: now 1002 succeeds
+    mock_bot.send_message = AsyncMock(return_value=True)
+    delivered_retry = await process_ai_incident_notifications(mock_bot, session_maker=test_db_session_maker)
+    assert delivered_retry == 1
+
+    # Verify 1001 was NOT re-sent (only 1 send_message call occurred in retry)
+    assert mock_bot.send_message.call_count == 1
+    assert mock_bot.send_message.call_args.kwargs["chat_id"] == 1002
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_concurrent_transient_failure_and_terminal_alert(pg_test_session_maker, monkeypatch):
+    """Defect 4: Concurrent non-operator failures and terminal alert deduplication on real PostgreSQL:
+    - 2 concurrent async tasks record the exact same transient non-operator failure simultaneously on real PostgreSQL.
+    - Partial unique index uq_transient_ai_incident enforces concurrent identity.
+    - Exactly ONE row in ai_provider_incidents with status='transient' and occurrence_count=2.
+    - Cooldown prevents duplicate terminal alert outbox rows.
+    """
+    bot_token = "8281390498:AAFtest_telegram_token_123456789012"
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+
+    inst_def = {"pm2_name": "tg_someonewithyou01_bot_new", "platform": "telegram", "platform_id": 8281390498, "admins": [1001], "username": "someonewithyou01_bot"}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[1001]))
+
+    scope = get_provider_account_fingerprint("pg_test_transient_key", None)
+    async with pg_test_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="OpenAI", openai_api_key="pg_test_transient_key")
+            session.add(cfg)
+        else:
+            cfg.provider = "OpenAI"
+            cfg.openai_api_key = "pg_test_transient_key"
+        await session.commit()
+
+    # Non-operator failure (transient)
+    class TransientTimeout(Exception):
+        pass
+
+    async def record_transient():
+        return await record_ai_provider_failure(
+            origin_instance_id="tg_someonewithyou01_bot_new",
+            provider="OpenAI",
+            error=TransientTimeout("Temporary gateway timeout"),
+            operation="chat",
+            model="gpt-4o",
+            credential_scope=scope,
+            session_maker=pg_test_session_maker,
+            enqueue_notification=False,
+        )
+
+    # Run 2 concurrent recordings
+    inc1, inc2 = await asyncio.gather(record_transient(), record_transient())
+    assert inc1 is not None
+    assert inc2 is not None
+    assert inc1.id == inc2.id
+
+    # Verify exactly 1 transient incident row exists in PostgreSQL
+    async with pg_test_session_maker() as session:
+        trans_rows = (await session.execute(
+            select(AIProviderIncidentModel).where(
+                AIProviderIncidentModel.provider == "OPENAI",
+                AIProviderIncidentModel.credential_scope == scope,
+                AIProviderIncidentModel.status == "transient",
+            )
+        )).scalars().all()
+        assert len(trans_rows) == 1
+        assert trans_rows[0].occurrence_count == 2
+
+    # Now run 2 concurrent terminal alert notifications for this incident
+    enq1, enq2 = await asyncio.gather(
+        enqueue_terminal_ai_failure_notification(
+            incident_id=inc1.id,
+            origin_instance_id="tg_someonewithyou01_bot_new",
+            text="Diagnostic alert 1",
+            cooldown_seconds=1800,
+            session_maker=pg_test_session_maker,
+        ),
+        enqueue_terminal_ai_failure_notification(
+            incident_id=inc1.id,
+            origin_instance_id="tg_someonewithyou01_bot_new",
+            text="Diagnostic alert 2",
+            cooldown_seconds=1800,
+            session_maker=pg_test_session_maker,
+        ),
+    )
+    # Exactly one succeeded, one suppressed by cooldown/index
+    assert (enq1, enq2) in [(True, False), (False, True)]
+
+    # Verify exactly 1 notification row in PostgreSQL
+    async with pg_test_session_maker() as session:
+        notifs = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.incident_id == inc1.id,
+                AIIncidentNotificationModel.event_type == "terminal_failure",
+            )
+        )).scalars().all()
+        assert len(notifs) == 1
