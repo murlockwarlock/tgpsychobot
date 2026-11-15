@@ -2482,8 +2482,8 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
                 except Exception as inc_exc:
                     log.warning("Failed to record KIE transcription failure: %s", inc_exc)
                 raise
-            log.info("Handled AI notice: KIE transcription fallback to Gemini | stage=transcription | provider=KIE | model=%s", gemini_stt_model)
             gemini_stt_model = get_default_model(PROVIDER_GEMINI, channel="transcription")
+            log.info("Handled AI notice: KIE transcription fallback to Gemini | stage=transcription | provider=KIE | model=%s", gemini_stt_model)
             fb_ok = False
             try:
                 res = await _transcribe_gemini(
