@@ -337,6 +337,18 @@ async def test_terminal_ai_failure_alert_displays_correct_bot_name_and_routes_to
     2. Dispatch via companion Telegram bot (@yourself_way_bot).
     """
     from error_reporting import send_terminal_ai_failure_alert
+    from database import engine, Base, AIConfig, AIProviderIncidentModel, AIIncidentNotificationModel, async_session_maker
+    from sqlalchemy import delete
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    async with async_session_maker() as session:
+        await session.execute(delete(AIIncidentNotificationModel))
+        await session.execute(delete(AIProviderIncidentModel))
+        await session.execute(delete(AIConfig))
+        cfg = AIConfig(id=1, provider="Deepseek", deepseek_api_key="sk-test-deepseek")
+        session.add(cfg)
+        await session.commit()
 
     recording_session = RecordingSession()
     dummy_bot_token = "8481853696:AAF_YOURSELF_WAY_TOKEN_TEST"
@@ -349,7 +361,7 @@ async def test_terminal_ai_failure_alert_displays_correct_bot_name_and_routes_to
     }, clear=True), patch("telegram_client.create_telegram_bot", lambda token: Bot(token=token, session=recording_session)):
 
         delivered = await send_terminal_ai_failure_alert(
-            bot=None,  # Running in MAX process without Telegram bot instance
+            bot=None,  # Running in MAX process without Telegram bot instance: enqueues into durable outbox for companion
             platform="max",
             user_id=100026905347,
             classification="timeout",
@@ -358,12 +370,23 @@ async def test_terminal_ai_failure_alert_displays_correct_bot_name_and_routes_to
         )
         assert delivered is True
 
+    # Companion Telegram bot processes the durable outbox row
+    from ai_incident_manager import process_ai_incident_notifications
+    companion_bot = Bot(token=dummy_bot_token, session=recording_session)
+    with patch.dict(os.environ, {
+        "BOT_INSTANCE_ID": "tg_yourself_way_bot_new",
+        "PM2_APP_NAME": "tg_yourself_way_bot_new",
+        "BOT_TOKEN": dummy_bot_token,
+    }, clear=True):
+        delivered_count = await process_ai_incident_notifications(companion_bot)
+        assert delivered_count > 0
+
     assert len(recording_session.requests) > 0
     token, bot_id, method = recording_session.requests[0]
     assert bot_id == 8481853696, "Must be routed through companion @yourself_way_bot"
     assert "id519010411655_bot" in method.text, "Header must show real bot name"
     assert "tgpsychobot" not in method.text, "Fallback 'tgpsychobot' must NOT appear"
-    assert "100026905347" in method.text
+    assert "100026905347" not in method.text, "User ID must NOT be present in terminal failure alert (zero PII)"
     assert "#3466, #3467" in method.text
 
 
@@ -723,6 +746,16 @@ async def test_e2e_reproduce_incident_november_7_and_verify_correct_routing():
         )
         assert deliv2 is True
 
+    # Companion bot processes outbox for MAX terminal alert
+    from ai_incident_manager import process_ai_incident_notifications
+    companion_bot = Bot(token=yourself_token, session=recording_session)
+    with patch.dict(os.environ, {
+        "BOT_INSTANCE_ID": "tg_yourself_way_bot_new",
+        "PM2_APP_NAME": "tg_yourself_way_bot_new",
+        "BOT_TOKEN": yourself_token,
+    }, clear=True):
+        await process_ai_incident_notifications(companion_bot)
+
     # VERIFY EXACT TRANSPORT BEHAVIOR
     assert len(recording_session.requests) > 0, "Requests must be delivered"
 
@@ -745,7 +778,7 @@ async def test_e2e_reproduce_incident_november_7_and_verify_correct_routing():
         if "Сбой ИИ" in method.text:
             assert "id519010411655_bot" in method.text
             assert "tgpsychobot" not in method.text
-            assert "100026905347" in method.text
+            assert "100026905347" not in method.text
 
 
 @pytest.mark.asyncio

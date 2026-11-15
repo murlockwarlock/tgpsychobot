@@ -267,9 +267,22 @@ class VisionMediaRedactionPersistenceTests(unittest.IsolatedAsyncioTestCase):
 class VisionAdminAlertMediaRedactionTests(unittest.IsolatedAsyncioTestCase):
     """Section 10: Alert media redaction test patching _dispatch_admin_alert_text."""
 
-    def setUp(self):
+    async def asyncSetUp(self):
         _terminal_failure_cooldown._last_sent.clear()
         _output_budget_cooldown._last_sent.clear()
+        os.environ["BOT_INSTANCE_ID"] = "tg_someonewithyou01_bot_new"
+        os.environ["BOT_TOKEN"] = "8281390498:AAF_TEST_ROUTING_TOKEN"
+        from sqlalchemy import delete
+        from database import engine, Base, AIConfig, AIProviderIncidentModel, AIIncidentNotificationModel, async_session_maker
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with async_session_maker() as session:
+            await session.execute(delete(AIIncidentNotificationModel))
+            await session.execute(delete(AIProviderIncidentModel))
+            await session.execute(delete(AIConfig))
+            cfg = AIConfig(id=1, provider="OpenAI", openai_api_key="sk-test-openai")
+            session.add(cfg)
+            await session.commit()
 
     async def test_alert_media_redaction_terminal_and_fallback(self):
         marker_uri = "ALERT_MARKER_URI_1111"
@@ -283,12 +296,15 @@ class VisionAdminAlertMediaRedactionTests(unittest.IsolatedAsyncioTestCase):
         realistic_signed_url = f"https://s3.amazonaws.com/bucket/image.png?X-Amz-Signature={marker_sig}&token=xyz"
 
         mock_bot = MagicMock()
+        mock_bot.token = "8281390498:AAF_TEST_ROUTING_TOKEN"
+        mock_bot.send_message = AsyncMock(return_value=True)
+        mock_bot.get_me = AsyncMock(return_value=SimpleNamespace(id=8281390498, is_bot=True, first_name="bot", username="someonewithyou01_bot"))
         mock_user = SimpleNamespace(id=9999, full_name="Secret User", username="secretuser")
 
         with patch("error_reporting._dispatch_admin_alert_text", new_callable=AsyncMock) as mock_dispatch:
             mock_dispatch.return_value = True
 
-            # 1. Test terminal failure alert
+            # 1. Test terminal failure alert (delivers via durable outbox -> bot.send_message)
             await send_terminal_ai_failure_alert(
                 bot=mock_bot,
                 title="Тестовый сбой",
@@ -311,8 +327,8 @@ class VisionAdminAlertMediaRedactionTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
-            self.assertTrue(mock_dispatch.called)
-            alert_text = mock_dispatch.call_args[0][1]
+            self.assertTrue(mock_bot.send_message.called)
+            alert_text = mock_bot.send_message.call_args.kwargs.get("text") or mock_bot.send_message.call_args[0][1]
             self.assertNotIn(marker_uri, alert_text)
             self.assertNotIn(marker_raw, alert_text)
             self.assertNotIn(marker_kie, alert_text)
@@ -322,9 +338,7 @@ class VisionAdminAlertMediaRedactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(realistic_kie_url, alert_text)
             self.assertNotIn(realistic_signed_url, alert_text)
 
-            mock_dispatch.reset_mock()
-
-            # 2. Test fallback used alert
+            # 2. Test fallback used alert (delivers via _dispatch_admin_alert_text)
             await send_ai_fallback_used_alert(
                 bot=mock_bot,
                 primary_provider="OpenAI",
@@ -547,71 +561,84 @@ class VisionAdminUITests(unittest.IsolatedAsyncioTestCase):
 class VisionPublicAlertTests(unittest.IsolatedAsyncioTestCase):
     """Test public admin alert contracts, cooldowns, and isolation between chat and vision."""
 
-    def setUp(self):
+    async def asyncSetUp(self):
         _terminal_failure_cooldown._last_sent.clear()
         _output_budget_cooldown._last_sent.clear()
+        os.environ["BOT_INSTANCE_ID"] = "tg_someonewithyou01_bot_new"
+        os.environ["BOT_TOKEN"] = "8281390498:AAF_TEST_ROUTING_TOKEN"
+        from sqlalchemy import delete
+        from database import engine, Base, AIConfig, AIProviderIncidentModel, AIIncidentNotificationModel, async_session_maker
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with async_session_maker() as session:
+            await session.execute(delete(AIIncidentNotificationModel))
+            await session.execute(delete(AIProviderIncidentModel))
+            await session.execute(delete(AIConfig))
+            cfg = AIConfig(id=1, provider="OpenAI", openai_api_key="sk-test-openai")
+            session.add(cfg)
+            await session.commit()
 
     async def test_chat_alert_then_vision_alert_both_send(self):
         mock_bot = MagicMock()
-        mock_bot.send_message = AsyncMock()
+        mock_bot.token = "8281390498:AAF_TEST_ROUTING_TOKEN"
+        mock_bot.send_message = AsyncMock(return_value=True)
+        mock_bot.get_me = AsyncMock(return_value=SimpleNamespace(id=8281390498, is_bot=True, first_name="bot", username="someonewithyou01_bot"))
 
-        with patch("error_reporting._dispatch_admin_alert_text", new_callable=AsyncMock) as mock_dispatch:
-            mock_dispatch.return_value = True
+        # 1. Chat terminal alert (delivers via durable outbox -> bot.send_message)
+        chat_sent = await send_terminal_ai_failure_alert(
+            bot=mock_bot,
+            platform="telegram",
+            user_id=7001,
+            primary_provider="OpenAI",
+            primary_model="gpt-5.6-terra",
+            request_type="chat",
+            error_message="Chat timeout",
+        )
+        self.assertTrue(chat_sent)
 
-            # 1. Chat terminal alert
-            chat_sent = await send_terminal_ai_failure_alert(
-                bot=mock_bot,
-                platform="telegram",
-                user_id=7001,
-                primary_provider="OpenAI",
-                primary_model="gpt-5.6-terra",
-                request_type="chat",
-                error_message="Chat timeout",
-            )
-            self.assertTrue(chat_sent)
-
-            # 2. Vision terminal alert for same provider/model sends because namespace is isolated
-            vision_sent = await send_terminal_ai_failure_alert(
-                bot=mock_bot,
-                platform="telegram",
-                user_id=7001,
-                primary_provider="OpenAI",
-                primary_model="gpt-5.6-terra",
-                request_type="vision",
-                error_message="Vision timeout",
-            )
-            self.assertTrue(vision_sent)
-            self.assertEqual(mock_dispatch.call_count, 2)
+        # 2. Vision terminal alert for same provider/model sends because namespace is isolated
+        vision_sent = await send_terminal_ai_failure_alert(
+            bot=mock_bot,
+            platform="telegram",
+            user_id=7001,
+            primary_provider="OpenAI",
+            primary_model="gpt-5.6-terra",
+            request_type="vision",
+            error_message="Vision timeout",
+        )
+        self.assertTrue(vision_sent)
+        self.assertEqual(mock_bot.send_message.call_count, 6)
 
     async def test_vision_terminal_alert_cooldown_deduplication(self):
         mock_bot = MagicMock()
-        with patch("error_reporting._dispatch_admin_alert_text", new_callable=AsyncMock) as mock_dispatch:
-            mock_dispatch.return_value = True
+        mock_bot.token = "8281390498:AAF_TEST_ROUTING_TOKEN"
+        mock_bot.send_message = AsyncMock(return_value=True)
+        mock_bot.get_me = AsyncMock(return_value=SimpleNamespace(id=8281390498, is_bot=True, first_name="bot", username="someonewithyou01_bot"))
 
-            # First vision alert sends
-            sent1 = await send_terminal_ai_failure_alert(
-                bot=mock_bot,
-                platform="telegram",
-                user_id=7001,
-                primary_provider="OpenAI",
-                primary_model="gpt-5.6-terra",
-                request_type="vision",
-                error_message="Vision timeout",
-            )
-            self.assertTrue(sent1)
+        # First vision alert sends
+        sent1 = await send_terminal_ai_failure_alert(
+            bot=mock_bot,
+            platform="telegram",
+            user_id=7001,
+            primary_provider="OpenAI",
+            primary_model="gpt-5.6-terra",
+            request_type="vision",
+            error_message="Vision timeout",
+        )
+        self.assertTrue(sent1)
 
-            # Second identical vision alert within cooldown is suppressed
-            sent2 = await send_terminal_ai_failure_alert(
-                bot=mock_bot,
-                platform="telegram",
-                user_id=7001,
-                primary_provider="OpenAI",
-                primary_model="gpt-5.6-terra",
-                request_type="vision",
-                error_message="Vision timeout",
-            )
-            self.assertFalse(sent2)
-            self.assertEqual(mock_dispatch.call_count, 1)
+        # Second identical vision alert within cooldown is suppressed
+        sent2 = await send_terminal_ai_failure_alert(
+            bot=mock_bot,
+            platform="telegram",
+            user_id=7001,
+            primary_provider="OpenAI",
+            primary_model="gpt-5.6-terra",
+            request_type="vision",
+            error_message="Vision timeout",
+        )
+        self.assertFalse(sent2)
+        self.assertEqual(mock_bot.send_message.call_count, 3)
 
     async def test_fallback_recovery_alert_dispatches_cleanly(self):
         mock_bot = MagicMock()
@@ -639,10 +666,14 @@ class VisionPublicAlertTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_recovery_alert_does_not_consume_terminal_or_budget_cooldown(self):
         mock_bot = MagicMock()
+        mock_bot.token = "8281390498:AAF_TEST_ROUTING_TOKEN"
+        mock_bot.send_message = AsyncMock(return_value=True)
+        mock_bot.get_me = AsyncMock(return_value=SimpleNamespace(id=8281390498, is_bot=True, first_name="bot", username="someonewithyou01_bot"))
+
         with patch("error_reporting._dispatch_admin_alert_text", new_callable=AsyncMock) as mock_dispatch:
             mock_dispatch.return_value = True
 
-            # 1. Fallback used alert
+            # 1. Fallback used alert (uses _dispatch_admin_alert_text)
             await send_ai_fallback_used_alert(
                 bot=mock_bot,
                 platform="telegram",
@@ -654,8 +685,9 @@ class VisionPublicAlertTests(unittest.IsolatedAsyncioTestCase):
                 primary_error="KIE 503",
                 request_type="vision",
             )
+            self.assertEqual(mock_dispatch.call_count, 1)
 
-            # 2. Terminal alert for same provider/model is still sent
+            # 2. Terminal alert for same provider/model is still sent (uses durable outbox -> bot.send_message)
             term_sent = await send_terminal_ai_failure_alert(
                 bot=mock_bot,
                 platform="telegram",
@@ -666,7 +698,7 @@ class VisionPublicAlertTests(unittest.IsolatedAsyncioTestCase):
                 error_message="KIE terminal",
             )
             self.assertTrue(term_sent)
-            self.assertEqual(mock_dispatch.call_count, 2)
+            self.assertEqual(mock_bot.send_message.call_count, 3)
 
 
 class VisionOrchestrationIntegrationTests(unittest.IsolatedAsyncioTestCase):

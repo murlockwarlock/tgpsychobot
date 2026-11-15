@@ -203,11 +203,10 @@ async def record_ai_provider_failure(
     credential_scope: str | None = None,
     session_maker: Any = None,
     enqueue_notification: bool = True,
-    force_operator_incident: bool = False,
 ) -> AIProviderIncidentModel | None:
     """
     Record an AI provider failure, opening or updating an active incident and enqueuing outbox events.
-    Fail-safe: catches all internal exceptions and logs warning, never raising to caller.
+    Fail-safe: catches all internal exceptions and logs error, never raising to caller.
     """
     try:
         return await _record_ai_provider_failure_impl(
@@ -222,10 +221,9 @@ async def record_ai_provider_failure(
             credential_scope=credential_scope,
             session_maker=session_maker,
             enqueue_notification=enqueue_notification,
-            force_operator_incident=force_operator_incident,
         )
     except Exception as exc:
-        logger.warning("[AI Incident] Unexpected error recording failure for %s: %s", provider, exc)
+        logger.error("[AI Incident] Unexpected error recording failure for %s: %s", provider, exc, exc_info=True)
         return None
 
 
@@ -241,7 +239,6 @@ async def _record_ai_provider_failure_impl(
     credential_scope: str | None = None,
     session_maker: Any = None,
     enqueue_notification: bool = True,
-    force_operator_incident: bool = False,
 ) -> AIProviderIncidentModel | None:
     current_inst = detect_current_instance()
     if not current_inst:
@@ -318,16 +315,6 @@ async def _record_ai_provider_failure_impl(
         else normalize_exception(error, provider=provider, operation=operation)
     )
 
-    # Transient or non-operator failures do NOT create long-lived operator incidents unless forced
-    if not failure.operator_action_required and not force_operator_incident:
-        logger.info(
-            "[AI Incident] Non-operator failure for %s (%s, %s): not creating operator incident.",
-            provider,
-            operation,
-            failure.classification,
-        )
-        return None
-
     prov_norm = (provider or failure.provider or "unknown").strip().upper()
     op_norm = (operation or failure.operation or "chat").strip().lower()
     mod_norm = str(model or "*").strip()
@@ -343,7 +330,6 @@ async def _record_ai_provider_failure_impl(
     now = datetime.utcnow()
 
     async with sm() as session:
-        # If credential_scope not passed, log warning and compute from AIConfig
         if not credential_scope:
             logger.warning("[AI Incident] Credential scope not passed for %s (%s); reading current AIConfig.", prov_norm, op_norm)
             from database import AIConfig
@@ -352,7 +338,33 @@ async def _record_ai_provider_failure_impl(
             b_url = getattr(ai_cfg, "kie_base_url", None) if prov_norm == "KIE" else None
             credential_scope = get_provider_account_fingerprint(api_k, b_url)
 
-        # 1. Atomic query / UPSERT with partial unique index
+        # Check if this credential scope was already retired/superseded by a key rotation
+        stmt_superseded = select(AIProviderIncidentModel).where(
+            AIProviderIncidentModel.provider == prov_norm,
+            AIProviderIncidentModel.credential_scope == credential_scope,
+            AIProviderIncidentModel.status == "superseded",
+            or_(
+                AIProviderIncidentModel.origin_instance_id == origin_instance_id,
+                AIProviderIncidentModel.companion_instance_id == origin_instance_id,
+            ),
+        ).limit(1)
+        existing_superseded = await session.scalar(stmt_superseded)
+
+        if existing_superseded is not None:
+            logger.info(
+                "[AI Incident] Finished AI attempt for %s belongs to retired credential %s. Preserving record as superseded.",
+                prov_norm,
+                credential_scope,
+            )
+            target_status = "superseded"
+            enqueue_notification = False
+        elif failure.operator_action_required:
+            target_status = "active"
+        else:
+            target_status = "transient"
+            enqueue_notification = False
+
+        # 1. Atomic query / UPSERT for this target status
         stmt = select(AIProviderIncidentModel).where(
             AIProviderIncidentModel.origin_instance_id == origin_instance_id,
             AIProviderIncidentModel.provider == prov_norm,
@@ -360,7 +372,7 @@ async def _record_ai_provider_failure_impl(
             AIProviderIncidentModel.operation == op_norm,
             AIProviderIncidentModel.model_scope == mod_norm,
             AIProviderIncidentModel.incident_type == inc_type,
-            AIProviderIncidentModel.status == "active",
+            AIProviderIncidentModel.status == target_status,
         )
         existing = await session.scalar(stmt)
 
@@ -388,12 +400,13 @@ async def _record_ai_provider_failure_impl(
                 incident_type=inc_type,
                 detail_code=det_code,
                 evidence_tier=evidence_tier,
-                status="active",
+                status=target_status,
                 occurrence_count=1,
                 reminder_cycle=0,
                 first_seen_at=now,
                 last_seen_at=now,
                 last_alerted_at=now,
+                resolved_at=now if target_status == "superseded" else None,
             )
             try:
                 async with session.begin_nested():
@@ -417,9 +430,9 @@ async def _record_ai_provider_failure_impl(
                     )
                 )
 
-        # 2. Enqueue notification event if newly opened or fallback_used
+        # 2. Enqueue notification event if newly opened active operator incident or fallback_used
         event_type = "fallback_used" if fallback_succeeded else "opened"
-        if enqueue_notification and (is_new or fallback_succeeded):
+        if target_status == "active" and enqueue_notification and (is_new or fallback_succeeded):
             admin_ids = await resolve_target_admin_ids(companion_def, current_instance=source_def, session=session)
             if admin_ids:
                 msg_text = _format_incident_message_text(
@@ -481,7 +494,7 @@ async def record_ai_operation_success(
             session_maker=session_maker,
         )
     except Exception as exc:
-        logger.warning("[AI Incident] Unexpected error recording operation success for %s: %s", provider, exc)
+        logger.error("[AI Incident] Unexpected error recording operation success for %s: %s", provider, exc, exc_info=True)
         return False
 
 
@@ -644,7 +657,7 @@ async def handle_key_rotation(
             session_maker=session_maker,
         )
     except Exception as exc:
-        logger.warning("[AI Incident] Unexpected error in handle_key_rotation: %s", exc)
+        logger.error("[AI Incident] Unexpected error in handle_key_rotation: %s", exc, exc_info=True)
         return 0
 
 
@@ -656,7 +669,13 @@ async def _handle_key_rotation_impl(
     session_maker: Any = None,
 ) -> int:
     current_inst = detect_current_instance()
-    if origin_instance_id:
+    if not origin_instance_id:
+        if not current_inst:
+            logger.critical("[AI Incident] Fail-closed: cannot determine instance identity for key rotation.")
+            return 0
+        source_def = current_inst
+        origin_instance_id = current_inst.get("pm2_name")
+    else:
         source_def = get_instance_by_pm2_name(origin_instance_id)
         if not source_def:
             logger.critical("[AI Incident] Fail-closed: origin_instance_id %r not in registry for key rotation.", origin_instance_id)
@@ -684,12 +703,29 @@ async def _handle_key_rotation_impl(
     now = datetime.utcnow()
     superseded_count = 0
 
+    # Determine origin and companion instance names to avoid touching foreign bot incidents in shared DB
+    companion_def = resolve_companion_telegram_instance(source_def) if source_def else None
+    origin_names = {source_def.get("pm2_name"), source_def.get("bot_instance_id")}
+    if companion_def:
+        origin_names.update({companion_def.get("pm2_name"), companion_def.get("bot_instance_id")})
+    origin_names.discard(None)
+
     async with sm() as session:
-        # Supersede ALL active incidents in this DB for provider whose credential_scope != new_fp
+        from database import AIConfig
+        ai_cfg = await session.get(AIConfig, 1)
+        old_k = get_provider_api_key(ai_cfg, prov_norm)
+        old_b_url = getattr(ai_cfg, "kie_base_url", None) if prov_norm == "KIE" else None
+        old_fp = get_provider_account_fingerprint(old_k, old_b_url) if old_k else None
+
+        # Supersede active incidents for this provider that belong ONLY to this bot instance or its companion
         stmt = select(AIProviderIncidentModel).where(
             AIProviderIncidentModel.provider == prov_norm,
             AIProviderIncidentModel.credential_scope != new_fp,
             AIProviderIncidentModel.status == "active",
+            or_(
+                AIProviderIncidentModel.origin_instance_id.in_(origin_names),
+                AIProviderIncidentModel.companion_instance_id.in_(origin_names),
+            ),
         )
         active_old = (await session.execute(stmt)).scalars().all()
         for inc in active_old:
@@ -711,13 +747,42 @@ async def _handle_key_rotation_impl(
                 )
             )
 
+        # Ensure a tombstone record exists for old_fp so concurrent in-flight failures
+        # are recognized as superseded and do not open a new active incident
+        if superseded_count == 0 and old_fp and old_fp != "unconfigured" and old_fp != new_fp:
+            tomb_stmt = select(AIProviderIncidentModel).where(
+                AIProviderIncidentModel.provider == prov_norm,
+                AIProviderIncidentModel.credential_scope == old_fp,
+                AIProviderIncidentModel.status == "superseded",
+                AIProviderIncidentModel.origin_instance_id.in_(origin_names),
+            ).limit(1)
+            tomb = await session.scalar(tomb_stmt)
+            if not tomb:
+                tomb = AIProviderIncidentModel(
+                    origin_instance_id=source_def.get("pm2_name"),
+                    companion_instance_id=companion_def.get("pm2_name") if companion_def else None,
+                    provider=prov_norm,
+                    credential_scope=old_fp,
+                    operation="chat",
+                    model_scope="*",
+                    incident_type="key_rotated",
+                    status="superseded",
+                    occurrence_count=1,
+                    resolved_at=now,
+                )
+                session.add(tomb)
+
         if prov_norm == "KIE":
-            # Reconcile kie_credit_alert_sent with whether new_fp has an active low_credit_warning
+            # Reconcile kie_credit_alert_sent with whether new_fp has an active low_credit_warning for this bot
             stmt_active_warn = select(AIProviderIncidentModel).where(
                 AIProviderIncidentModel.provider == "KIE",
                 AIProviderIncidentModel.credential_scope == new_fp,
                 AIProviderIncidentModel.incident_type == "low_credit_warning",
                 AIProviderIncidentModel.status == "active",
+                or_(
+                    AIProviderIncidentModel.origin_instance_id.in_(origin_names),
+                    AIProviderIncidentModel.companion_instance_id.in_(origin_names),
+                ),
             )
             has_active_warn = (await session.scalar(stmt_active_warn)) is not None
             from database import AIConfig
@@ -839,7 +904,7 @@ async def record_low_credit_warning(
             await session.commit()
             return True
     except Exception as exc:
-        logger.warning("[AI Incident] Failed to record low credit warning: %s", exc)
+        logger.error("[AI Incident] Failed to record low credit warning: %s", exc, exc_info=True)
         return False
 
 
@@ -919,7 +984,7 @@ async def resolve_low_credit_warning(
             await session.commit()
             return True
     except Exception as exc:
-        logger.warning("[AI Incident] Failed to resolve low credit warning: %s", exc)
+        logger.error("[AI Incident] Failed to resolve low credit warning: %s", exc, exc_info=True)
         return False
 
 
@@ -1037,7 +1102,7 @@ async def enqueue_terminal_ai_failure_notification(
             await session.commit()
             return enqueued_count > 0
     except Exception as exc:
-        logger.error("[AI Incident] Failed to enqueue terminal failure notification: %s", exc)
+        logger.error("[AI Incident] Failed to enqueue terminal failure notification: %s", exc, exc_info=True)
         return False
 
 
@@ -1051,97 +1116,101 @@ async def check_incident_repeat_reminders(
     """Check active incidents and enqueue repeat reminder outbox rows if cooldown elapsed."""
     if repeat_seconds is not None:
         repeat_interval_seconds = repeat_seconds
-    current_inst = detect_current_instance()
-    if not current_inst:
-        return 0
-    current_bot_instance_id = current_inst["pm2_name"]
-
-    sm = session_maker or async_session_maker
-    now = datetime.utcnow()
-    threshold = now - timedelta(seconds=repeat_interval_seconds)
-    reminders_created = 0
-
-    async with sm() as session:
-        stmt = select(AIProviderIncidentModel).where(
-            or_(
-                AIProviderIncidentModel.origin_instance_id == current_bot_instance_id,
-                AIProviderIncidentModel.companion_instance_id == current_bot_instance_id,
-            ),
-            AIProviderIncidentModel.status == "active",
-            AIProviderIncidentModel.last_alerted_at <= threshold,
-        )
-        stale_incidents = (await session.execute(stmt)).scalars().all()
-        if not stale_incidents:
+    try:
+        current_inst = detect_current_instance()
+        if not current_inst:
             return 0
+        current_bot_instance_id = current_inst["pm2_name"]
 
-        companion_def = resolve_companion_telegram_instance(current_inst)
-        if not companion_def:
-            return 0
-        admin_ids = await resolve_target_admin_ids(companion_def, current_instance=current_inst, session=session)
-        if not admin_ids:
-            return 0
+        sm = session_maker or async_session_maker
+        now = datetime.utcnow()
+        threshold = now - timedelta(seconds=repeat_interval_seconds)
+        reminders_created = 0
 
-        authorized_instance_id = companion_def["pm2_name"]
-
-        for inc in stale_incidents:
-            old_cycle = inc.reminder_cycle
-            new_cycle = old_cycle + 1
-
-            # Explicit CAS atomic update: only bump if cycle has not changed and last_alerted_at <= threshold
-            stmt_cas = (
-                update(AIProviderIncidentModel)
-                .where(
-                    AIProviderIncidentModel.id == inc.id,
-                    AIProviderIncidentModel.status == "active",
-                    AIProviderIncidentModel.reminder_cycle == old_cycle,
-                    AIProviderIncidentModel.last_alerted_at <= threshold,
-                )
-                .values(
-                    reminder_cycle=new_cycle,
-                    last_alerted_at=now,
-                )
+        async with sm() as session:
+            stmt = select(AIProviderIncidentModel).where(
+                or_(
+                    AIProviderIncidentModel.origin_instance_id == current_bot_instance_id,
+                    AIProviderIncidentModel.companion_instance_id == current_bot_instance_id,
+                ),
+                AIProviderIncidentModel.status == "active",
+                AIProviderIncidentModel.last_alerted_at <= threshold,
             )
-            cas_res = await session.execute(stmt_cas)
-            if cas_res.rowcount != 1:
-                # Concurrent worker already claimed and advanced this cycle
-                continue
+            stale_incidents = (await session.execute(stmt)).scalars().all()
+            if not stale_incidents:
+                return 0
 
-            msg_text = _format_incident_message_text(
-                provider=inc.provider,
-                operation=inc.operation,
-                model_scope=inc.model_scope,
-                incident_type=inc.incident_type,
-                detail_code=inc.detail_code or "persisting",
-                evidence_tier=inc.evidence_tier,
-                event_type="repeat_reminder",
-            )
+            companion_def = resolve_companion_telegram_instance(current_inst)
+            if not companion_def:
+                return 0
+            admin_ids = await resolve_target_admin_ids(companion_def, current_instance=current_inst, session=session)
+            if not admin_ids:
+                return 0
 
-            for admin_id in admin_ids:
-                if not is_valid_telegram_user_id(admin_id):
+            authorized_instance_id = companion_def["pm2_name"]
+
+            for inc in stale_incidents:
+                old_cycle = inc.reminder_cycle
+                new_cycle = old_cycle + 1
+
+                # Explicit CAS atomic update: only bump if cycle has not changed and last_alerted_at <= threshold
+                stmt_cas = (
+                    update(AIProviderIncidentModel)
+                    .where(
+                        AIProviderIncidentModel.id == inc.id,
+                        AIProviderIncidentModel.status == "active",
+                        AIProviderIncidentModel.reminder_cycle == old_cycle,
+                        AIProviderIncidentModel.last_alerted_at <= threshold,
+                    )
+                    .values(
+                        reminder_cycle=new_cycle,
+                        last_alerted_at=now,
+                    )
+                )
+                cas_res = await session.execute(stmt_cas)
+                if cas_res.rowcount != 1:
+                    # Concurrent worker already claimed and advanced this cycle
                     continue
-                notif = AIIncidentNotificationModel(
-                    incident_id=inc.id,
+
+                msg_text = _format_incident_message_text(
+                    provider=inc.provider,
+                    operation=inc.operation,
+                    model_scope=inc.model_scope,
+                    incident_type=inc.incident_type,
+                    detail_code=inc.detail_code or "persisting",
+                    evidence_tier=inc.evidence_tier,
                     event_type="repeat_reminder",
-                    cycle_index=new_cycle,
-                    recipient_id=admin_id,
-                    authorized_instance_id=authorized_instance_id,
-                    message_text=msg_text,
-                    status="pending",
-                    attempts=0,
-                    max_attempts=MAX_OUTBOX_ATTEMPTS,
-                    next_retry_at=now,
                 )
-                try:
-                    async with session.begin_nested():
-                        session.add(notif)
-                        await session.flush()
-                    reminders_created += 1
-                except IntegrityError:
-                    pass
 
-        await session.commit()
+                for admin_id in admin_ids:
+                    if not is_valid_telegram_user_id(admin_id):
+                        continue
+                    notif = AIIncidentNotificationModel(
+                        incident_id=inc.id,
+                        event_type="repeat_reminder",
+                        cycle_index=new_cycle,
+                        recipient_id=admin_id,
+                        authorized_instance_id=authorized_instance_id,
+                        message_text=msg_text,
+                        status="pending",
+                        attempts=0,
+                        max_attempts=MAX_OUTBOX_ATTEMPTS,
+                        next_retry_at=now,
+                    )
+                    try:
+                        async with session.begin_nested():
+                            session.add(notif)
+                            await session.flush()
+                        reminders_created += 1
+                    except IntegrityError:
+                        pass
 
-    return reminders_created
+            await session.commit()
+
+        return reminders_created
+    except Exception as exc:
+        logger.error("[AI Incident] Unexpected error in check_incident_repeat_reminders: %s", exc, exc_info=True)
+        return 0
 
 
 async def process_ai_incident_notifications(
@@ -1270,14 +1339,30 @@ async def process_ai_incident_notifications(
             if not row or row.claim_token != token:
                 return False
 
-            # Check parent incident freshness: if resolved/superseded before sending 'opened' or 'repeat_reminder', skip!
+            # Check parent incident freshness: if resolved/superseded before sending, skip alerts (opened, repeat_reminder, terminal_failure, fallback_used).
+            # For resolved event notifications, ensure parent incident is indeed resolved (and not superseded).
             parent_inc = await session.get(AIProviderIncidentModel, row.incident_id)
-            if parent_inc and parent_inc.status != "active" and row.event_type in ("opened", "repeat_reminder", "fallback_used"):
+            if not parent_inc:
                 row.status = "skipped_stale"
-                row.last_error = f"incident_{parent_inc.status}_before_send"
+                row.last_error = "parent_incident_deleted"
                 row.updated_at = ts_now
                 await session.commit()
                 return False
+
+            if row.event_type == "resolved":
+                if parent_inc.status != "resolved":
+                    row.status = "skipped_stale"
+                    row.last_error = f"incident_not_resolved_{parent_inc.status}"
+                    row.updated_at = ts_now
+                    await session.commit()
+                    return False
+            else:
+                if parent_inc.status in ("resolved", "superseded"):
+                    row.status = "skipped_stale"
+                    row.last_error = f"incident_{parent_inc.status}_before_send"
+                    row.updated_at = ts_now
+                    await session.commit()
+                    return False
 
             # Dynamic Admin Authorization Verification
             allowed_admins = await resolve_target_admin_ids(current_inst, current_instance=current_inst, session=session)

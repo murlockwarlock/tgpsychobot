@@ -596,7 +596,19 @@ async def notify_admins_about_error(
             prov_failure = cand_f
             break
 
-    effective_classification_source = classification_source or getattr(prov_failure, "classification_source", None)
+    # Security: classification_source CANNOT be elevated to trusted by an arbitrary caller argument.
+    # The genuine classification_source is strictly read from the verified ProviderFailure object.
+    genuine_source = getattr(prov_failure, "classification_source", None) if prov_failure else None
+    if genuine_source in (
+        "provider_structured",
+        "http_status_fallback",
+        "transport",
+        "sdk_typed_exception",
+    ):
+        effective_classification_source = "unverified" if classification_source == "unverified" else genuine_source
+    else:
+        effective_classification_source = genuine_source or "unverified"
+
     has_verified_provider_failure = (
         prov_failure is not None
         and effective_classification_source in (
@@ -908,16 +920,7 @@ async def send_terminal_ai_failure_alert(
     if not _terminal_failure_cooldown.should_send(fingerprint):
         return False
 
-    id_label = f"MAX ID: <code>{user_id}</code>" if platform_norm == "MAX" else f"Telegram ID: <code>{user_id}</code>"
-    chat_line = f"Chat ID: <code>{chat_id}</code>\n" if chat_id is not None else ""
-
     err_type_str = error_type or (type(exception).__name__ if exception is not None else "AIServiceError")
-    raw_err = error_message or (str(exception) if exception is not None else "Unknown error")
-    if request_type == "vision":
-        from vision_reliability import sanitize_vision_request_payload
-        raw_err = sanitize_vision_request_payload(raw_err)
-    err_msg_str = sanitize_secret_values(str(raw_err))
-    err_msg_short = _shorten(err_msg_str, 500)
 
     if ai_log_ids:
         logs_str = ", ".join(f"#{i}" if str(i).isdigit() else str(i) for i in ai_log_ids)
@@ -943,43 +946,23 @@ async def send_terminal_ai_failure_alert(
             lines.append(f"• {html.escape(str(p))} / {html.escape(str(m))} {mark}{cls_info}")
         attempts_block = "\nПопытки:\n" + "\n".join(lines) + "\n"
 
+    # Strictly typed technical diagnostic snapshot: ZERO PII (no user ID, chat ID, or raw exception/input strings)
     text = (
         f"{alert_title}"
         f"Бот: <code>{html.escape(b_name)}</code>\n"
-        f"{id_label}\n"
-        f"{chat_line}"
+        f"Платформа: <code>{platform_norm}</code> | Канал: <code>{html.escape(request_type)}</code>\n"
         f"Primary: {html.escape(primary_provider)} / {html.escape(primary_model)} ❌\n"
         f"{fb_lines}"
         f"{attempts_block}\n"
         f"Ошибка:\n"
-        f"<code>{html.escape(err_type_str)}</code> / <code>{html.escape(err_msg_short)}</code>\n\n"
+        f"<code>{html.escape(err_type_str)}</code>\n\n"
         f"Классификация:\n"
         f"<code>{html.escape(cls_str)}</code>\n"
         f"{ai_log_line}"
     )
 
-    # 1. If dispatch function is mocked by test harnesses, honor it directly
-    from unittest.mock import AsyncMock, MagicMock, Mock
-    if isinstance(_dispatch_admin_alert_text, (AsyncMock, MagicMock, Mock)) or type(_dispatch_admin_alert_text).__name__ in ("AsyncMock", "MagicMock", "Mock"):
-        return await _dispatch_admin_alert_text(bot, text)
-
-    # 2. When running in MAX process or background without Telegram bot instance, route via companion
-    if bot is None:
-        if incident_id is not None:
-            try:
-                from ai_incident_manager import enqueue_terminal_ai_failure_notification
-                await enqueue_terminal_ai_failure_notification(
-                    incident_id=incident_id,
-                    origin_instance_id=None,
-                    text=text,
-                    cooldown_seconds=1800,
-                    session_maker=session_maker,
-                )
-            except Exception as exc:
-                logging.getLogger(__name__).warning("Failed to enqueue terminal failure outbox: %s", exc)
-        return await _dispatch_admin_alert_text(bot, text)
-
-    # 3. Attempt DB-backed durable outbox delivery with individual admin retry & persistent deduplication
+    # Durable DB-backed outbox delivery: single canonical route with per-recipient status,
+    # retry, lease recovery, and companion Telegram routing. No parallel direct sends.
     try:
         from ai_incident_manager import (
             enqueue_terminal_ai_failure_notification,
@@ -988,7 +971,7 @@ async def send_terminal_ai_failure_alert(
         )
         target_incident_id = incident_id
         if target_incident_id is None:
-            err_for_inc = exception or Exception(err_msg_short or "Terminal AI failure")
+            err_for_inc = exception or Exception(err_type_str)
             target_inc = await record_ai_provider_failure(
                 origin_instance_id=None,
                 provider=primary_provider or provider or "unknown",
@@ -996,31 +979,40 @@ async def send_terminal_ai_failure_alert(
                 operation=request_type or "chat",
                 model=primary_model or model,
                 enqueue_notification=False,
-                force_operator_incident=True,
                 session_maker=session_maker,
             )
             if target_inc:
                 target_incident_id = target_inc.id
 
-        if target_incident_id is not None:
-            enqueued = await enqueue_terminal_ai_failure_notification(
-                incident_id=target_incident_id,
-                origin_instance_id=None,
-                text=text,
-                cooldown_seconds=1800,
-                session_maker=session_maker,
+        if target_incident_id is None:
+            logging.getLogger(__name__).error(
+                "[AI Terminal Alert] Could not create or resolve incident for terminal alert. Delivery not guaranteed."
             )
-            if enqueued:
-                await process_ai_incident_notifications(bot, session_maker=session_maker)
-                return True
-            else:
-                # Suppressed by persistent DB cooldown
-                return False
-    except Exception as outbox_err:
-        logging.getLogger(__name__).warning("Terminal failure outbox delivery fallback: %s", outbox_err)
+            return False
 
-    # 4. Fallback to direct delivery if outbox routing is unavailable
-    return await _dispatch_admin_alert_text(bot, text)
+        enqueued = await enqueue_terminal_ai_failure_notification(
+            incident_id=target_incident_id,
+            origin_instance_id=None,
+            text=text,
+            cooldown_seconds=1800,
+            session_maker=session_maker,
+        )
+        if not enqueued:
+            # Suppressed by persistent DB cooldown (or invalid recipient configuration)
+            return False
+
+        # When running in Telegram bot process, trigger immediate outbox processing turn
+        if bot is not None:
+            await process_ai_incident_notifications(bot, session_maker=session_maker)
+        return True
+
+    except Exception as outbox_err:
+        logging.getLogger(__name__).error(
+            "[AI Terminal Alert] Terminal failure outbox delivery failed: %s. Delivery not guaranteed.",
+            outbox_err,
+            exc_info=True,
+        )
+        return False
 
 
 async def send_output_budget_exhausted_alert(
