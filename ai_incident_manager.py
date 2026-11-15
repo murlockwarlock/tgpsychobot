@@ -19,6 +19,7 @@ import asyncio
 import hashlib
 import html
 import logging
+import math
 import os
 import re
 import uuid
@@ -56,6 +57,7 @@ from notification_routing import (
 from notification_transport import is_bot_blocked_reason
 from provider_failures import (
     CANONICAL_CLASSES,
+    KNOWN_EXCEPTION_NAMES,
     KNOWN_TECHNICAL_CODES,
     ProviderFailure,
     canonical_classification,
@@ -71,7 +73,8 @@ class IncidentSecurityError(RuntimeError):
 
 DEFAULT_REPEAT_ALERT_SECONDS = 6 * 3600  # 6 hours
 OUTBOX_LEASE_SECONDS = 60
-MAX_OUTBOX_ATTEMPTS = 5
+MAX_OUTBOX_RETRIES = 5
+MAX_OUTBOX_ATTEMPTS = 6  # 1 initial attempt + 5 retries = 6 total attempts
 
 AI_INCIDENT_BACKOFF_DELAYS: tuple[timedelta, ...] = (
     timedelta(seconds=15),
@@ -86,11 +89,12 @@ def get_ai_incident_outbox_backoff(attempts: int) -> timedelta:
     """
     Return the canonical AI incident backoff delay for the given attempt count.
     Claimed attempts is 1-based (after claim, attempts is 1 on first failure):
-      attempt 1 -> 15 seconds
-      attempt 2 -> 1 minute
-      attempt 3 -> 5 minutes
-      attempt 4 -> 15 minutes
-      attempt 5+ -> 1 hour
+      attempt 1 (initial attempt failed) -> 15 seconds (before retry 1)
+      attempt 2 (retry 1 failed) -> 1 minute (before retry 2)
+      attempt 3 (retry 2 failed) -> 5 minutes (before retry 3)
+      attempt 4 (retry 3 failed) -> 15 minutes (before retry 4)
+      attempt 5 (retry 4 failed) -> 1 hour (before retry 5 / attempt 6)
+      attempt >= 6 -> terminal failure
     """
     idx = min(max(0, attempts - 1), len(AI_INCIDENT_BACKOFF_DELAYS) - 1)
     return AI_INCIDENT_BACKOFF_DELAYS[idx]
@@ -111,14 +115,11 @@ def sanitize_technical_code(
     if not s:
         return default
     s_lower = s.lower()
+    if s in KNOWN_EXCEPTION_NAMES:
+        return s
     if s_lower in KNOWN_TECHNICAL_CODES or s_lower in CANONICAL_CLASSES:
         return s[:64]
-    if s.isdigit() and len(s) == 3:  # 3-digit HTTP status code e.g. 502, 429, 401
-        return s
-    if (
-        re.match(r"^[A-Za-z0-9_]{1,64}$", s)
-        and s.endswith(("Error", "Exception", "Failure", "Timeout"))
-    ):
+    if s.isdigit() and len(s) == 3 and (400 <= int(s) <= 599):  # 3-digit HTTP status code
         return s
     # Check if code has low-credit pattern "balance_X.XX_below_Y.YY"
     if re.match(r"^balance_\d+(\.\d+)?_below_\d+(\.\d+)?$", s):
@@ -1770,9 +1771,11 @@ async def process_ai_incident_notifications(
             retry_after_val = getattr(exc, "retry_after", 30)
             try:
                 retry_after_sec = float(retry_after_val)
+                if not math.isfinite(retry_after_sec) or retry_after_sec <= 0:
+                    retry_after_sec = 30.0
             except (TypeError, ValueError):
                 retry_after_sec = 30.0
-            retry_delay = timedelta(seconds=max(1.0, min(300.0, retry_after_sec)))
+            retry_delay = timedelta(seconds=max(1.0, retry_after_sec))
         except TelegramNetworkError:
             send_success = False
             error_code = "telegram_network_error"
@@ -1811,6 +1814,7 @@ async def process_ai_incident_notifications(
                 return True
             else:
                 new_status = "failed_terminal" if is_terminal or attempts >= MAX_OUTBOX_ATTEMPTS else "pending"
+                next_retry = None if new_status == "failed_terminal" else (ts_post + retry_delay)
                 stmt = (
                     update(AIIncidentNotificationModel)
                     .where(
@@ -1821,7 +1825,7 @@ async def process_ai_incident_notifications(
                     .values(
                         status=new_status,
                         last_error=error_code,
-                        next_retry_at=ts_post + retry_delay,
+                        next_retry_at=next_retry,
                         updated_at=ts_post,
                     )
                 )

@@ -117,10 +117,34 @@ _CODE_GROUPS = {
     "unknown": "unmapped",
 }
 CODE_CLASSES = {code: cls for cls, codes in _CODE_GROUPS.items() for code in codes.split()}
+KNOWN_EXCEPTION_NAMES: frozenset[str] = frozenset({
+    # Built-in exceptions
+    "TimeoutError", "ConnectionError", "ConnectionRefusedError", "ConnectionResetError",
+    "BrokenPipeError", "SSLError", "OSError", "RuntimeError", "ValueError", "TypeError",
+    "KeyError", "AttributeError",
+    # httpx exceptions
+    "TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout",
+    "TransportError", "ConnectError", "ReadError", "WriteError", "CloseError",
+    "ProxyError", "HTTPStatusError", "RequestError", "DecodingError", "StreamError",
+    # Telegram / aiogram exceptions
+    "TelegramAPIError", "TelegramNetworkError", "TelegramRetryAfter", "TelegramForbiddenError",
+    "TelegramBadRequest", "TelegramUnauthorizedError", "TelegramServerError", "TelegramNotFound",
+    "RestartingTelegram",
+    # OpenAI / Anthropic SDK exceptions
+    "APIError", "APIConnectionError", "APITimeoutError", "RateLimitError", "BadRequestError",
+    "AuthenticationError", "PermissionDeniedError", "NotFoundError", "ConflictError",
+    "UnprocessableEntityError", "InternalServerError", "APIStatusError", "APIResponseValidationError",
+    # Application / domain exceptions
+    "AIServiceError", "AIResponseError", "InsufficientBalanceError", "DailyLimitError",
+    "ModelUnavailableError", "ProviderAdapterError", "GeminiImageError", "GeminiImageResponseError",
+    "IncidentSecurityError", "RoutingError", "ConfigurationError",
+})
 KNOWN_TECHNICAL_CODES: frozenset[str] = frozenset(
     CANONICAL_CLASSES
     | frozenset(LEGACY_ALIASES.keys())
     | frozenset(CODE_CLASSES.keys())
+    | KNOWN_EXCEPTION_NAMES
+    | {name.lower() for name in KNOWN_EXCEPTION_NAMES}
     | {
         "billing_or_spend_limit",
         "billing_or_credit_exhaustion",

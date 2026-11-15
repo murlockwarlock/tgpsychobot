@@ -917,16 +917,16 @@ async def send_terminal_ai_failure_alert(
     else:
         alert_title = title or f"🚨 <b>[{platform_norm}] Сбой ИИ в текстовом диалоге</b>\n\n"
 
-    from provider_failures import KNOWN_TECHNICAL_CODES
+    from provider_failures import KNOWN_TECHNICAL_CODES, KNOWN_EXCEPTION_NAMES
     if error_type and (
         error_type.lower() in KNOWN_TECHNICAL_CODES
+        or error_type in KNOWN_EXCEPTION_NAMES
         or error_type in _ERROR_CLASS_DESCRIPTIONS
-        or (re.match(r"^[A-Za-z0-9_]{1,64}$", error_type) and error_type.endswith(("Error", "Exception", "Failure", "Timeout")))
     ):
         err_type_str = error_type
     elif exception is not None:
         t_name = type(exception).__name__
-        err_type_str = t_name if re.match(r"^[A-Za-z0-9_]{1,64}$", t_name) else "AIServiceError"
+        err_type_str = t_name if (t_name in KNOWN_EXCEPTION_NAMES or t_name.lower() in KNOWN_TECHNICAL_CODES) else "AIServiceError"
     else:
         err_type_str = "AIServiceError"
 
