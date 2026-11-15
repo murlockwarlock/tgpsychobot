@@ -1076,35 +1076,67 @@ async def send_output_budget_exhausted_alert(
         or "tgpsychobot"
     )
 
-    if request_type == "vision":
-        fingerprint = f"vision:{b_name}:{provider}:{model}:output_budget_exhausted"
-        title = f"⚠️ <b>[Vision] {html.escape(provider)} исчерпал output budget</b>\n\n"
-    else:
-        fingerprint = f"{b_name}:{provider}:{model}:output_budget_exhausted"
-        title = f"⚠️ <b>[AI] {html.escape(provider)} исчерпал output budget</b>\n\n"
+    ai_log_str = f"#{ai_log_id}" if ai_log_id is not None and str(ai_log_id).isdigit() else (str(ai_log_id) if ai_log_id else "не зафиксирован")
 
-    if not _output_budget_cooldown.should_send(fingerprint):
-        return False
-
-    ai_log_str = f"#{ai_log_id}" if ai_log_id is not None and str(ai_log_id).isdigit() else (str(ai_log_id) if ai_log_id else "не удалось сохранить")
-    id_label = f"User ID: <code>{user_id if user_id is not None else 'не указан'}</code>\n"
-    chat_line = f"Chat ID: <code>{chat_id}</code>\n" if chat_id is not None else ""
-
+    title = f"⚠️ <b>[{platform_norm}] Исчерпан лимит токенов ({html.escape(request_type)})</b>\n\n"
     text = (
         f"{title}"
         f"Бот: <code>{html.escape(b_name)}</code>\n"
-        f"Платформа: <b>{platform_norm}</b>\n"
-        f"{id_label}"
-        f"{chat_line}"
-        f"Model: <code>{html.escape(model)}</code>\n"
-        f"finish_reason: <code>{html.escape(finish_reason)}</code>\n"
-        f"visible_content_length: <code>{visible_content_length}</code>\n"
-        f"reasoning_content_length: <code>{reasoning_content_length}</code>\n"
-        f"max_tokens: <code>{max_tokens}</code>\n"
+        f"Платформа: <code>{platform_norm}</code> | Канал: <code>{html.escape(request_type)}</code>\n"
+        f"Провайдер: <code>{html.escape(provider)}</code> / <code>{html.escape(model or '—')}</code>\n"
+        f"Причина: <code>{html.escape(finish_reason)}</code>\n"
+        f"Длина видимого ответа: <code>{visible_content_length}</code>\n"
+        f"Длина рассуждений: <code>{reasoning_content_length}</code>\n"
+        f"Лимит max_tokens: <code>{max_tokens}</code>\n"
         f"AI Log: {ai_log_str}"
     )
 
-    return await _dispatch_admin_alert_text(bot, text)
+    try:
+        from ai_incident_manager import (
+            enqueue_ai_notification_event,
+            process_ai_incident_notifications,
+            record_ai_provider_failure,
+        )
+        target_incident_id = incident_id
+        if target_incident_id is None:
+            err_for_inc = exception or Exception("AI output budget exhausted (max_tokens)")
+            target_inc = await record_ai_provider_failure(
+                origin_instance_id=None,
+                provider=provider or "unknown",
+                error=err_for_inc,
+                operation=request_type or "chat",
+                model=model,
+                credential_scope=credential_scope,
+                attempt_started_at=attempt_started_at,
+                enqueue_notification=False,
+                session_maker=session_maker,
+            )
+            if target_inc:
+                if target_inc.status == "superseded":
+                    logging.getLogger(__name__).info("[AI Alert] Stale output budget failure on superseded key. Suppressing.")
+                    return False
+                target_incident_id = target_inc.id
+
+        if target_incident_id is None:
+            return False
+
+        enqueued = await enqueue_ai_notification_event(
+            incident_id=target_incident_id,
+            origin_instance_id=None,
+            event_type="output_budget_exhausted",
+            text=text,
+            cooldown_seconds=1800,
+            session_maker=session_maker,
+        )
+        if not enqueued:
+            return False
+
+        if bot is not None:
+            await process_ai_incident_notifications(bot, session_maker=session_maker)
+        return True
+    except Exception as exc:
+        logging.getLogger(__name__).error("[AI Alert] Output budget alert failed: %s", exc, exc_info=True)
+        return False
 
 
 async def send_ai_fallback_used_alert(
@@ -1138,30 +1170,31 @@ async def send_ai_fallback_used_alert(
     attempt_started_at: datetime | None = None,
     session_maker: Any = None,
 ) -> bool:
-    """Send realtime notification that reserve AI provider was used successfully."""
-    if user is not None:
-        user_id = getattr(user, "user_id", None) or getattr(user, "id", None) or user_id
-        chat_id = getattr(user, "chat_id", None) or chat_id
-        username = getattr(user, "username", None) or username
-        full_name = getattr(user, "full_name", None) or getattr(user, "name", None) or full_name
-        platform = getattr(user, "platform", platform) or platform
-
+    """Send realtime notification via durable outbox that reserve AI provider was used successfully."""
     primary_provider = primary_provider or failed_provider or "Unknown"
     primary_model = primary_model or failed_model or "—"
     primary_error = primary_error or reason or failure_reason
     fallback_model = fallback_model or ""
     platform_norm = "MAX" if platform.lower() == "max" else "Telegram"
     b_name = bot_name or os.getenv("BOT_NAME") or os.getenv("BOT_USERNAME") or "tgpsychobot"
-    id_label = f"MAX ID: <code>{user_id}</code>" if platform_norm == "MAX" else f"Telegram ID: <code>{user_id}</code>"
-    chat_line = f"Chat ID: <code>{chat_id}</code>\n" if chat_id is not None else ""
 
-    raw_err = str(primary_error) if primary_error is not None else "Не зафиксирована"
+    if isinstance(primary_error, Exception):
+        raw_err = type(primary_error).__name__
+    elif primary_error:
+        s = str(primary_error).strip()
+        lines = [line.strip() for line in s.splitlines() if line.strip()]
+        candidate = lines[-1] if lines and ("Traceback" in lines[0] or "File " in s) else lines[0]
+        type_name = candidate.split(":", 1)[0].strip()
+        raw_err = type_name if type_name else "ProviderFailure"
+    else:
+        raw_err = "ProviderFailure"
+
     if request_type == "vision":
         from vision_reliability import sanitize_vision_request_payload
         raw_err = sanitize_vision_request_payload(raw_err)
     err_str = sanitize_secret_values(str(raw_err))
-    err_short = _shorten(err_str, 300)
-
+    err_type_str = _shorten(err_str, 80)
+    cls_str = getattr(primary_error, "classification", None) or "fallback_recovery"
     title_type = "при анализе изображения" if request_type == "vision" else "в текстовом диалоге"
 
     eff_attempts = provider_attempts or attempts
@@ -1186,14 +1219,66 @@ async def send_ai_fallback_used_alert(
     text = (
         f"ℹ️ <b>[{platform_norm}] Использован резервный AI-провайдер {title_type}</b>\n\n"
         f"Бот: <code>{html.escape(b_name)}</code>\n"
-        f"{id_label}\n"
-        f"{chat_line}"
+        f"Платформа: <code>{platform_norm}</code> | Канал: <code>{html.escape(request_type)}</code>\n"
         f"Основной: {html.escape(primary_provider)} / {html.escape(primary_model or '—')} ❌\n"
         f"Резервный: {html.escape(fallback_provider)} / {html.escape(fallback_model or '—')} ✅\n"
         f"{attempts_block}"
-        f"Причина переключения:\n"
-        f"<code>{html.escape(err_short)}</code>\n"
+        f"Тип сбоя: <code>{html.escape(err_type_str)}</code>\n"
+        f"Классификация: <code>{html.escape(cls_str)}</code>\n"
         f"{ai_log_line}"
     )
-    return await _dispatch_admin_alert_text(bot, text)
+
+    try:
+        from ai_incident_manager import (
+            enqueue_ai_notification_event,
+            process_ai_incident_notifications,
+            record_ai_provider_failure,
+        )
+        target_incident_id = incident_id
+        if target_incident_id is None:
+            err_for_inc = (
+                primary_error
+                if isinstance(primary_error, Exception)
+                else Exception(str(primary_error or "Primary provider failed; fallback used"))
+            )
+            target_inc = await record_ai_provider_failure(
+                origin_instance_id=None,
+                provider=primary_provider or "unknown",
+                error=err_for_inc,
+                operation=request_type or "chat",
+                model=primary_model or "—",
+                fallback_provider=fallback_provider,
+                fallback_model=fallback_model,
+                fallback_succeeded=True,
+                credential_scope=credential_scope,
+                attempt_started_at=attempt_started_at,
+                enqueue_notification=False,
+                session_maker=session_maker,
+            )
+            if target_inc:
+                if target_inc.status == "superseded":
+                    logging.getLogger(__name__).info("[AI Alert] Stale fallback used on superseded key. Suppressing.")
+                    return False
+                target_incident_id = target_inc.id
+
+        if target_incident_id is None:
+            return False
+
+        enqueued = await enqueue_ai_notification_event(
+            incident_id=target_incident_id,
+            origin_instance_id=None,
+            event_type="fallback_used",
+            text=text,
+            cooldown_seconds=1800,
+            session_maker=session_maker,
+        )
+        if not enqueued:
+            return False
+
+        if bot is not None:
+            await process_ai_incident_notifications(bot, session_maker=session_maker)
+        return True
+    except Exception as exc:
+        logging.getLogger(__name__).error("[AI Alert] Fallback alert failed: %s", exc, exc_info=True)
+        return False
 

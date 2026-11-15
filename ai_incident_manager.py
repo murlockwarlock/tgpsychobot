@@ -1186,23 +1186,26 @@ async def _get_incident_enqueue_lock(incident_id: int) -> asyncio.Lock:
         return lock
 
 
-async def enqueue_terminal_ai_failure_notification(
+async def enqueue_ai_notification_event(
     incident_id: int,
     origin_instance_id: str | None,
+    event_type: str,
     text: str,
     cooldown_seconds: int = 1800,
     session_maker: Any = None,
 ) -> bool:
     """
-    Enqueue a durable terminal AI failure notification for all Telegram admins.
-    - Dedupes against recent terminal_failure notifications for this incident within cooldown_seconds in DB.
+    Enqueue a durable AI notification event (terminal_failure, output_budget_exhausted, fallback_used)
+    for all valid Telegram admins using canonical ownership, fail-closed isolation, and companion routing.
+    - Validates incident existence, current instance identity, caller ownership / companion linkage.
+    - Suppresses stale notifications when parent incident is superseded.
+    - Dedupes against recent notifications of the same event_type for this incident within cooldown_seconds in DB.
     - Creates separate outbox row for EACH valid Telegram admin.
-    - Ensures fail-closed instance identity and companion routing.
     """
     try:
         current_inst = detect_current_instance()
         if not current_inst:
-            logger.critical("[AI Incident] Fail-closed: cannot determine bot instance identity for terminal alert.")
+            logger.critical("[AI Incident] Fail-closed: cannot determine bot instance identity for %s alert.", event_type)
             return False
 
         if not origin_instance_id:
@@ -1224,18 +1227,13 @@ async def enqueue_terminal_ai_failure_notification(
             )
             if not (is_same or is_companion):
                 logger.critical(
-                    "[AI Incident] Fail-closed: origin_instance_id %r not allowed from %r for terminal alert.",
+                    "[AI Incident] Fail-closed: origin_instance_id %r not allowed from %r for %s alert.",
                     origin_instance_id,
                     current_inst.get("pm2_name"),
+                    event_type,
                 )
                 return False
 
-        companion_def = resolve_companion_telegram_instance(source_def)
-        if not companion_def:
-            logger.error("[AI Incident] No companion Telegram instance found for %s. Dropping terminal alert.", origin_instance_id)
-            return False
-
-        authorized_instance_id = companion_def["pm2_name"]
         sm = session_maker or async_session_maker
         inc_lock = await _get_incident_enqueue_lock(incident_id)
 
@@ -1251,19 +1249,64 @@ async def enqueue_terminal_ai_failure_notification(
                     )
                     parent_inc = await session.scalar(stmt_lock)
                     if not parent_inc:
-                        logger.error("[AI Incident] Parent incident %s not found for terminal alert.", incident_id)
+                        logger.error("[AI Incident] Parent incident %s not found for %s alert.", incident_id, event_type)
                         return False
 
                     if parent_inc.status == "superseded":
-                        logger.info("[AI Incident] Parent incident %s is superseded. Suppressing terminal alert.", incident_id)
+                        logger.info("[AI Incident] Parent incident %s is superseded. Suppressing %s alert.", incident_id, event_type)
                         return False
 
-                    # Check true elapsed time since last terminal_failure notification on this incident
+                    # Verification of incident owner / caller authority (fail-closed isolation)
+                    inc_origin = parent_inc.origin_instance_id
+                    inc_origin_def = get_instance_by_pm2_name(inc_origin)
+                    if not inc_origin_def:
+                        logger.critical("[AI Incident] Fail-closed: incident %s origin %r not in registry.", incident_id, inc_origin)
+                        return False
+
+                    caller_is_origin = (
+                        inc_origin in (current_inst.get("pm2_name"), current_inst.get("bot_instance_id"))
+                    )
+                    caller_is_companion = (
+                        current_inst.get("companion_instance") in (inc_origin, parent_inc.companion_instance_id)
+                        or inc_origin_def.get("companion_instance") in (current_inst.get("pm2_name"), current_inst.get("bot_instance_id"))
+                    )
+                    if not (caller_is_origin or caller_is_companion):
+                        logger.critical(
+                            "[AI Incident] Fail-closed: caller %r has no authority over incident %s owned by %r.",
+                            current_inst.get("pm2_name"),
+                            incident_id,
+                            inc_origin,
+                        )
+                        return False
+
+                    if origin_instance_id:
+                        orig_is_match = (
+                            origin_instance_id in (inc_origin, inc_origin_def.get("bot_instance_id"))
+                            or inc_origin in (source_def.get("pm2_name"), source_def.get("bot_instance_id"))
+                        )
+                        if not orig_is_match:
+                            logger.critical(
+                                "[AI Incident] Fail-closed: provided origin %r does not match incident %s origin %r.",
+                                origin_instance_id,
+                                incident_id,
+                                inc_origin,
+                            )
+                            return False
+
+                    # Canonical companion and target admin IDs are strictly determined from parent incident's origin
+                    canonical_companion_def = resolve_companion_telegram_instance(inc_origin_def)
+                    if not canonical_companion_def:
+                        logger.error("[AI Incident] No companion Telegram instance found for incident %s (%s).", incident_id, inc_origin)
+                        return False
+
+                    authorized_instance_id = canonical_companion_def["pm2_name"]
+
+                    # Check true elapsed time since last notification of this event_type on this incident
                     recent_stmt = (
                         select(func.max(AIIncidentNotificationModel.created_at))
                         .where(
                             AIIncidentNotificationModel.incident_id == incident_id,
-                            AIIncidentNotificationModel.event_type == "terminal_failure",
+                            AIIncidentNotificationModel.event_type == event_type,
                         )
                     )
                     last_created_at = await session.scalar(recent_stmt)
@@ -1271,20 +1314,21 @@ async def enqueue_terminal_ai_failure_notification(
                         elapsed = (now - last_created_at).total_seconds()
                         if elapsed < cooldown_seconds:
                             logger.info(
-                                "[AI Incident] Terminal failure alert for incident %s suppressed by DB cooldown (elapsed %.2fs < %ss).",
+                                "[AI Incident] %s alert for incident %s suppressed by DB cooldown (elapsed %.2fs < %ss).",
+                                event_type,
                                 incident_id,
                                 elapsed,
                                 cooldown_seconds,
                             )
                             return False
 
-                    admin_ids = await resolve_target_admin_ids(companion_def, current_instance=source_def, session=session)
+                    admin_ids = await resolve_target_admin_ids(canonical_companion_def, current_instance=inc_origin_def, session=session)
                     if not admin_ids:
                         return False
 
                     max_cycle_stmt = select(func.max(AIIncidentNotificationModel.cycle_index)).where(
                         AIIncidentNotificationModel.incident_id == incident_id,
-                        AIIncidentNotificationModel.event_type == "terminal_failure",
+                        AIIncidentNotificationModel.event_type == event_type,
                     )
                     max_cycle = await session.scalar(max_cycle_stmt)
                     next_cycle = 0 if max_cycle is None else max_cycle + 1
@@ -1295,7 +1339,7 @@ async def enqueue_terminal_ai_failure_notification(
                             continue
                         notif = AIIncidentNotificationModel(
                             incident_id=incident_id,
-                            event_type="terminal_failure",
+                            event_type=event_type,
                             cycle_index=next_cycle,
                             recipient_id=adm_id,
                             authorized_instance_id=authorized_instance_id,
@@ -1318,8 +1362,31 @@ async def enqueue_terminal_ai_failure_notification(
                     parent_inc.last_alerted_at = now
                     return enqueued_count > 0
     except Exception as exc:
-        logger.error("[AI Incident] Failed to enqueue terminal failure notification: %s", exc, exc_info=True)
+        logger.error("[AI Incident] Failed to enqueue %s alert for incident %s: %s", event_type, incident_id, exc, exc_info=True)
         return False
+
+
+async def enqueue_terminal_ai_failure_notification(
+    incident_id: int,
+    origin_instance_id: str | None,
+    text: str,
+    cooldown_seconds: int = 1800,
+    session_maker: Any = None,
+) -> bool:
+    """
+    Enqueue a durable terminal AI failure notification for all Telegram admins.
+    - Dedupes against recent terminal_failure notifications for this incident within cooldown_seconds in DB.
+    - Creates separate outbox row for EACH valid Telegram admin.
+    - Ensures fail-closed instance identity and companion routing.
+    """
+    return await enqueue_ai_notification_event(
+        incident_id=incident_id,
+        origin_instance_id=origin_instance_id,
+        event_type="terminal_failure",
+        text=text,
+        cooldown_seconds=cooldown_seconds,
+        session_maker=session_maker,
+    )
 
 
 async def check_incident_repeat_reminders(

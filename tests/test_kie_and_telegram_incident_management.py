@@ -4049,8 +4049,11 @@ async def test_admin_dispatcher_key_rotation_race_with_inflight_failure(test_db_
     bot_token = "8224473896:AAFtest_token_veraveda"
     monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
     monkeypatch.setenv("BOT_TOKEN", bot_token)
+    monkeypatch.setattr("database.async_session_maker", test_db_session_maker)
     monkeypatch.setattr(handlers, "async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("ai_integration.async_session_maker", test_db_session_maker)
     monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("handlers.missing_profile_fields", lambda c, u: [])
     monkeypatch.setattr(handlers, "is_admin", AsyncMock(side_effect=lambda user_id: user_id == 777))
 
     key_a = "kie_key_race_alpha_111"
@@ -4642,8 +4645,11 @@ async def test_admin_key_rotation_atomic_transaction_rollback_preserves_old_conf
     bot_token = "8224473896:AAFtest_token_veraveda"
     monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
     monkeypatch.setenv("BOT_TOKEN", bot_token)
+    monkeypatch.setattr("database.async_session_maker", test_db_session_maker)
     monkeypatch.setattr(handlers, "async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("ai_integration.async_session_maker", test_db_session_maker)
     monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("handlers.missing_profile_fields", lambda c, u: [])
     monkeypatch.setattr(handlers, "is_admin", AsyncMock(side_effect=lambda user_id: user_id == 777))
 
     key_orig = "kie_original_key_111"
@@ -4678,13 +4684,43 @@ async def test_admin_key_rotation_atomic_transaction_rollback_preserves_old_conf
     admin_chat = Chat(id=777, type="private")
     fsm_ctx = dp.fsm.get_context(bot=bot, user_id=777, chat_id=777)
 
-    # Set FSM state to editing KIE API key
-    await fsm_ctx.set_state(handlers.AdminStates.set_api_key)
-    await fsm_ctx.update_data(provider="KIE", settings_chat_id=777, settings_message_id=90)
+    # --- Step 1: Admin opens KIE settings and clicks visible '🔑 API-ключ' button via Dispatcher ---
+    cb_msg = Message(message_id=90, date=datetime.now(timezone.utc), chat=admin_chat, text="Settings")
+    update_open = Update(
+        update_id=500,
+        callback_query=CallbackQuery(
+            id="cb_open_1",
+            from_user=admin_user,
+            chat_instance="ci_admin",
+            message=cb_msg,
+            data="view_models_KIE",
+        ),
+    )
+    await dp.feed_update(bot, update_open)
 
-    # Admin sends new key
+    edit_calls_1 = [c for c in telegram_session.calls if type(c).__name__ == "EditMessageText"]
+    assert len(edit_calls_1) >= 1
+    buttons_1 = [btn for row in edit_calls_1[-1].reply_markup.inline_keyboard for btn in row]
+    btn_key_1 = next((b for b in buttons_1 if "API-ключ" in b.text), None)
+    assert btn_key_1 is not None, "Button 'API-ключ' must be visible on settings screen"
+
+    # Click visible 'API-ключ' button
+    update_click_key = Update(
+        update_id=501,
+        callback_query=CallbackQuery(
+            id="cb_key_1",
+            from_user=admin_user,
+            chat_instance="ci_admin",
+            message=cb_msg,
+            data=btn_key_1.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, update_click_key)
+    assert await fsm_ctx.get_state() == handlers.AdminStates.set_api_key.state
+
+    # --- Step 2: Admin sends key; failure occurs during rotation ---
     key_msg = Message(message_id=91, date=datetime.now(timezone.utc), chat=admin_chat, from_user=admin_user, text=key_fail)
-    await dp.feed_update(bot, Update(update_id=501, message=key_msg))
+    await dp.feed_update(bot, Update(update_id=502, message=key_msg))
 
     # Assert 1: AIConfig was rolled back! Original key remains in DB!
     async with test_db_session_maker() as session:
@@ -4695,28 +4731,108 @@ async def test_admin_key_rotation_atomic_transaction_rollback_preserves_old_conf
     assert await fsm_ctx.get_state() is None
 
     # Assert 3: Error message sent to admin
-    sent_texts = [getattr(call, "text", "") for call in telegram_session.calls]
+    sent_texts = [call.text for call in telegram_session.calls if isinstance(getattr(call, "text", None), str)]
     assert any("Ошибка сохранения настроек. Попробуйте еще раз." in t for t in sent_texts)
 
-    # Assert 4: Successful retry recovery journey
-    monkeypatch.setattr("ai_incident_manager.handle_key_rotation", AsyncMock(return_value=1))
-    monkeypatch.setattr(handlers, "send_temp_notification", AsyncMock())
-    monkeypatch.setattr(handlers, "_edit_provider_model_settings", AsyncMock())
+    # --- Step 3: Complete Admin Recovery Journey (Zero UI mocks, real visible buttons and Dispatcher) ---
+    # Restore real handle_key_rotation implementation
+    import ai_incident_manager
+    monkeypatch.setattr("ai_incident_manager.handle_key_rotation", ai_incident_manager._handle_key_rotation_impl)
 
-    await fsm_ctx.set_state(handlers.AdminStates.set_api_key)
-    await fsm_ctx.update_data(provider="KIE", settings_chat_id=777, settings_message_id=90)
+    # Re-open KIE settings via Dispatcher to inspect visible buttons
+    update_reopen = Update(
+        update_id=503,
+        callback_query=CallbackQuery(
+            id="cb_open_2",
+            from_user=admin_user,
+            chat_instance="ci_admin",
+            message=cb_msg,
+            data="view_models_KIE",
+        ),
+    )
+    await dp.feed_update(bot, update_reopen)
 
+    edit_calls_2 = [c for c in telegram_session.calls if type(c).__name__ == "EditMessageText"]
+    assert len(edit_calls_2) > len(edit_calls_1)
+    buttons_2 = [btn for row in edit_calls_2[-1].reply_markup.inline_keyboard for btn in row]
+    btn_key_retry = next((b for b in buttons_2 if "API-ключ" in b.text), None)
+    assert btn_key_retry is not None, "Button 'API-ключ' must be visible after recovery re-open"
+
+    # Admin clicks visible 'API-ключ' button again via Dispatcher
+    update_click_retry = Update(
+        update_id=504,
+        callback_query=CallbackQuery(
+            id="cb_key_2",
+            from_user=admin_user,
+            chat_instance="ci_admin",
+            message=cb_msg,
+            data=btn_key_retry.callback_data,
+        ),
+    )
+    await dp.feed_update(bot, update_click_retry)
+    assert await fsm_ctx.get_state() == handlers.AdminStates.set_api_key.state
+
+    # Admin sends new valid key via Message Update
     key_retry = "kie_retry_key_333"
     key_msg_retry = Message(message_id=92, date=datetime.now(timezone.utc), chat=admin_chat, from_user=admin_user, text=key_retry)
-    await dp.feed_update(bot, Update(update_id=502, message=key_msg_retry))
+    await dp.feed_update(bot, Update(update_id=505, message=key_msg_retry))
 
+    # Assert 4: FSM state is cleared and AIConfig is updated in DB
+    assert await fsm_ctx.get_state() is None
     async with test_db_session_maker() as session:
         cfg_retry = await session.get(AIConfig, 1)
         assert cfg_retry.kie_api_key == key_retry
 
-    assert await fsm_ctx.get_state() is None
-    handlers.send_temp_notification.assert_awaited_once()
-    assert "✅ Новый ключ API для KIE сохранен." in handlers.send_temp_notification.await_args[0][2]
+    # Assert 5: Real next screen rendered with ValidatingTelegramSession
+    edit_calls_3 = [c for c in telegram_session.calls if type(c).__name__ == "EditMessageText"]
+    assert len(edit_calls_3) > len(edit_calls_2)
+    last_rendered = edit_calls_3[-1]
+    rendered_buttons = [btn for row in last_rendered.reply_markup.inline_keyboard for btn in row]
+    assert any("Выбрать модель" in b.text for b in rendered_buttons)
+    assert any("API-ключ" in b.text for b in rendered_buttons)
+
+    # Assert 6: Re-opening settings screen persists and displays properly
+    await dp.feed_update(bot, update_reopen)
+
+    # Assert 7: Runtime reflection - verify new user message uses updated key
+    import ai_integration
+    from database import SubscriptionConfig
+    captured_runtime_keys = []
+    async def mock_kie_chat_runtime(api_key, *args, **kwargs):
+        captured_runtime_keys.append(api_key)
+        return "Ответ ИИ после восстановления настроек администратором"
+
+    monkeypatch.setattr(ai_integration, "_call_kie_chat", mock_kie_chat_runtime)
+    monkeypatch.setattr(handlers, "_call_kie_chat", mock_kie_chat_runtime)
+
+    async with test_db_session_maker() as session:
+        user_db = await session.get(User, 999)
+        if not user_db:
+            session.add(User(id=999, username="user999", first_name="User", is_admin=False, accepted_disclaimer=True))
+        else:
+            user_db.accepted_disclaimer = True
+        sub_cfg = await session.get(SubscriptionConfig, 1)
+        if not sub_cfg:
+            session.add(SubscriptionConfig(id=1, subscriptions_enabled=False))
+        else:
+            sub_cfg.subscriptions_enabled = False
+        await session.commit()
+
+    user_chat = Chat(id=999, type="private")
+    user_tg = TgUser(id=999, is_bot=False, first_name="User", username="user999")
+    await dp.feed_update(bot, Update(
+        update_id=506,
+        message=Message(
+            message_id=93,
+            date=datetime.now(timezone.utc),
+            chat=user_chat,
+            from_user=user_tg,
+            text="Здравствуйте",
+        ),
+    ))
+    await asyncio.sleep(1.2)
+    assert len(captured_runtime_keys) >= 1, "Runtime AI request must be triggered"
+    assert captured_runtime_keys[-1] == key_retry, "AI request must use newly saved retry key"
 
 
 @pytest.mark.asyncio
@@ -5526,24 +5642,327 @@ async def test_terminal_alert_stale_request_after_rotation_suppressed_no_false_a
     # In DB: NO active incidents for KIE!
     async with test_db_session_maker() as session:
         stmt_active = select(AIProviderIncidentModel).where(
-            AIProviderIncidentModel.provider == "kie",
+            AIProviderIncidentModel.provider == "KIE",
             AIProviderIncidentModel.status == "active",
         )
         active_inc = (await session.execute(stmt_active)).scalars().all()
         assert len(active_inc) == 0
 
-        # NO terminal notifications queued
-        stmt_notif = select(AIIncidentNotificationModel).where(
-            AIIncidentNotificationModel.event_type == "terminal_failure",
-        )
-        notifs = (await session.execute(stmt_notif)).scalars().all()
-        assert len(notifs) == 0
-
-        # Any recorded incident for key A is marked superseded
+        # Superseded incident for old key A must exist and be marked superseded
         stmt_inc_a = select(AIProviderIncidentModel).where(
-            AIProviderIncidentModel.provider == "kie",
+            AIProviderIncidentModel.provider == "KIE",
             AIProviderIncidentModel.credential_scope == fp_a,
         )
         incs_a = (await session.execute(stmt_inc_a)).scalars().all()
+        assert len(incs_a) >= 1, "Superseded incident for key A must exist in DB"
         for inc in incs_a:
             assert inc.status == "superseded"
+            assert inc.resolved_at is not None
+            assert inc.credential_scope == fp_a
+
+        # NO incident must exist for the newly active key B
+        stmt_inc_b = select(AIProviderIncidentModel).where(
+            AIProviderIncidentModel.provider == "KIE",
+            AIProviderIncidentModel.credential_scope == fp_b,
+        )
+        incs_b = (await session.execute(stmt_inc_b)).scalars().all()
+        assert len(incs_b) == 0, "No incident must be opened for newly active key B"
+
+        # Zero notifications of any event_type queued in outbox
+        stmt_notif = select(AIIncidentNotificationModel)
+        notifs = (await session.execute(stmt_notif)).scalars().all()
+        assert len(notifs) == 0, "No notifications should be queued for stale failure"
+
+    # ZERO messages sent to Telegram admins
+    admin_sends = [c for c in telegram_session.calls if type(c).__name__ == "SendMessage"]
+    assert len(admin_sends) == 0, "No false alerts must be delivered to admins"
+
+
+@pytest.mark.asyncio
+async def test_terminal_alert_foreign_incident_id_fail_closed_shared_db(test_db_session_maker, monkeypatch):
+    """Item 1: Verification of incident ownership is fail-closed.
+    Bot A cannot enqueue alerts or notifications for an incident owned by Bot B.
+    Legit MAX instance enqueuing for its own incident properly routes to companion Telegram bot."""
+    from database import AIProviderIncidentModel, AIIncidentNotificationModel
+    from ai_incident_manager import (
+        enqueue_terminal_ai_failure_notification,
+        process_ai_incident_notifications,
+    )
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+
+    inst_bot_a = {
+        "pm2_name": "tg_veraveda777_bot_legacy",
+        "bot_instance_id": "tg_veraveda777_bot_legacy",
+        "companion_instance": "max_se13639182_bot_legacy",
+        "platform": "telegram",
+        "admins": [777],
+    }
+    inst_bot_b = {
+        "pm2_name": "tg_someonewithyou01_bot_new",
+        "bot_instance_id": "tg_someonewithyou01_bot_new",
+        "companion_instance": None,
+        "platform": "telegram",
+        "admins": [888],
+    }
+    inst_max_a = {
+        "pm2_name": "max_se13639182_bot_legacy",
+        "bot_instance_id": "max_se13639182_bot_legacy",
+        "companion_instance": "tg_veraveda777_bot_legacy",
+        "platform": "max",
+    }
+
+    instances = {
+        "tg_veraveda777_bot_legacy": inst_bot_a,
+        "tg_someonewithyou01_bot_new": inst_bot_b,
+        "max_se13639182_bot_legacy": inst_max_a,
+    }
+
+    current_running_inst = {"inst": inst_bot_a}
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: instances.get(n))
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: current_running_inst["inst"])
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_bot_a if s.get("pm2_name") in ("tg_veraveda777_bot_legacy", "max_se13639182_bot_legacy") else inst_bot_b)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(side_effect=lambda comp, current_instance=None, session=None: [777] if comp.get("pm2_name") == "tg_veraveda777_bot_legacy" else [888]))
+
+    # Seed an active incident in DB owned by Bot B
+    async with test_db_session_maker() as session:
+        inc_b = AIProviderIncidentModel(
+            origin_instance_id="tg_someonewithyou01_bot_new",
+            companion_instance_id=None,
+            provider="KIE",
+            credential_scope="scope_b_secret",
+            model_scope="kie-default",
+            operation="chat",
+            incident_type="provider_down",
+            detail_code="502_bad_gateway",
+            evidence_tier="tier1_primary_circuit",
+            status="active",
+        )
+        session.add(inc_b)
+        await session.commit()
+        await session.refresh(inc_b)
+        inc_b_id = inc_b.id
+
+    telegram_session = ValidatingTelegramSession()
+    bot = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session)
+    bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    # Case 1: Caller is Bot A, attempting to alert for incident owned by Bot B (origin_instance_id=tg_veraveda777_bot_legacy)
+    current_running_inst["inst"] = inst_bot_a
+    res1 = await enqueue_terminal_ai_failure_notification(
+        incident_id=inc_b_id,
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        text="Terminal failure alert from Bot A",
+        session_maker=test_db_session_maker,
+    )
+    assert res1 is False, "Bot A cannot enqueue alert for incident owned by Bot B"
+
+    # Case 2: Bot A attempting to spoof origin_instance_id=tg_someonewithyou01_bot_new
+    res2 = await enqueue_terminal_ai_failure_notification(
+        incident_id=inc_b_id,
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        text="Spoofed terminal failure alert",
+        session_maker=test_db_session_maker,
+    )
+    assert res2 is False, "Caller identity mismatch must fail-closed"
+
+    # Verify zero outbox rows and zero sends
+    async with test_db_session_maker() as session:
+        notifs = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        assert len(notifs) == 0, "No notifications must be created for unauthorized incident"
+
+    await process_ai_incident_notifications(bot, session_maker=test_db_session_maker)
+    assert len(telegram_session.calls) == 0, "Zero admin sends for unauthorized incident"
+
+    # Case 3: Legit MAX instance (max_se13639182_bot_legacy) enqueuing for its own incident
+    async with test_db_session_maker() as session:
+        inc_max = AIProviderIncidentModel(
+            origin_instance_id="max_se13639182_bot_legacy",
+            companion_instance_id="tg_veraveda777_bot_legacy",
+            provider="KIE",
+            credential_scope="scope_max_secret",
+            model_scope="kie-default",
+            operation="chat",
+            incident_type="provider_down",
+            detail_code="503_service_unavailable",
+            evidence_tier="tier1_primary_circuit",
+            status="active",
+        )
+        session.add(inc_max)
+        await session.commit()
+        await session.refresh(inc_max)
+        inc_max_id = inc_max.id
+
+    # Switch execution context to MAX instance
+    current_running_inst["inst"] = inst_max_a
+    res3 = await enqueue_terminal_ai_failure_notification(
+        incident_id=inc_max_id,
+        origin_instance_id="max_se13639182_bot_legacy",
+        text="Legit MAX terminal failure alert",
+        session_maker=test_db_session_maker,
+    )
+    assert res3 is True, "Legit MAX instance must succeed in enqueuing notification"
+
+    # Verify outbox row created for companion Telegram instance and admin
+    async with test_db_session_maker() as session:
+        notifs_max = (await session.execute(select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.incident_id == inc_max_id))).scalars().all()
+        assert len(notifs_max) == 1
+        notif_row = notifs_max[0]
+        assert notif_row.authorized_instance_id == "tg_veraveda777_bot_legacy"
+        assert notif_row.recipient_id == 777
+        assert notif_row.status == "pending"
+
+    # Companion Telegram bot delivers the alert
+    current_running_inst["inst"] = inst_bot_a
+    delivered = await process_ai_incident_notifications(bot, session_maker=test_db_session_maker)
+    assert delivered == 1
+
+    send_calls = [c for c in telegram_session.calls if type(c).__name__ == "SendMessage"]
+    assert len(send_calls) == 1
+    assert send_calls[0].chat_id == 777
+    assert "Legit MAX terminal failure alert" in send_calls[0].text
+
+
+@pytest.mark.asyncio
+async def test_output_budget_and_fallback_alerts_use_durable_outbox_telegram_and_max(test_db_session_maker, monkeypatch):
+    """Item 2: Fallback and output budget exhaustion alerts are delivered strictly via durable outbox (AIIncidentNotificationModel).
+    Verifies ZERO PII in outbox, Telegram immediate delivery, MAX companion routing, DB cooldown, and retry recovery."""
+    from datetime import timedelta
+    from database import AIIncidentNotificationModel, AIProviderIncidentModel
+    from error_reporting import send_ai_fallback_used_alert, send_output_budget_exhausted_alert
+    from ai_incident_manager import process_ai_incident_notifications
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+
+    inst_tg = {
+        "pm2_name": "tg_veraveda777_bot_legacy",
+        "bot_instance_id": "tg_veraveda777_bot_legacy",
+        "companion_instance": "max_se13639182_bot_legacy",
+        "platform": "telegram",
+        "admins": [777],
+    }
+    inst_max = {
+        "pm2_name": "max_se13639182_bot_legacy",
+        "bot_instance_id": "max_se13639182_bot_legacy",
+        "companion_instance": "tg_veraveda777_bot_legacy",
+        "platform": "max",
+    }
+    instances = {"tg_veraveda777_bot_legacy": inst_tg, "max_se13639182_bot_legacy": inst_max}
+
+    current_running_inst = {"inst": inst_tg}
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: instances.get(n))
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: current_running_inst["inst"])
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[777]))
+
+    telegram_session = ValidatingTelegramSession()
+    bot = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session)
+    bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    # Part A: Telegram Output Budget Alert with real bot (immediate delivery turn, zero PII, DB cooldown)
+    current_running_inst["inst"] = inst_tg
+    res_budget = await send_output_budget_exhausted_alert(
+        bot=bot,
+        platform="telegram",
+        user_id=1234567,
+        chat_id=9876543,
+        username="confidential_user",
+        full_name="Secret Name",
+        request_type="chat",
+        provider="KIE",
+        model="kie-claude-3-7-sonnet",
+        finish_reason="length",
+        visible_content_length=150,
+        reasoning_content_length=5000,
+        max_tokens=5000,
+        session_maker=test_db_session_maker,
+    )
+    assert res_budget is True
+
+    # Assert outbox row was created and delivered
+    async with test_db_session_maker() as session:
+        notifs = (await session.execute(select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.event_type == "output_budget_exhausted"))).scalars().all()
+        assert len(notifs) == 1
+        notif_row = notifs[0]
+        assert notif_row.status == "delivered"
+        assert notif_row.recipient_id == 777
+        # ZERO PII verification
+        assert "1234567" not in notif_row.message_text
+        assert "9876543" not in notif_row.message_text
+        assert "confidential_user" not in notif_row.message_text
+        assert "Secret Name" not in notif_row.message_text
+
+    # Immediate delivery turn sent message to Telegram admin 777
+    send_calls = [c for c in telegram_session.calls if type(c).__name__ == "SendMessage"]
+    assert len(send_calls) == 1
+    assert send_calls[0].chat_id == 777
+
+    # DB Cooldown verification: second immediate alert is suppressed
+    res_budget_suppressed = await send_output_budget_exhausted_alert(
+        bot=bot,
+        platform="telegram",
+        provider="KIE",
+        model="kie-claude-3-7-sonnet",
+        session_maker=test_db_session_maker,
+    )
+    assert res_budget_suppressed is False
+    assert len([c for c in telegram_session.calls if type(c).__name__ == "SendMessage"]) == 1
+
+    # Part B: MAX Fallback Alert with bot=None (companion routing, retries, restart recovery)
+    current_running_inst["inst"] = inst_max
+    res_fallback = await send_ai_fallback_used_alert(
+        bot=None,
+        platform="max",
+        user_id=8888888,
+        chat_id=7777777,
+        request_type="chat",
+        primary_provider="KIE",
+        primary_model="kie-model",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-4o",
+        primary_error="ConfidentialErrorDetails: Internal 502 with sensitive stacktrace",
+        session_maker=test_db_session_maker,
+    )
+    assert res_fallback is True
+
+    # Check outbox row: status is pending for companion Telegram instance
+    async with test_db_session_maker() as session:
+        notifs_fb = (await session.execute(select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.event_type == "fallback_used"))).scalars().all()
+        assert len(notifs_fb) == 1
+        fb_row = notifs_fb[0]
+        assert fb_row.status == "pending"
+        assert fb_row.authorized_instance_id == "tg_veraveda777_bot_legacy"
+        assert fb_row.recipient_id == 777
+        # ZERO PII verification
+        assert "8888888" not in fb_row.message_text
+        assert "7777777" not in fb_row.message_text
+        assert "sensitive stacktrace" not in fb_row.message_text
+
+    # Simulate transient network failure during companion delivery (e.g. Telegram 502)
+    current_running_inst["inst"] = inst_tg
+    orig_send = bot.send_message
+    fail_count = 0
+    async def transient_fail(*args, **kwargs):
+        nonlocal fail_count
+        fail_count += 1
+        if fail_count == 1:
+            raise RuntimeError("Telegram 502 Bad Gateway (transient)")
+        return await orig_send(*args, **kwargs)
+
+    bot.send_message = transient_fail
+
+    # Delivery fails on attempt 1 -> retryable status retained in outbox
+    await process_ai_incident_notifications(bot, session_maker=test_db_session_maker)
+    async with test_db_session_maker() as session:
+        row_retry = await session.get(AIIncidentNotificationModel, fb_row.id)
+        assert row_retry.status == "pending"
+        assert row_retry.attempts == 1
+        assert row_retry.last_error in ("unexpected_delivery_error", "telegram_network_error")
+        # Reset next_retry_at to past to simulate retry interval elapsed / restart recovery
+        row_retry.next_retry_at = datetime.utcnow() - timedelta(minutes=1)
+        await session.commit()
+
+    # Restart / next cycle delivers successfully
+    await process_ai_incident_notifications(bot, session_maker=test_db_session_maker)
+    async with test_db_session_maker() as session:
+        row_delivered = await session.get(AIIncidentNotificationModel, fb_row.id)
+        assert row_delivered.status == "delivered"
+        assert row_delivered.attempts == 2

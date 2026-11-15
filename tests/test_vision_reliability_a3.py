@@ -338,7 +338,8 @@ class VisionAdminAlertMediaRedactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(realistic_kie_url, alert_text)
             self.assertNotIn(realistic_signed_url, alert_text)
 
-            # 2. Test fallback used alert (delivers via _dispatch_admin_alert_text)
+            # 2. Test fallback used alert (delivers via durable outbox -> bot.send_message)
+            mock_bot.send_message.reset_mock()
             await send_ai_fallback_used_alert(
                 bot=mock_bot,
                 primary_provider="OpenAI",
@@ -359,8 +360,8 @@ class VisionAdminAlertMediaRedactionTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
-            self.assertTrue(mock_dispatch.called)
-            fallback_alert_text = mock_dispatch.call_args[0][1]
+            self.assertTrue(mock_bot.send_message.called)
+            fallback_alert_text = mock_bot.send_message.call_args.kwargs.get("text") or mock_bot.send_message.call_args[0][1]
             self.assertNotIn(marker_uri, fallback_alert_text)
             self.assertNotIn(marker_raw, fallback_alert_text)
             self.assertNotIn(marker_kie, fallback_alert_text)
@@ -370,9 +371,8 @@ class VisionAdminAlertMediaRedactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(realistic_kie_url, fallback_alert_text)
             self.assertNotIn(realistic_signed_url, fallback_alert_text)
 
-            mock_dispatch.reset_mock()
-
-            # 3. Test output-budget alert
+            # 3. Test output-budget alert (delivers via durable outbox -> bot.send_message)
+            mock_bot.send_message.reset_mock()
             await send_output_budget_exhausted_alert(
                 bot=mock_bot,
                 provider="OpenAI",
@@ -384,8 +384,8 @@ class VisionAdminAlertMediaRedactionTests(unittest.IsolatedAsyncioTestCase):
                 request_type="vision",
                 details=f"Exhausted on {realistic_kie_url} with {realistic_raw_b64}",
             )
-            self.assertTrue(mock_dispatch.called)
-            budget_alert_text = mock_dispatch.call_args[0][1]
+            self.assertTrue(mock_bot.send_message.called)
+            budget_alert_text = mock_bot.send_message.call_args.kwargs.get("text") or mock_bot.send_message.call_args[0][1]
             self.assertNotIn(marker_uri, budget_alert_text)
             self.assertNotIn(marker_raw, budget_alert_text)
             self.assertNotIn(marker_kie, budget_alert_text)
@@ -642,27 +642,26 @@ class VisionPublicAlertTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fallback_recovery_alert_dispatches_cleanly(self):
         mock_bot = MagicMock()
-        with patch("error_reporting._dispatch_admin_alert_text", new_callable=AsyncMock) as mock_dispatch:
-            mock_dispatch.return_value = True
+        mock_bot.token = "8281390498:AAF_TEST_ROUTING_TOKEN"
+        mock_bot.send_message = AsyncMock(return_value=True)
+        mock_bot.get_me = AsyncMock(return_value=SimpleNamespace(id=8281390498, is_bot=True, first_name="bot", username="someonewithyou01_bot"))
 
-            sent = await send_ai_fallback_used_alert(
-                bot=mock_bot,
-                platform="telegram",
-                user_id=7001,
-                primary_provider="KIE",
-                primary_model="gemini-3-flash",
-                fallback_provider="OpenAI",
-                fallback_model="gpt-5.6-terra",
-                primary_error="KIE 503",
-                request_type="vision",
-            )
-            self.assertTrue(sent)
-            self.assertEqual(mock_dispatch.call_count, 1)
-            # Verify only (bot, text) was passed to _dispatch_admin_alert_text
-            args, kwargs = mock_dispatch.call_args
-            self.assertEqual(len(args), 2)
-            self.assertEqual(args[0], mock_bot)
-            self.assertIn("Использован резервный AI-провайдер", args[1])
+        sent = await send_ai_fallback_used_alert(
+            bot=mock_bot,
+            platform="telegram",
+            user_id=7001,
+            primary_provider="KIE",
+            primary_model="gemini-3-flash",
+            fallback_provider="OpenAI",
+            fallback_model="gpt-5.6-terra",
+            primary_error="KIE 503",
+            request_type="vision",
+        )
+        self.assertTrue(sent)
+        self.assertTrue(mock_bot.send_message.called)
+        args, kwargs = mock_bot.send_message.call_args
+        alert_text = kwargs.get("text") or args[1]
+        self.assertIn("Использован резервный AI-провайдер", alert_text)
 
     async def test_recovery_alert_does_not_consume_terminal_or_budget_cooldown(self):
         mock_bot = MagicMock()
@@ -670,35 +669,34 @@ class VisionPublicAlertTests(unittest.IsolatedAsyncioTestCase):
         mock_bot.send_message = AsyncMock(return_value=True)
         mock_bot.get_me = AsyncMock(return_value=SimpleNamespace(id=8281390498, is_bot=True, first_name="bot", username="someonewithyou01_bot"))
 
-        with patch("error_reporting._dispatch_admin_alert_text", new_callable=AsyncMock) as mock_dispatch:
-            mock_dispatch.return_value = True
+        # 1. Fallback used alert (uses durable outbox -> bot.send_message)
+        fb_sent = await send_ai_fallback_used_alert(
+            bot=mock_bot,
+            platform="telegram",
+            user_id=7001,
+            primary_provider="KIE",
+            primary_model="gemini-3-flash",
+            fallback_provider="OpenAI",
+            fallback_model="gpt-5.6-terra",
+            primary_error="KIE 503",
+            request_type="vision",
+        )
+        self.assertTrue(fb_sent)
+        fb_calls = mock_bot.send_message.call_count
+        self.assertGreaterEqual(fb_calls, 1)
 
-            # 1. Fallback used alert (uses _dispatch_admin_alert_text)
-            await send_ai_fallback_used_alert(
-                bot=mock_bot,
-                platform="telegram",
-                user_id=7001,
-                primary_provider="KIE",
-                primary_model="gemini-3-flash",
-                fallback_provider="OpenAI",
-                fallback_model="gpt-5.6-terra",
-                primary_error="KIE 503",
-                request_type="vision",
-            )
-            self.assertEqual(mock_dispatch.call_count, 1)
-
-            # 2. Terminal alert for same provider/model is still sent (uses durable outbox -> bot.send_message)
-            term_sent = await send_terminal_ai_failure_alert(
-                bot=mock_bot,
-                platform="telegram",
-                user_id=7001,
-                primary_provider="KIE",
-                primary_model="gemini-3-flash",
-                request_type="vision",
-                error_message="KIE terminal",
-            )
-            self.assertTrue(term_sent)
-            self.assertEqual(mock_bot.send_message.call_count, 3)
+        # 2. Terminal alert for same provider/model is still sent (uses durable outbox -> bot.send_message)
+        term_sent = await send_terminal_ai_failure_alert(
+            bot=mock_bot,
+            platform="telegram",
+            user_id=7001,
+            primary_provider="KIE",
+            primary_model="gemini-3-flash",
+            request_type="vision",
+            error_message="KIE terminal",
+        )
+        self.assertTrue(term_sent)
+        self.assertGreater(mock_bot.send_message.call_count, fb_calls)
 
 
 class VisionOrchestrationIntegrationTests(unittest.IsolatedAsyncioTestCase):
