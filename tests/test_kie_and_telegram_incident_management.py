@@ -4834,6 +4834,10 @@ async def test_admin_key_rotation_atomic_transaction_rollback_preserves_old_conf
     assert len(captured_runtime_keys) >= 1, "Runtime AI request must be triggered"
     assert captured_runtime_keys[-1] == key_retry, "AI request must use newly saved retry key"
 
+    user_sends = [c for c in telegram_session.calls if type(c).__name__ == "SendMessage" and getattr(c, "chat_id", None) == 999]
+    assert len(user_sends) >= 1, "AI response must be sent to the end user"
+    assert "Ответ ИИ после восстановления настроек администратором" in user_sends[-1].text
+
 
 @pytest.mark.asyncio
 async def test_key_rotation_companion_shared_db_two_keys_isolation(test_db_session_maker, monkeypatch):
@@ -5966,3 +5970,408 @@ async def test_output_budget_and_fallback_alerts_use_durable_outbox_telegram_and
         row_delivered = await session.get(AIIncidentNotificationModel, fb_row.id)
         assert row_delivered.status == "delivered"
         assert row_delivered.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_fallback_and_budget_alert_markers_redacted_zero_free_text_leakage(test_db_session_maker, monkeypatch):
+    """
+    Directive 2: Eliminate free text from fallback and output budget outbox.
+    Prove zero leakage of sensitive markers in primary_error, attempts, classification,
+    details, finish_reason, and ai_log_ids into outbox and sent Telegram messages.
+    """
+    from database import AIIncidentNotificationModel, AIProviderIncidentModel
+    from error_reporting import send_ai_fallback_used_alert, send_output_budget_exhausted_alert
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+
+    inst_tg = {
+        "pm2_name": "tg_veraveda777_bot_legacy",
+        "bot_instance_id": "tg_veraveda777_bot_legacy",
+        "companion_instance": None,
+        "platform": "telegram",
+        "admins": [777],
+    }
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[777]))
+
+    telegram_session = ValidatingTelegramSession()
+    bot = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session)
+    bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    MARKER_SECRET_KEY = "sk-ant-api03-CONFIDENTIAL_SECRET_KEY_XYZ_999"
+    MARKER_PRIMARY_ERR = "CRITICAL_INJECTION_PRIMARY_ERROR_LINE_777"
+    MARKER_ATTEMPT_ERR = "ATTEMPT_TRACEBACK_SECRET_USER_INPUT_888"
+    MARKER_CLS_INJECT = "CLASSIFICATION_MALICIOUS_INJECTION_555"
+    MARKER_FINISH_REASON = "FINISH_REASON_INJECTION_444"
+    MARKER_LOG_ID_STRING = "LOG_ID_SECRET_MARKER_333"
+    MARKER_DETAILS = "DETAILS_CONFIDENTIAL_BEARER_TOKEN_222"
+
+    ALL_SENSITIVE_MARKERS = [
+        MARKER_SECRET_KEY,
+        MARKER_PRIMARY_ERR,
+        MARKER_ATTEMPT_ERR,
+        MARKER_CLS_INJECT,
+        MARKER_FINISH_REASON,
+        MARKER_LOG_ID_STRING,
+        MARKER_DETAILS,
+    ]
+
+    # 1. Fallback alert with multiple sensitive markers injected across free fields
+    res_fb = await send_ai_fallback_used_alert(
+        bot=bot,
+        platform="telegram",
+        user_id=12345,
+        primary_provider="KIE",
+        primary_model="gemini-2.5-flash",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-5",
+        primary_error=f"UnrecognizedServiceError: {MARKER_PRIMARY_ERR} with key {MARKER_SECRET_KEY}",
+        reason=f"Failed reason with {MARKER_DETAILS}",
+        ai_log_ids=[101, MARKER_LOG_ID_STRING],
+        provider_attempts=[
+            {
+                "provider": "KIE",
+                "model": "gemini-2.5-flash",
+                "status": "FAILED",
+                "error": f"Stacktrace containing {MARKER_ATTEMPT_ERR}",
+                "classification": MARKER_CLS_INJECT,
+            },
+            {
+                "provider": "OpenAI",
+                "model": "gpt-5",
+                "status": "SUCCESS",
+            },
+        ],
+        session_maker=test_db_session_maker,
+    )
+    assert res_fb is True
+
+    # 2. Output budget alert with sensitive markers in finish_reason, ai_log_id, exception, details
+    res_budget = await send_output_budget_exhausted_alert(
+        bot=bot,
+        platform="telegram",
+        provider="Deepseek",
+        model="deepseek-r1",
+        finish_reason=MARKER_FINISH_REASON,
+        visible_content_length=200,
+        reasoning_content_length=4000,
+        max_tokens=4000,
+        ai_log_id=f"999_{MARKER_LOG_ID_STRING}",
+        details=MARKER_DETAILS,
+        exception=Exception(f"Token overflow with {MARKER_SECRET_KEY}"),
+        session_maker=test_db_session_maker,
+    )
+    assert res_budget is True
+
+    # 3. Assert zero leakage in AIIncidentNotificationModel outbox table
+    async with test_db_session_maker() as session:
+        notifs = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        assert len(notifs) >= 2
+        for notif in notifs:
+            msg_text = notif.message_text
+            for marker in ALL_SENSITIVE_MARKERS:
+                assert marker not in msg_text, f"Marker {marker!r} leaked into outbox message_text: {msg_text}"
+            # Prove err_type_str does not guess from string and defaults to safe code
+            assert "UnrecognizedServiceError" not in msg_text
+            # Prove classification defaulted to safe value, never the injected string
+            assert MARKER_CLS_INJECT not in msg_text
+
+    # 4. Assert zero leakage in actual Telegram messages sent to admin
+    send_calls = [c for c in telegram_session.calls if type(c).__name__ == "SendMessage"]
+    assert len(send_calls) >= 2
+    for call in send_calls:
+        call_text = call.text
+        for marker in ALL_SENSITIVE_MARKERS:
+            assert marker not in call_text, f"Marker {marker!r} leaked into sent Telegram message: {call_text}"
+
+
+@pytest.mark.asyncio
+async def test_runtime_stale_fallback_and_budget_exhausted_after_a_b_a_suppressed(test_db_session_maker, monkeypatch):
+    """
+    Directive 1: Real AI Attempt Identity & A -> B -> A Lifecycle.
+    Stale in-flight fallback and output budget alerts started before key rotation
+    belong to the previous superseded generation and must NOT open a new incident or send alerts
+    when Key A is reactivated (A -> B -> A).
+    """
+    from datetime import datetime, timedelta
+    from ai_incident_manager import (
+        get_provider_account_fingerprint,
+        handle_key_rotation,
+        record_ai_provider_failure,
+    )
+    from error_reporting import send_ai_fallback_used_alert, send_output_budget_exhausted_alert
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+
+    inst_tg = {
+        "pm2_name": "tg_veraveda777_bot_legacy",
+        "bot_instance_id": "tg_veraveda777_bot_legacy",
+        "companion_instance": None,
+        "platform": "telegram",
+        "admins": [777],
+    }
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[777]))
+
+    telegram_session = ValidatingTelegramSession()
+    bot = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session)
+    bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    key_a = "kie_lifecycle_key_alpha_111"
+    key_b = "kie_lifecycle_key_beta_222"
+    scope_a = get_provider_account_fingerprint(key_a, None)
+    scope_b = get_provider_account_fingerprint(key_b, None)
+
+    # Step 1: Active configuration is Key A
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            session.add(AIConfig(id=1, kie_api_key=key_a, default_model="kie-default"))
+        else:
+            cfg.kie_api_key = key_a
+        await session.commit()
+
+    # Request R1 starts at t1 under Key A
+    t1 = datetime.utcnow() - timedelta(seconds=10)
+
+    # Step 2: Key is rotated A -> B at t_rot1
+    await asyncio.sleep(0.05)
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.kie_api_key = key_b
+        await session.commit()
+    await handle_key_rotation(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        new_key=key_b,
+        old_key=key_a,
+        session_maker=test_db_session_maker,
+    )
+
+    # Step 3: Key is rotated back B -> A at t_rot2 (reactivation)
+    await asyncio.sleep(0.05)
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.kie_api_key = key_a
+        await session.commit()
+    await handle_key_rotation(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        new_key=key_a,
+        old_key=key_b,
+        session_maker=test_db_session_maker,
+    )
+
+    # Step 4: Fresh Request R2 starts under reactivated Key A at t2 > t_rot2
+    await asyncio.sleep(0.05)
+    t2 = datetime.utcnow()
+    err_r2 = InsufficientBalanceError("KIE credits empty on reactivated key A")
+    err_r2.provider = "KIE"
+    inc_r2 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=err_r2,
+        operation="chat",
+        model="kie-default",
+        credential_scope=scope_a,
+        attempt_started_at=t2,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_r2 is not None
+    assert inc_r2.status == "active", "R2 should open an active incident on reactivated key A"
+
+    # Step 5: Stale Request R1 finishes NOW (after A -> B -> A), reporting output budget & fallback
+    # Output budget alert from stale R1 (started at t1)
+    res_stale_budget = await send_output_budget_exhausted_alert(
+        bot=bot,
+        platform="telegram",
+        provider="KIE",
+        model="kie-default",
+        finish_reason="length",
+        credential_scope=scope_a,
+        attempt_started_at=t1,
+        session_maker=test_db_session_maker,
+    )
+    assert res_stale_budget is False, "Stale output budget alert for superseded attempt must be suppressed"
+
+    # Fallback alert from stale R1 (started at t1)
+    res_stale_fallback = await send_ai_fallback_used_alert(
+        bot=bot,
+        platform="telegram",
+        primary_provider="KIE",
+        primary_model="kie-default",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-5",
+        primary_error=Exception("Stale 502 error from old generation"),
+        credential_scope=scope_a,
+        attempt_started_at=t1,
+        session_maker=test_db_session_maker,
+    )
+    assert res_stale_fallback is False, "Stale fallback alert for superseded attempt must be suppressed"
+
+    # Step 6: Verify DB state:
+    # 1. R2 incident remains ACTIVE and untouched
+    # 2. No notification was queued for R1
+    async with test_db_session_maker() as session:
+        inc_check = await session.get(AIProviderIncidentModel, inc_r2.id)
+        assert inc_check.status == "active"
+
+        notifs_r1 = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.event_type.in_(["output_budget_exhausted", "fallback_used"])
+            )
+        )).scalars().all()
+        assert len(notifs_r1) == 0, "Zero outbox notifications must be queued for stale R1 attempts"
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_concurrent_enqueue_during_rotation_shared_db(pg_test_session_maker, monkeypatch):
+    """
+    Directive 3: PostgreSQL test for concurrent enqueue during key rotation with shared DB across multiple bots.
+    Proves atomicity, no deadlocks, and isolation between Bot A and Bot B under high concurrency.
+    """
+    from datetime import datetime
+    from ai_incident_manager import (
+        enqueue_ai_notification_event,
+        get_provider_account_fingerprint,
+        handle_key_rotation,
+        record_ai_provider_failure,
+    )
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+
+    inst_bot_a = {
+        "pm2_name": "tg_veraveda777_bot_legacy",
+        "bot_instance_id": "tg_veraveda777_bot_legacy",
+        "companion_instance": None,
+        "platform": "telegram",
+        "admins": [777],
+    }
+    inst_bot_b = {
+        "pm2_name": "tg_someonewithyou01_bot_new",
+        "bot_instance_id": "tg_someonewithyou01_bot_new",
+        "companion_instance": None,
+        "platform": "telegram",
+        "admins": [888],
+    }
+    instances = {
+        "tg_veraveda777_bot_legacy": inst_bot_a,
+        "tg_someonewithyou01_bot_new": inst_bot_b,
+    }
+
+    import contextvars
+    current_inst_cv = contextvars.ContextVar("current_inst", default=inst_bot_a)
+
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: instances.get(n))
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: current_inst_cv.get())
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: s)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(side_effect=lambda comp, current_instance=None, session=None: [777] if comp.get("pm2_name") == "tg_veraveda777_bot_legacy" else [888]))
+
+    key_a_old = "kie_pg_bot_a_old_key_111"
+    key_a_new = "kie_pg_bot_a_new_key_222"
+    key_b = "kie_pg_bot_b_stable_key_333"
+
+    scope_a_old = get_provider_account_fingerprint(key_a_old, None)
+    scope_a_new = get_provider_account_fingerprint(key_a_new, None)
+    scope_b = get_provider_account_fingerprint(key_b, None)
+
+    # Seed incidents for Bot A and Bot B on real PostgreSQL
+    current_inst_cv.set(inst_bot_a)
+    err_a = InsufficientBalanceError("KIE credits empty on Bot A")
+    err_a.provider = "KIE"
+    inc_a = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=err_a,
+        operation="chat",
+        model="kie-model-a",
+        credential_scope=scope_a_old,
+        session_maker=pg_test_session_maker,
+    )
+    assert inc_a is not None
+
+    current_inst_cv.set(inst_bot_b)
+    err_b = InsufficientBalanceError("KIE credits empty on Bot B")
+    err_b.provider = "KIE"
+    inc_b = await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        error=err_b,
+        operation="chat",
+        model="kie-model-b",
+        credential_scope=scope_b,
+        session_maker=pg_test_session_maker,
+    )
+    assert inc_b is not None
+
+    current_inst_cv.set(inst_bot_a)
+
+    # Define concurrent tasks:
+    # 1. Admin rotates Bot A's key
+    async def task_rotate_bot_a():
+        current_inst_cv.set(inst_bot_a)
+        return await handle_key_rotation(
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            provider="KIE",
+            new_key=key_a_new,
+            old_key=key_a_old,
+            session_maker=pg_test_session_maker,
+        )
+
+    # 2. In-flight notification enqueue on Bot A
+    async def task_enqueue_bot_a():
+        current_inst_cv.set(inst_bot_a)
+        return await enqueue_ai_notification_event(
+            incident_id=inc_a.id,
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            event_type="terminal_failure",
+            text="Concurrent terminal failure for Bot A",
+            cooldown_seconds=0,
+            session_maker=pg_test_session_maker,
+        )
+
+    # 3. Concurrent error recording for Bot B (should not be affected by Bot A's rotation)
+    async def task_record_and_enqueue_bot_b():
+        current_inst_cv.set(inst_bot_b)
+        return await enqueue_ai_notification_event(
+            incident_id=inc_b.id,
+            origin_instance_id="tg_someonewithyou01_bot_new",
+            event_type="fallback_used",
+            text="Concurrent fallback notification for Bot B",
+            cooldown_seconds=0,
+            session_maker=pg_test_session_maker,
+        )
+
+    # Run all tasks concurrently on PostgreSQL
+    results = await asyncio.gather(
+        task_rotate_bot_a(),
+        task_enqueue_bot_a(),
+        task_record_and_enqueue_bot_b(),
+        return_exceptions=False,
+    )
+
+    # Assertions on real PostgreSQL:
+    # 1. No deadlocks or exceptions occurred during concurrent transactions
+    assert len(results) == 3
+
+    # 2. Bot A's old incident was superseded by rotation
+    async with pg_test_session_maker() as session:
+        db_inc_a = await session.get(AIProviderIncidentModel, inc_a.id)
+        assert db_inc_a.status == "superseded"
+
+        # 3. Bot B's incident remains ACTIVE (complete multi-bot isolation on PostgreSQL)
+        db_inc_b = await session.get(AIProviderIncidentModel, inc_b.id)
+        assert db_inc_b.status == "active"
+        assert db_inc_b.resolved_at is None
+
+        # 4. Outbox contains notification for Bot B (admin 888)
+        notifs_b = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.incident_id == inc_b.id,
+                AIIncidentNotificationModel.event_type == "fallback_used",
+            )
+        )).scalars().all()
+        assert len(notifs_b) >= 1
+        assert notifs_b[0].recipient_id == 888

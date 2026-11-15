@@ -1740,6 +1740,11 @@ async def get_ai_response(
                 provider_response_payload=err_meta["provider_response_payload"],
             )
 
+            from ai_incident_manager import get_provider_account_fingerprint, get_provider_api_key
+            prim_api_k = get_provider_api_key(ai_config, primary_prov)
+            prim_b_url = _get_kie_base_url(ai_config) if primary_prov.upper() == "KIE" else None
+            prim_cred_scope = get_provider_account_fingerprint(prim_api_k, prim_b_url)
+
             # Check output budget exhausted alert on primary
             if (
                 getattr(primary_err, "classification", None) == "output_budget_exhausted"
@@ -1762,6 +1767,10 @@ async def get_ai_response(
                         getattr(ai_config, "max_output_tokens", None),
                     ),
                     ai_log_id=primary_log_id,
+                    credential_scope=prim_cred_scope,
+                    attempt_started_at=primary_started_at,
+                    exception=primary_err,
+                    session_maker=async_session_maker,
                 )
 
             # Try fallback provider if configured
@@ -1773,11 +1782,6 @@ async def get_ai_response(
                 fb_model = fb_model.strip() or None
             allow_fallback = bool(getattr(ai_config, "allow_fallback", False))
             fallback_succeeded = False
-
-            from ai_incident_manager import get_provider_account_fingerprint, get_provider_api_key
-            prim_api_k = get_provider_api_key(ai_config, primary_prov)
-            prim_b_url = _get_kie_base_url(ai_config) if primary_prov.upper() == "KIE" else None
-            prim_cred_scope = get_provider_account_fingerprint(prim_api_k, prim_b_url)
 
             inc_primary = None
             if not allow_fallback or not fb_provider or not fb_model:
@@ -2135,9 +2139,10 @@ async def get_ai_response(
                     )
                     fallback_succeeded = True
                     log.info("Fallback response generated user_id=%s provider=%s", user_id, actual_provider)
+                    rec_incident = None
                     try:
                         from ai_incident_manager import get_provider_account_fingerprint, record_ai_operation_success, record_ai_provider_failure
-                        await record_ai_provider_failure(
+                        rec_incident = await record_ai_provider_failure(
                             None,
                             primary_prov,
                             primary_err,
@@ -2160,6 +2165,26 @@ async def get_ai_response(
                         )
                     except Exception as rec_err:
                         log.warning("Failed to record MAX AI fallback success: %s", rec_err)
+
+                    try:
+                        await send_ai_fallback_used_alert(
+                            bot=None,
+                            platform="max",
+                            user_id=user_id,
+                            request_type="chat",
+                            primary_provider=primary_prov,
+                            primary_model=primary_mod,
+                            fallback_provider=actual_provider,
+                            fallback_model=actual_model,
+                            primary_error=primary_err,
+                            incident_id=rec_incident.id if rec_incident else None,
+                            credential_scope=prim_cred_scope,
+                            attempt_started_at=primary_started_at,
+                            ai_log_ids=[i for i in (primary_log_id, fb_log_id) if i is not None] or None,
+                            session_maker=async_session_maker,
+                        )
+                    except Exception as alert_err:
+                        log.warning("Failed to send MAX AI fallback alert: %s", alert_err)
                 except Exception as fb_err:
                     fb_latency = int((time.monotonic() - fb_start) * 1000)
                     fb_prov, fb_mod = _extract_effective_provider_and_model(
@@ -3961,9 +3986,10 @@ async def analyze_image(
                 provider_response_payload=fb_capture.get("provider_response_payload"),
             )
 
+            rec_v_incident = None
             try:
                 from ai_incident_manager import get_provider_account_fingerprint, record_ai_operation_success, record_ai_provider_failure
-                await record_ai_provider_failure(
+                rec_v_incident = await record_ai_provider_failure(
                     None,
                     primary_provider,
                     last_exception,
@@ -3989,6 +4015,27 @@ async def analyze_image(
                 )
             except Exception as rec_err:
                 log.warning("Failed to record MAX vision fallback success: %s", rec_err)
+
+            try:
+                await send_ai_fallback_used_alert(
+                    bot=execution_context.bot if execution_context else None,
+                    platform=getattr(execution_context, "platform", "max") or "max",
+                    user_id=getattr(execution_context, "user_id", None),
+                    chat_id=getattr(execution_context, "chat_id", None),
+                    bot_name=getattr(execution_context, "bot_name", None),
+                    primary_provider=primary_provider,
+                    primary_model=primary_model,
+                    fallback_provider=fb_provider,
+                    fallback_model=fb_model,
+                    primary_error=last_exception,
+                    incident_id=rec_v_incident.id if rec_v_incident else None,
+                    credential_scope=prim_cred_scope,
+                    attempt_started_at=prim_started_at,
+                    request_type="vision",
+                    session_maker=async_session_maker,
+                )
+            except Exception as alert_err:
+                log.warning("Failed to send MAX vision fallback alert: %s", alert_err)
 
         except Exception as fb_exc:
             dur_fb = int((time.monotonic() - t_fb) * 1000)
@@ -4080,6 +4127,9 @@ async def analyze_image(
                         attempts=attempts,
                         platform=execution_context.platform,
                         incident_id=getattr(inc_fb or inc_prim, "id", None),
+                        credential_scope=prim_cred_scope,
+                        attempt_started_at=prim_started_at,
+                        session_maker=async_session_maker,
                     )
                 else:
                     vis_cred_scope = fb_cred_scope if inc_fb else prim_cred_scope

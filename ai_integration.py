@@ -2492,6 +2492,10 @@ async def get_ai_response(
                 provider_response_payload=err_meta["provider_response_payload"],
             )
 
+            from ai_incident_manager import get_provider_account_fingerprint, record_ai_provider_failure
+            prim_b_url = _get_kie_base_url(ai_config) if primary_prov == "KIE" else None
+            prim_cred_scope = get_provider_account_fingerprint(api_key, prim_b_url)
+
             # Check output budget exhausted alert on primary
             if (
                 getattr(primary_err, "classification", None) == "output_budget_exhausted"
@@ -2503,6 +2507,7 @@ async def get_ai_response(
                     bot=bot,
                     platform="telegram",
                     user_id=user_id,
+                    user=user,
                     provider=primary_prov,
                     model=primary_mod,
                     finish_reason=getattr(diag, "finish_reason", "length") if diag else "length",
@@ -2514,6 +2519,10 @@ async def get_ai_response(
                         getattr(ai_config, "max_output_tokens", None),
                     ),
                     ai_log_id=primary_log_id,
+                    credential_scope=prim_cred_scope,
+                    attempt_started_at=primary_started_at,
+                    exception=primary_err,
+                    session_maker=async_session_maker,
                 )
 
             allow_fallback = getattr(ai_config, 'allow_fallback', False)
@@ -2521,10 +2530,7 @@ async def get_ai_response(
             fb_model = getattr(ai_config, 'fallback_model', None)
             if not allow_fallback or not fb_provider or not fb_model:
                 inc_primary = None
-                prim_cred_scope = None
                 try:
-                    from ai_incident_manager import get_provider_account_fingerprint, record_ai_provider_failure
-                    prim_cred_scope = get_provider_account_fingerprint(api_key, _get_kie_base_url(ai_config) if primary_prov == "KIE" else None)
                     inc_primary = await record_ai_provider_failure(
                         None,
                         primary_prov,
@@ -2802,6 +2808,27 @@ async def get_ai_response(
                     )
                 except Exception as rec_err:
                     logging.warning("Failed to record AI fallback success/failure: %s", rec_err)
+
+                try:
+                    await send_ai_fallback_used_alert(
+                        bot=bot,
+                        platform="telegram",
+                        user=user,
+                        user_id=user_id,
+                        request_type="chat",
+                        primary_provider=primary_prov,
+                        primary_model=primary_mod,
+                        fallback_provider=fb_prov,
+                        fallback_model=fb_mod,
+                        primary_error=primary_err,
+                        incident_id=rec_incident.id if rec_incident else None,
+                        credential_scope=prim_cred_scope,
+                        attempt_started_at=primary_started_at,
+                        ai_log_ids=[i for i in (primary_log_id, fb_log_id) if i is not None] or None,
+                        session_maker=async_session_maker,
+                    )
+                except Exception as alert_err:
+                    logging.warning("Failed to send AI fallback alert: %s", alert_err)
 
                 if rec_incident is None:
                     await _notify_ai_fallback_used(
@@ -4844,7 +4871,7 @@ async def analyze_image_content(
             except Exception as rec_err:
                 logging.warning("Failed to record vision fallback success: %s", rec_err)
 
-            if rec_v_incident is None and execution_context is not None and execution_context.bot is not None:
+            if execution_context is not None and execution_context.bot is not None:
                 try:
                     await send_ai_fallback_used_alert(
                         bot=execution_context.bot,
@@ -4856,9 +4883,13 @@ async def analyze_image_content(
                         primary_model=primary_target_model,
                         fallback_provider=eff_fallback_provider,
                         fallback_model=eff_fallback_model or "",
-                        primary_error=sanitize_vision_text(str(last_error)),
+                        primary_error=last_error,
+                        incident_id=rec_v_incident.id if rec_v_incident else None,
+                        credential_scope=prim_cred_scope,
+                        attempt_started_at=prim_started_at,
                         ai_log_ids=[i for i in (primary_log_id, fb_log_id) if i is not None] or None,
                         request_type="vision",
+                        session_maker=async_session_maker,
                     )
                 except Exception as alert_err:
                     logging.warning("Failed to send vision fallback alert: %s", alert_err)
@@ -4950,6 +4981,11 @@ async def analyze_image_content(
                     full_name=execution_context.full_name,
                     platform=execution_context.platform,
                     request_type="vision",
+                    incident_id=inc_prim.id if inc_prim else None,
+                    credential_scope=prim_cred_scope,
+                    attempt_started_at=prim_started_at,
+                    exception=last_error,
+                    session_maker=async_session_maker,
                 )
             else:
                 vis_cred_scope = fb_cred_scope if inc_fb else prim_cred_scope
