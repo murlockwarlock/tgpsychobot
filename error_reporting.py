@@ -870,6 +870,8 @@ async def send_terminal_ai_failure_alert(
     username: str | None = None,
     full_name: str | None = None,
     incident_id: int | None = None,
+    credential_scope: str | None = None,
+    attempt_started_at: datetime | None = None,
     session_maker: Any = None,
 ) -> bool:
     """Send realtime terminal AI failure alert to Telegram admins with 30m cooldown."""
@@ -973,10 +975,17 @@ async def send_terminal_ai_failure_alert(
                 error=err_for_inc,
                 operation=request_type or "chat",
                 model=primary_model or model,
+                credential_scope=credential_scope,
+                attempt_started_at=attempt_started_at,
                 enqueue_notification=False,
                 session_maker=session_maker,
             )
             if target_inc:
+                if target_inc.status == "superseded":
+                    logging.getLogger(__name__).info(
+                        "[AI Terminal Alert] Stale failure belongs to superseded generation. Suppressing terminal alert."
+                    )
+                    return False
                 target_incident_id = target_inc.id
 
         if target_incident_id is None:
@@ -1036,6 +1045,8 @@ async def send_output_budget_exhausted_alert(
     username: str | None = None,
     full_name: str | None = None,
     incident_id: int | None = None,
+    credential_scope: str | None = None,
+    attempt_started_at: datetime | None = None,
     session_maker: Any = None,
 ) -> bool:
     """Send alert when AI provider exhausts output budget on tokens (30m cooldown)."""
@@ -1123,6 +1134,8 @@ async def send_ai_fallback_used_alert(
     username: str | None = None,
     full_name: str | None = None,
     incident_id: int | None = None,
+    credential_scope: str | None = None,
+    attempt_started_at: datetime | None = None,
     session_maker: Any = None,
 ) -> bool:
     """Send realtime notification that reserve AI provider was used successfully."""

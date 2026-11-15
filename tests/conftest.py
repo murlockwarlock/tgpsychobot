@@ -2,7 +2,6 @@ import asyncio
 import os
 
 os.environ.setdefault("BOT_TOKEN", "ci-test-token")
-os.environ.setdefault("BOT_INSTANCE_ID", "tg_autobusbusbot_new")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 os.environ.setdefault("TESTING", "true")
 

@@ -4684,13 +4684,39 @@ async def test_admin_key_rotation_atomic_transaction_rollback_preserves_old_conf
 
     # Admin sends new key
     key_msg = Message(message_id=91, date=datetime.now(timezone.utc), chat=admin_chat, from_user=admin_user, text=key_fail)
-    with pytest.raises(RuntimeError, match="Simulated crash/DB failure"):
-        await dp.feed_update(bot, Update(update_id=501, message=key_msg))
+    await dp.feed_update(bot, Update(update_id=501, message=key_msg))
 
-    # Assert: AIConfig was rolled back! Original key remains in DB!
+    # Assert 1: AIConfig was rolled back! Original key remains in DB!
     async with test_db_session_maker() as session:
         cfg_after = await session.get(AIConfig, 1)
         assert cfg_after.kie_api_key == key_orig
+
+    # Assert 2: FSM state is cleared
+    assert await fsm_ctx.get_state() is None
+
+    # Assert 3: Error message sent to admin
+    sent_texts = [getattr(call, "text", "") for call in telegram_session.calls]
+    assert any("Ошибка сохранения настроек. Попробуйте еще раз." in t for t in sent_texts)
+
+    # Assert 4: Successful retry recovery journey
+    monkeypatch.setattr("ai_incident_manager.handle_key_rotation", AsyncMock(return_value=1))
+    monkeypatch.setattr(handlers, "send_temp_notification", AsyncMock())
+    monkeypatch.setattr(handlers, "_edit_provider_model_settings", AsyncMock())
+
+    await fsm_ctx.set_state(handlers.AdminStates.set_api_key)
+    await fsm_ctx.update_data(provider="KIE", settings_chat_id=777, settings_message_id=90)
+
+    key_retry = "kie_retry_key_333"
+    key_msg_retry = Message(message_id=92, date=datetime.now(timezone.utc), chat=admin_chat, from_user=admin_user, text=key_retry)
+    await dp.feed_update(bot, Update(update_id=502, message=key_msg_retry))
+
+    async with test_db_session_maker() as session:
+        cfg_retry = await session.get(AIConfig, 1)
+        assert cfg_retry.kie_api_key == key_retry
+
+    assert await fsm_ctx.get_state() is None
+    handlers.send_temp_notification.assert_awaited_once()
+    assert "✅ Новый ключ API для KIE сохранен." in handlers.send_temp_notification.await_args[0][2]
 
 
 @pytest.mark.asyncio
@@ -5315,3 +5341,209 @@ async def test_runtime_attempt_started_at_prevents_stale_in_flight_reopening_rea
     assert inc_r2 is not None
     # Must be active because it was started on the newly reactivated key generation!
     assert inc_r2.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_runtime_stale_success_after_a_b_a_does_not_close_new_incident(test_db_session_maker, monkeypatch):
+    """Gap 1: In A -> B -> A rotation, an in-flight success started on old generation of key A
+    must NOT resolve an active incident opened by the newly reactivated key A generation.
+    """
+    from datetime import timedelta
+    from ai_incident_manager import (
+        get_provider_account_fingerprint,
+        handle_key_rotation,
+        record_ai_operation_success,
+        record_ai_provider_failure,
+    )
+    from database import AIProviderIncidentModel, AIIncidentNotificationModel
+
+    bot_token = "8281390498:AAFtest_telegram_token_123456789012"
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+    monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+
+    key_a = "kie_stale_key_alpha_111"
+    key_b = "kie_stale_key_beta_222"
+    fp_a = get_provider_account_fingerprint(key_a)
+    fp_b = get_provider_account_fingerprint(key_b)
+
+    # Initial AIConfig with key A
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="KIE", kie_api_key=key_a)
+            session.add(cfg)
+        else:
+            cfg.provider = "KIE"
+            cfg.kie_api_key = key_a
+        await session.commit()
+
+    # Step 1: Request R1 starts at t0 on key A
+    t0 = datetime.utcnow() - timedelta(minutes=10)
+
+    # Step 2: Key rotated A -> B at t_rot1
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.kie_api_key = key_b
+        await session.commit()
+    await handle_key_rotation(None, "KIE", key_b, old_key=key_a, session_maker=test_db_session_maker)
+
+    # Step 3: Key rotated B -> A at t_rot2 (A is reactivated!)
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.kie_api_key = key_a
+        await session.commit()
+    await handle_key_rotation(None, "KIE", key_a, old_key=key_b, session_maker=test_db_session_maker)
+
+    # Step 4: New request R2 starts at t2 on reactivated key A (AFTER reactivation)
+    t2 = datetime.utcnow()
+    err_r2 = InsufficientBalanceError("KIE credit balance exhausted: 0 credits left")
+    inc_r2 = await record_ai_provider_failure(
+        origin_instance_id=None,
+        provider="KIE",
+        error=err_r2,
+        operation="chat",
+        model="kie-model",
+        credential_scope=fp_a,
+        attempt_started_at=t2,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_r2 is not None
+    assert inc_r2.status == "active"
+    incident_id_r2 = inc_r2.id
+
+    # Step 5: Stale request R1 (started at t0 on old generation of key A) now completes with success!
+    res_stale = await record_ai_operation_success(
+        origin_instance_id=None,
+        provider="KIE",
+        credential_scope=fp_a,
+        operation="chat",
+        model="kie-model",
+        session_maker=test_db_session_maker,
+        attempt_started_at=t0,
+    )
+    # Stale success must be ignored!
+    assert res_stale is False
+
+    # In DB: R2 incident remains ACTIVE, NOT resolved!
+    async with test_db_session_maker() as session:
+        inc_check = await session.get(AIProviderIncidentModel, incident_id_r2)
+        assert inc_check.status == "active"
+        assert inc_check.resolved_at is None
+
+        # Verify no false "resolved" notification was queued
+        stmt_notif = select(AIIncidentNotificationModel).where(
+            AIIncidentNotificationModel.incident_id == incident_id_r2,
+            AIIncidentNotificationModel.event_type == "resolved",
+        )
+        notif = (await session.execute(stmt_notif)).scalar_one_or_none()
+        assert notif is None
+
+    # Step 6: Subsequent successful request R3 started at t3 > t2 succeeds -> Incident IS resolved!
+    t3 = datetime.utcnow()
+    res_valid = await record_ai_operation_success(
+        origin_instance_id=None,
+        provider="KIE",
+        credential_scope=fp_a,
+        operation="chat",
+        model="kie-model",
+        session_maker=test_db_session_maker,
+        attempt_started_at=t3,
+    )
+    assert res_valid is True
+
+    async with test_db_session_maker() as session:
+        inc_check2 = await session.get(AIProviderIncidentModel, incident_id_r2)
+        assert inc_check2.status == "resolved"
+        assert inc_check2.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_terminal_alert_stale_request_after_rotation_suppressed_no_false_alert(test_db_session_maker, monkeypatch):
+    """Gap 2: Terminal alert without incident_id for a stale in-flight request started on old key A
+    after rotation to key B is safely suppressed, never creating active incidents or enqueuing alerts for key B.
+    """
+    from datetime import timedelta
+    from ai_incident_manager import (
+        get_provider_account_fingerprint,
+        handle_key_rotation,
+    )
+    from error_reporting import send_terminal_ai_failure_alert
+    from database import AIProviderIncidentModel, AIIncidentNotificationModel
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+
+    bot_token = "8281390498:AAFtest_telegram_token_123456789012"
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+    monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("error_reporting.async_session_maker", test_db_session_maker)
+
+    telegram_session = ValidatingTelegramSession()
+    bot = Bot(token=bot_token, session=telegram_session)
+
+    key_a = "kie_terminal_key_alpha_111"
+    key_b = "kie_terminal_key_beta_222"
+    fp_a = get_provider_account_fingerprint(key_a)
+    fp_b = get_provider_account_fingerprint(key_b)
+
+    # Initial AIConfig with key A
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="KIE", kie_api_key=key_a)
+            session.add(cfg)
+        else:
+            cfg.provider = "KIE"
+            cfg.kie_api_key = key_a
+        await session.commit()
+
+    # In-flight request starts on key A at t0
+    t0 = datetime.utcnow() - timedelta(minutes=5)
+
+    # Key rotated A -> B
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.kie_api_key = key_b
+        await session.commit()
+    await handle_key_rotation(None, "KIE", key_b, old_key=key_a, session_maker=test_db_session_maker)
+
+    # In-flight request fails terminal on key A without incident_id
+    alert_result = await send_terminal_ai_failure_alert(
+        bot=bot,
+        platform="telegram",
+        user_id=123,
+        primary_provider="KIE",
+        primary_model="kie-model",
+        exception=AIServiceError("Dead key A"),
+        incident_id=None,
+        credential_scope=fp_a,
+        attempt_started_at=t0,
+        session_maker=test_db_session_maker,
+    )
+    # Stale terminal failure alert must be suppressed!
+    assert alert_result is False
+
+    # In DB: NO active incidents for KIE!
+    async with test_db_session_maker() as session:
+        stmt_active = select(AIProviderIncidentModel).where(
+            AIProviderIncidentModel.provider == "kie",
+            AIProviderIncidentModel.status == "active",
+        )
+        active_inc = (await session.execute(stmt_active)).scalars().all()
+        assert len(active_inc) == 0
+
+        # NO terminal notifications queued
+        stmt_notif = select(AIIncidentNotificationModel).where(
+            AIIncidentNotificationModel.event_type == "terminal_failure",
+        )
+        notifs = (await session.execute(stmt_notif)).scalars().all()
+        assert len(notifs) == 0
+
+        # Any recorded incident for key A is marked superseded
+        stmt_inc_a = select(AIProviderIncidentModel).where(
+            AIProviderIncidentModel.provider == "kie",
+            AIProviderIncidentModel.credential_scope == fp_a,
+        )
+        incs_a = (await session.execute(stmt_inc_a)).scalars().all()
+        for inc in incs_a:
+            assert inc.status == "superseded"

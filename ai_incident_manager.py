@@ -528,6 +528,7 @@ async def record_ai_operation_success(
     operation: str,
     model: str | None = None,
     session_maker: Any = None,
+    attempt_started_at: datetime | None = None,
 ) -> bool:
     """
     Record an operational success, resolving any active matching incident strictly within this scope.
@@ -541,6 +542,7 @@ async def record_ai_operation_success(
             operation=operation,
             model=model,
             session_maker=session_maker,
+            attempt_started_at=attempt_started_at,
         )
     except Exception as exc:
         logger.error("[AI Incident] Unexpected error recording operation success for %s: %s", provider, exc, exc_info=True)
@@ -554,6 +556,7 @@ async def _record_ai_operation_success_impl(
     operation: str,
     model: str | None = None,
     session_maker: Any = None,
+    attempt_started_at: datetime | None = None,
 ) -> bool:
     current_inst = detect_current_instance()
     if not current_inst:
@@ -597,6 +600,36 @@ async def _record_ai_operation_success_impl(
     resolved_any = False
 
     async with sm() as session:
+        # Check verified lifecycle: if this attempt started before this credential was rotated out,
+        # it belongs to a superseded credential generation and must NOT resolve new incidents.
+        if attempt_started_at:
+            att_dt = attempt_started_at.replace(tzinfo=None) if attempt_started_at.tzinfo else attempt_started_at
+            stmt_superseded = (
+                select(AIProviderIncidentModel)
+                .where(
+                    AIProviderIncidentModel.provider == prov_norm,
+                    AIProviderIncidentModel.credential_scope == credential_scope,
+                    AIProviderIncidentModel.status == "superseded",
+                    or_(
+                        AIProviderIncidentModel.origin_instance_id == origin_instance_id,
+                        AIProviderIncidentModel.companion_instance_id == origin_instance_id,
+                    ),
+                )
+                .order_by(AIProviderIncidentModel.resolved_at.desc())
+                .limit(1)
+            )
+            existing_superseded = await session.scalar(stmt_superseded)
+            if existing_superseded and existing_superseded.resolved_at:
+                res_dt = existing_superseded.resolved_at.replace(tzinfo=None) if existing_superseded.resolved_at.tzinfo else existing_superseded.resolved_at
+                if att_dt <= res_dt:
+                    logger.info(
+                        "[AI Incident] Finished AI operation success for %s started at %s before rotation resolved_at %s. Ignoring stale success.",
+                        prov_norm,
+                        attempt_started_at,
+                        existing_superseded.resolved_at,
+                    )
+                    return False
+
         # Match active incidents for this exact resource scope
         stmt = select(AIProviderIncidentModel).where(
             AIProviderIncidentModel.origin_instance_id == origin_instance_id,
@@ -613,13 +646,32 @@ async def _record_ai_operation_success_impl(
         if not active_incidents:
             return False
 
+        # An active incident cannot be resolved by an attempt that was started before the incident occurred
+        filtered_incidents = []
+        for inc in active_incidents:
+            if attempt_started_at and inc.first_seen_at:
+                att_dt = attempt_started_at.replace(tzinfo=None) if attempt_started_at.tzinfo else attempt_started_at
+                inc_seen_dt = inc.first_seen_at.replace(tzinfo=None) if inc.first_seen_at.tzinfo else inc.first_seen_at
+                if att_dt < inc_seen_dt:
+                    logger.info(
+                        "[AI Incident] Active incident %s (first seen %s) cannot be resolved by earlier attempt started at %s.",
+                        inc.id,
+                        inc.first_seen_at,
+                        attempt_started_at,
+                    )
+                    continue
+            filtered_incidents.append(inc)
+
+        if not filtered_incidents:
+            return False
+
         admin_ids = (
             await resolve_target_admin_ids(companion_def, current_instance=source_def, session=session)
             if companion_def
             else ()
         )
 
-        for inc in active_incidents:
+        for inc in filtered_incidents:
             inc.status = "resolved"
             inc.resolved_at = now
             resolved_any = True
@@ -1200,6 +1252,10 @@ async def enqueue_terminal_ai_failure_notification(
                     parent_inc = await session.scalar(stmt_lock)
                     if not parent_inc:
                         logger.error("[AI Incident] Parent incident %s not found for terminal alert.", incident_id)
+                        return False
+
+                    if parent_inc.status == "superseded":
+                        logger.info("[AI Incident] Parent incident %s is superseded. Suppressing terminal alert.", incident_id)
                         return False
 
                     # Check true elapsed time since last terminal_failure notification on this incident

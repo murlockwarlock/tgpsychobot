@@ -3507,6 +3507,7 @@ async def test_ai_settings_changed_buttons_use_real_dispatcher_journeys(factory,
 
 @pytest.mark.asyncio
 async def test_telegram_ai_visible_button_contracts_use_complete_dispatcher_journeys(factory, admin_dispatcher, monkeypatch):
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_autobusbusbot_new")
     import admin_content_authoring
     import automation_admin
     import handlers

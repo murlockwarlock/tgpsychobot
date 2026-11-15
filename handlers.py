@@ -7609,11 +7609,22 @@ async def process_api_input(message: Message, state: FSMContext, bot: Bot):
             await message.answer("Ошибка авторизации экземпляра бота. Настройки не изменены.")
             await state.clear()
             return
+        except Exception as exc:
+            logging.error("Database transaction error during key rotation: %s", exc, exc_info=True)
+            await message.answer("Ошибка сохранения настроек. Попробуйте еще раз.")
+            await state.clear()
+            return
     else:
-        async with async_session_maker() as session:
-            stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
-            await session.execute(stmt)
-            await session.commit()
+        try:
+            async with async_session_maker() as session:
+                stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
+                await session.execute(stmt)
+                await session.commit()
+        except Exception as exc:
+            logging.error("Database transaction error during model update: %s", exc, exc_info=True)
+            await message.answer("Ошибка сохранения настроек. Попробуйте еще раз.")
+            await state.clear()
+            return
 
     await state.clear()
 
