@@ -241,9 +241,16 @@ class IncidentB1AttemptAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cooldown.should_send(diff_key))
 
         # Test alert formatting
+        from aiogram.types import User as TgUser
         bot = MagicMock()
+        bot.token = "8281390498:AAFtest_token_b1_1234567890"
+        bot.get_me = AsyncMock(return_value=TgUser(id=8281390498, is_bot=True, first_name="bot", username="someonewithyou01_bot"))
         bot.send_message = AsyncMock()
-        with patch("error_reporting.get_all_admin_ids", AsyncMock(return_value=[111])), \
+        with patch.dict(os.environ, {
+            "BOT_INSTANCE_ID": "tg_someonewithyou01_bot_new",
+            "BOT_TOKEN": "8281390498:AAFtest_token_b1_1234567890",
+        }), patch("error_reporting.get_all_admin_ids", AsyncMock(return_value=[111])), \
+             patch("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[111])), \
              patch("error_reporting._output_budget_cooldown.should_send", return_value=True):
             await send_output_budget_exhausted_alert(
                 bot=bot,

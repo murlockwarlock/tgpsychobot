@@ -1078,7 +1078,7 @@ async def send_output_budget_exhausted_alert(
 
     ai_log_str = f"#{ai_log_id}" if ai_log_id is not None and str(ai_log_id).isdigit() else (str(ai_log_id) if ai_log_id else "не зафиксирован")
 
-    title = f"⚠️ <b>[{platform_norm}] Исчерпан лимит токенов ({html.escape(request_type)})</b>\n\n"
+    title = f"⚠️ <b>[{platform_norm}] {html.escape(provider)} исчерпал output budget ({html.escape(request_type)})</b>\n\n"
     text = (
         f"{title}"
         f"Бот: <code>{html.escape(b_name)}</code>\n"
