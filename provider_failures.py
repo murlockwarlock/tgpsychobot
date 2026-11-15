@@ -386,12 +386,14 @@ def is_openai_image_size_incompatibility(failure: ProviderFailure | None) -> boo
 
 
 def normalize_exception(exception: Exception, provider: str = "", operation: str = "chat") -> ProviderFailure:
+    if isinstance(exception, ProviderFailure):
+        return exception
     chain, seen = [], set()
     item = exception
     while item is not None and id(item) not in seen:
         seen.add(id(item))
         chain.append(item)
-        item = item.__cause__
+        item = getattr(item, "__cause__", None)
     for item in chain:
         existing = getattr(item, "failure", None)
         if isinstance(existing, ProviderFailure):

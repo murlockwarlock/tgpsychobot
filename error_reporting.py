@@ -64,15 +64,17 @@ def _shorten(value: str, limit: int = 1400) -> str:
 
 def exception_chain(exception: Exception | None, *, include_context: bool = True) -> list[Exception]:
     """Return a finite outer-to-inner exception chain."""
+    if not isinstance(exception, BaseException):
+        return []
     chain: list[Exception] = []
     seen: set[int] = set()
     current = exception
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         chain.append(current)
-        current = current.__cause__
+        current = getattr(current, "__cause__", None)
         if current is None and include_context:
-            current = chain[-1].__context__
+            current = getattr(chain[-1], "__context__", None)
     return chain
 
 
@@ -481,6 +483,7 @@ async def notify_admins_about_error(
     exception: Exception | None = None,
     classification_override: str | None = None,
     classification: str | None = None,
+    classification_source: str | None = None,
     include_traceback: bool = True,
     logger: logging.Logger | None = None,
     level: int = logging.ERROR,
@@ -503,7 +506,7 @@ async def notify_admins_about_error(
             )
         root_summary = sanitize_secret_values(exception_summary(root_exception or exception))
 
-    if exception is not None and include_traceback:
+    if isinstance(exception, BaseException) and include_traceback:
         raw_trace = "".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
     else:
         raw_trace = ""
@@ -552,17 +555,65 @@ async def notify_admins_about_error(
     err_target = root_exception or exception
     err_type_name = type(err_target).__name__ if err_target is not None else ""
     is_infra_or_db_error = (
-        isinstance(err_target, (SQLAlchemyError, ConnectionError, OSError))
-        or any(k in err_type_name for k in ("OperationalError", "DatabaseError", "ProgrammingError", "IntegrityError", "InterfaceError"))
+        isinstance(
+            err_target,
+            (
+                SQLAlchemyError,
+                ConnectionError,
+                OSError,
+                TypeError,
+                KeyError,
+                AttributeError,
+                NameError,
+                UnboundLocalError,
+                IndexError,
+                ZeroDivisionError,
+                AssertionError,
+            ),
+        )
+        or any(
+            k in err_type_name
+            for k in (
+                "OperationalError",
+                "DatabaseError",
+                "ProgrammingError",
+                "IntegrityError",
+                "InterfaceError",
+                "InternalError",
+                "DataError",
+            )
+        )
     )
     is_internal_class = classification in {"application_internal", "unknown", None}
 
+    prov_failure = None
+    for cand in (exception, root_exception):
+        if isinstance(cand, ProviderFailure):
+            prov_failure = cand
+            break
+        cand_f = getattr(cand, "failure", None)
+        if isinstance(cand_f, ProviderFailure):
+            prov_failure = cand_f
+            break
+
+    effective_classification_source = classification_source or getattr(prov_failure, "classification_source", None)
+    has_verified_provider_failure = (
+        prov_failure is not None
+        and effective_classification_source in (
+            "provider_structured",
+            "http_status_fallback",
+            "transport",
+            "sdk_typed_exception",
+        )
+    )
+
     # Strict typed contract: handled AI notice ONLY for confirmed provider failures (retryable / operator quota)
+    # Explicit classification alone passed by caller NEVER proves normal provider failure.
     is_handled_ai = (
         not is_infra_or_db_error
         and not is_internal_class
-        and classification in (OPERATOR_CLASSES | RETRYABLE_CLASSES)
-        and (provider is not None or isinstance(getattr(exception, "failure", None), ProviderFailure))
+        and has_verified_provider_failure
+        and (prov_failure.classification in (OPERATOR_CLASSES | RETRYABLE_CLASSES))
     )
 
     if is_handled_ai:
@@ -806,6 +857,8 @@ async def send_terminal_ai_failure_alert(
     topic_name: str | None = None,
     username: str | None = None,
     full_name: str | None = None,
+    incident_id: int | None = None,
+    session_maker: Any = None,
 ) -> bool:
     """Send realtime terminal AI failure alert to Telegram admins with 30m cooldown."""
     if user is not None:
@@ -905,6 +958,50 @@ async def send_terminal_ai_failure_alert(
         f"{ai_log_line}"
     )
 
+    # 1. Attempt DB-backed durable outbox delivery with individual admin retry & persistent deduplication
+    try:
+        from ai_incident_manager import (
+            enqueue_terminal_ai_failure_notification,
+            process_ai_incident_notifications,
+            record_ai_provider_failure,
+        )
+        target_incident_id = incident_id
+        if target_incident_id is None:
+            err_for_inc = exception or Exception(err_msg_short or "Terminal AI failure")
+            target_inc = await record_ai_provider_failure(
+                origin_instance_id=None,
+                provider=primary_provider or provider or "unknown",
+                error=err_for_inc,
+                operation=request_type or "chat",
+                model=primary_model or model,
+                enqueue_notification=False,
+                force_operator_incident=True,
+                session_maker=session_maker,
+            )
+            if target_inc:
+                target_incident_id = target_inc.id
+
+        if target_incident_id is not None:
+            enqueued = await enqueue_terminal_ai_failure_notification(
+                incident_id=target_incident_id,
+                origin_instance_id=None,
+                text=text,
+                cooldown_seconds=1800,
+                session_maker=session_maker,
+            )
+            if enqueued:
+                if bot is not None:
+                    await process_ai_incident_notifications(bot, session_maker=session_maker)
+                return True
+            else:
+                # Suppressed by persistent DB cooldown
+                return False
+    except Exception as outbox_err:
+        logging.getLogger(__name__).warning("Terminal failure outbox delivery fallback: %s", outbox_err)
+
+    # 2. Fallback to direct delivery if outbox routing is unavailable
+    if not _terminal_failure_cooldown.should_send(fingerprint):
+        return False
     return await _dispatch_admin_alert_text(bot, text)
 
 
@@ -933,6 +1030,8 @@ async def send_output_budget_exhausted_alert(
     topic_name: str | None = None,
     username: str | None = None,
     full_name: str | None = None,
+    incident_id: int | None = None,
+    session_maker: Any = None,
 ) -> bool:
     """Send alert when AI provider exhausts output budget on tokens (30m cooldown)."""
     if user is not None:
@@ -1018,6 +1117,8 @@ async def send_ai_fallback_used_alert(
     topic_name: str | None = None,
     username: str | None = None,
     full_name: str | None = None,
+    incident_id: int | None = None,
+    session_maker: Any = None,
 ) -> bool:
     """Send realtime notification that reserve AI provider was used successfully."""
     if user is not None:

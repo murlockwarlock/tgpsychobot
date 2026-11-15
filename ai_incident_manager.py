@@ -31,7 +31,7 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramUnauthorizedError,
 )
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -202,6 +202,8 @@ async def record_ai_provider_failure(
     fallback_succeeded: bool = False,
     credential_scope: str | None = None,
     session_maker: Any = None,
+    enqueue_notification: bool = True,
+    force_operator_incident: bool = False,
 ) -> AIProviderIncidentModel | None:
     """
     Record an AI provider failure, opening or updating an active incident and enqueuing outbox events.
@@ -219,6 +221,8 @@ async def record_ai_provider_failure(
             fallback_succeeded=fallback_succeeded,
             credential_scope=credential_scope,
             session_maker=session_maker,
+            enqueue_notification=enqueue_notification,
+            force_operator_incident=force_operator_incident,
         )
     except Exception as exc:
         logger.warning("[AI Incident] Unexpected error recording failure for %s: %s", provider, exc)
@@ -236,18 +240,39 @@ async def _record_ai_provider_failure_impl(
     fallback_succeeded: bool = False,
     credential_scope: str | None = None,
     session_maker: Any = None,
+    enqueue_notification: bool = True,
+    force_operator_incident: bool = False,
 ) -> AIProviderIncidentModel | None:
     current_inst = detect_current_instance()
-    if not origin_instance_id:
-        if not current_inst:
-            logger.critical("[AI Incident] Fail-closed: cannot determine bot instance identity.")
-            return None
-        origin_instance_id = current_inst["pm2_name"]
-
-    source_def = get_instance_by_pm2_name(origin_instance_id) or current_inst
-    if not source_def:
-        logger.critical("[AI Incident] Fail-closed: origin_instance_id %r not in registry.", origin_instance_id)
+    if not current_inst:
+        logger.critical("[AI Incident] Fail-closed: cannot determine bot instance identity.")
         return None
+
+    if not origin_instance_id:
+        origin_instance_id = current_inst["pm2_name"]
+        source_def = current_inst
+    else:
+        source_def = get_instance_by_pm2_name(origin_instance_id)
+        if not source_def:
+            logger.critical("[AI Incident] Fail-closed: origin_instance_id %r not in registry.", origin_instance_id)
+            return None
+
+        # Verify origin belongs to calling instance or valid companion relation
+        is_same = (
+            source_def.get("pm2_name") == current_inst.get("pm2_name")
+            or source_def.get("bot_instance_id") == current_inst.get("bot_instance_id")
+        )
+        is_companion = (
+            source_def.get("companion_instance") in (current_inst.get("pm2_name"), current_inst.get("bot_instance_id"))
+            or current_inst.get("companion_instance") in (source_def.get("pm2_name"), source_def.get("bot_instance_id"))
+        )
+        if not (is_same or is_companion):
+            logger.critical(
+                "[AI Incident] Fail-closed: origin_instance_id %r does not belong to current instance %r and is not a valid companion.",
+                origin_instance_id,
+                current_inst.get("pm2_name"),
+            )
+            return None
 
     # Verify origin bot token consistency
     source_platform = source_def.get("platform")
@@ -293,8 +318,8 @@ async def _record_ai_provider_failure_impl(
         else normalize_exception(error, provider=provider, operation=operation)
     )
 
-    # Transient or non-operator failures do NOT create long-lived operator incidents
-    if not failure.operator_action_required:
+    # Transient or non-operator failures do NOT create long-lived operator incidents unless forced
+    if not failure.operator_action_required and not force_operator_incident:
         logger.info(
             "[AI Incident] Non-operator failure for %s (%s, %s): not creating operator incident.",
             provider,
@@ -318,8 +343,9 @@ async def _record_ai_provider_failure_impl(
     now = datetime.utcnow()
 
     async with sm() as session:
-        # If credential_scope not passed, compute from AIConfig
+        # If credential_scope not passed, log warning and compute from AIConfig
         if not credential_scope:
+            logger.warning("[AI Incident] Credential scope not passed for %s (%s); reading current AIConfig.", prov_norm, op_norm)
             from database import AIConfig
             ai_cfg = await session.get(AIConfig, 1)
             api_k = get_provider_api_key(ai_cfg, prov_norm)
@@ -393,7 +419,7 @@ async def _record_ai_provider_failure_impl(
 
         # 2. Enqueue notification event if newly opened or fallback_used
         event_type = "fallback_used" if fallback_succeeded else "opened"
-        if is_new or fallback_succeeded:
+        if enqueue_notification and (is_new or fallback_succeeded):
             admin_ids = await resolve_target_admin_ids(companion_def, current_instance=source_def, session=session)
             if admin_ids:
                 msg_text = _format_incident_message_text(
@@ -468,12 +494,35 @@ async def _record_ai_operation_success_impl(
     session_maker: Any = None,
 ) -> bool:
     current_inst = detect_current_instance()
-    if not origin_instance_id:
-        if not current_inst:
-            return False
-        origin_instance_id = current_inst["pm2_name"]
+    if not current_inst:
+        logger.critical("[AI Incident] Fail-closed: cannot determine bot instance identity for success recording.")
+        return False
 
-    source_def = get_instance_by_pm2_name(origin_instance_id) or current_inst
+    if not origin_instance_id:
+        origin_instance_id = current_inst["pm2_name"]
+        source_def = current_inst
+    else:
+        source_def = get_instance_by_pm2_name(origin_instance_id)
+        if not source_def:
+            logger.critical("[AI Incident] Fail-closed: origin_instance_id %r not in registry for success recording.", origin_instance_id)
+            return False
+
+        is_same = (
+            source_def.get("pm2_name") == current_inst.get("pm2_name")
+            or source_def.get("bot_instance_id") == current_inst.get("bot_instance_id")
+        )
+        is_companion = (
+            source_def.get("companion_instance") in (current_inst.get("pm2_name"), current_inst.get("bot_instance_id"))
+            or current_inst.get("companion_instance") in (source_def.get("pm2_name"), source_def.get("bot_instance_id"))
+        )
+        if not (is_same or is_companion):
+            logger.critical(
+                "[AI Incident] Fail-closed: origin_instance_id %r does not belong to current instance %r and is not a valid companion.",
+                origin_instance_id,
+                current_inst.get("pm2_name"),
+            )
+            return False
+
     companion_def = resolve_companion_telegram_instance(source_def) if source_def else None
     authorized_instance_id = companion_def["pm2_name"] if companion_def else origin_instance_id
 
@@ -606,6 +655,29 @@ async def _handle_key_rotation_impl(
     base_url: str | None = None,
     session_maker: Any = None,
 ) -> int:
+    current_inst = detect_current_instance()
+    if origin_instance_id:
+        source_def = get_instance_by_pm2_name(origin_instance_id)
+        if not source_def:
+            logger.critical("[AI Incident] Fail-closed: origin_instance_id %r not in registry for key rotation.", origin_instance_id)
+            return 0
+        if current_inst:
+            is_same = (
+                source_def.get("pm2_name") == current_inst.get("pm2_name")
+                or source_def.get("bot_instance_id") == current_inst.get("bot_instance_id")
+            )
+            is_companion = (
+                source_def.get("companion_instance") in (current_inst.get("pm2_name"), current_inst.get("bot_instance_id"))
+                or current_inst.get("companion_instance") in (source_def.get("pm2_name"), source_def.get("bot_instance_id"))
+            )
+            if not (is_same or is_companion):
+                logger.critical(
+                    "[AI Incident] Fail-closed: origin_instance_id %r not allowed from %r during key rotation.",
+                    origin_instance_id,
+                    current_inst.get("pm2_name"),
+                )
+                return 0
+
     prov_norm = provider.strip().upper()
     new_fp = get_provider_account_fingerprint(new_key, base_url)
     sm = session_maker or async_session_maker
@@ -848,6 +920,124 @@ async def resolve_low_credit_warning(
             return True
     except Exception as exc:
         logger.warning("[AI Incident] Failed to resolve low credit warning: %s", exc)
+        return False
+
+
+async def enqueue_terminal_ai_failure_notification(
+    incident_id: int,
+    origin_instance_id: str | None,
+    text: str,
+    cooldown_seconds: int = 1800,
+    session_maker: Any = None,
+) -> bool:
+    """
+    Enqueue a durable terminal AI failure notification for all Telegram admins.
+    - Dedupes against recent terminal_failure notifications for this incident within cooldown_seconds in DB.
+    - Creates separate outbox row for EACH valid Telegram admin.
+    - Ensures fail-closed instance identity and companion routing.
+    """
+    try:
+        current_inst = detect_current_instance()
+        if not current_inst:
+            logger.critical("[AI Incident] Fail-closed: cannot determine bot instance identity for terminal alert.")
+            return False
+
+        if not origin_instance_id:
+            origin_instance_id = current_inst["pm2_name"]
+            source_def = current_inst
+        else:
+            source_def = get_instance_by_pm2_name(origin_instance_id)
+            if not source_def:
+                logger.critical("[AI Incident] Fail-closed: origin_instance_id %r not in registry.", origin_instance_id)
+                return False
+
+            is_same = (
+                source_def.get("pm2_name") == current_inst.get("pm2_name")
+                or source_def.get("bot_instance_id") == current_inst.get("bot_instance_id")
+            )
+            is_companion = (
+                source_def.get("companion_instance") in (current_inst.get("pm2_name"), current_inst.get("bot_instance_id"))
+                or current_inst.get("companion_instance") in (source_def.get("pm2_name"), source_def.get("bot_instance_id"))
+            )
+            if not (is_same or is_companion):
+                logger.critical(
+                    "[AI Incident] Fail-closed: origin_instance_id %r not allowed from %r for terminal alert.",
+                    origin_instance_id,
+                    current_inst.get("pm2_name"),
+                )
+                return False
+
+        companion_def = resolve_companion_telegram_instance(source_def)
+        if not companion_def:
+            logger.error("[AI Incident] No companion Telegram instance found for %s. Dropping terminal alert.", origin_instance_id)
+            return False
+
+        authorized_instance_id = companion_def["pm2_name"]
+        sm = session_maker or async_session_maker
+        now = datetime.utcnow()
+        cooldown_threshold = now - timedelta(seconds=cooldown_seconds)
+
+        async with sm() as session:
+            # Check DB-backed deduplication / cooldown for this incident
+            recent_stmt = (
+                select(AIIncidentNotificationModel.id)
+                .where(
+                    AIIncidentNotificationModel.incident_id == incident_id,
+                    AIIncidentNotificationModel.event_type == "terminal_failure",
+                    AIIncidentNotificationModel.created_at >= cooldown_threshold,
+                )
+                .limit(1)
+            )
+            existing_recent = await session.scalar(recent_stmt)
+            if existing_recent is not None:
+                logger.info(
+                    "[AI Incident] Terminal failure alert for incident %s suppressed by DB cooldown (%ss).",
+                    incident_id,
+                    cooldown_seconds,
+                )
+                return False
+
+            admin_ids = await resolve_target_admin_ids(companion_def, current_instance=source_def, session=session)
+            if not admin_ids:
+                return False
+
+            max_cycle_stmt = select(func.max(AIIncidentNotificationModel.cycle_index)).where(
+                AIIncidentNotificationModel.incident_id == incident_id,
+                AIIncidentNotificationModel.event_type == "terminal_failure",
+            )
+            max_cycle = await session.scalar(max_cycle_stmt)
+            next_cycle = 0 if max_cycle is None else max_cycle + 1
+
+            enqueued_count = 0
+            for adm_id in admin_ids:
+                if not is_valid_telegram_user_id(adm_id):
+                    continue
+                notif = AIIncidentNotificationModel(
+                    incident_id=incident_id,
+                    event_type="terminal_failure",
+                    cycle_index=next_cycle,
+                    recipient_id=adm_id,
+                    authorized_instance_id=authorized_instance_id,
+                    message_text=text,
+                    status="pending",
+                    attempts=0,
+                    max_attempts=MAX_OUTBOX_ATTEMPTS,
+                    next_retry_at=now,
+                    created_at=now,
+                    updated_at=now,
+                )
+                try:
+                    async with session.begin_nested():
+                        session.add(notif)
+                        await session.flush()
+                    enqueued_count += 1
+                except IntegrityError:
+                    pass
+
+            await session.commit()
+            return enqueued_count > 0
+    except Exception as exc:
+        logger.error("[AI Incident] Failed to enqueue terminal failure notification: %s", exc)
         return False
 
 
