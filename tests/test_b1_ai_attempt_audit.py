@@ -194,12 +194,19 @@ class IncidentB1AttemptAuditTests(unittest.IsolatedAsyncioTestCase):
         gemini_err = AIServiceError("Gemini down")
         openai_err = AIServiceError("OpenAI quota exceeded")
 
+        from aiogram.types import User as TgUser
         bot = MagicMock()
+        bot.token = "8281390498:AAFtest_token_b1_1234567890"
+        bot.get_me = AsyncMock(return_value=TgUser(id=8281390498, is_bot=True, first_name="bot", username="someonewithyou01_bot"))
         bot.send_message = AsyncMock()
 
-        with patch("ai_integration._call_gemini_api", side_effect=gemini_err), \
+        with patch.dict(os.environ, {
+            "BOT_INSTANCE_ID": "tg_someonewithyou01_bot_new",
+            "BOT_TOKEN": "8281390498:AAFtest_token_b1_1234567890",
+        }), patch("ai_integration._call_gemini_api", side_effect=gemini_err), \
              patch("ai_integration._call_openai_api", side_effect=openai_err), \
-             patch("error_reporting.get_all_admin_ids", AsyncMock(return_value=[111, 222])), \
+             patch("error_reporting.get_all_admin_ids", AsyncMock(return_value=[272982544, 979514796])), \
+             patch("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[272982544, 979514796])), \
              patch("error_reporting._terminal_failure_cooldown.should_send", return_value=True):
             with self.assertRaises(AIServiceError):
                 await generate_response(user_id=9903, user_prompt="Question to fail", bot=bot)
