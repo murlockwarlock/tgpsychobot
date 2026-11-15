@@ -469,7 +469,10 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
         cls = "rate_limit"
     elif any(marker in fallback_text for marker in ("invalid api key", "authentication", "unauthorized", "status code 401")):
         cls = "auth"
-    elif any(marker in fallback_text for marker in ("quota", "credit", "billing", "status code 402")):
+    elif (
+        any(marker in fallback_text for marker in ("quota", "credit", "billing", "balance", "status code 402"))
+        or any(type(item).__name__ == "InsufficientBalanceError" for item in chain)
+    ):
         cls = "insufficient_balance_quota"
     elif any(marker in fallback_text for marker in ("configuration", "not configured", "api key for")):
         cls = "configuration"

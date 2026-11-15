@@ -203,6 +203,7 @@ async def record_ai_provider_failure(
     credential_scope: str | None = None,
     session_maker: Any = None,
     enqueue_notification: bool = True,
+    attempt_started_at: datetime | None = None,
 ) -> AIProviderIncidentModel | None:
     """
     Record an AI provider failure, opening or updating an active incident and enqueuing outbox events.
@@ -221,6 +222,7 @@ async def record_ai_provider_failure(
             credential_scope=credential_scope,
             session_maker=session_maker,
             enqueue_notification=enqueue_notification,
+            attempt_started_at=attempt_started_at,
         )
     except Exception as exc:
         logger.error("[AI Incident] Unexpected error recording failure for %s: %s", provider, exc, exc_info=True)
@@ -239,6 +241,7 @@ async def _record_ai_provider_failure_impl(
     credential_scope: str | None = None,
     session_maker: Any = None,
     enqueue_notification: bool = True,
+    attempt_started_at: datetime | None = None,
 ) -> AIProviderIncidentModel | None:
     current_inst = detect_current_instance()
     if not current_inst:
@@ -345,21 +348,26 @@ async def _record_ai_provider_failure_impl(
             credential_scope = current_active_scope or "unconfigured"
 
         # Check if this credential scope was already retired/superseded by a key rotation
-        stmt_superseded = select(AIProviderIncidentModel).where(
-            AIProviderIncidentModel.provider == prov_norm,
-            AIProviderIncidentModel.credential_scope == credential_scope,
-            AIProviderIncidentModel.status == "superseded",
-            or_(
-                AIProviderIncidentModel.origin_instance_id == origin_instance_id,
-                AIProviderIncidentModel.companion_instance_id == origin_instance_id,
-            ),
-        ).limit(1)
+        stmt_superseded = (
+            select(AIProviderIncidentModel)
+            .where(
+                AIProviderIncidentModel.provider == prov_norm,
+                AIProviderIncidentModel.credential_scope == credential_scope,
+                AIProviderIncidentModel.status == "superseded",
+                or_(
+                    AIProviderIncidentModel.origin_instance_id == origin_instance_id,
+                    AIProviderIncidentModel.companion_instance_id == origin_instance_id,
+                ),
+            )
+            .order_by(AIProviderIncidentModel.resolved_at.desc())
+            .limit(1)
+        )
         existing_superseded = await session.scalar(stmt_superseded)
 
         is_retired = False
         if existing_superseded is not None:
             # Check verified configuration lifecycle: if this credential_scope matches currently configured key,
-            # it was reactivated (A -> B -> A) and is no longer retired!
+            # it was reactivated (A -> B -> A) and may be active again.
             is_active_now = False
             if current_api_k:
                 if credential_scope in (
@@ -376,6 +384,17 @@ async def _record_ai_provider_failure_impl(
                     credential_scope,
                     current_active_scope,
                 )
+            elif attempt_started_at and existing_superseded.resolved_at:
+                # If this specific request was started BEFORE the key was rotated out at resolved_at,
+                # it belongs to the previous superseded generation and must NOT open a new incident.
+                if attempt_started_at <= existing_superseded.resolved_at:
+                    is_retired = True
+                    logger.info(
+                        "[AI Incident] Finished AI attempt for %s started at %s before rotation resolved_at %s. Preserving record as superseded.",
+                        prov_norm,
+                        attempt_started_at,
+                        existing_superseded.resolved_at,
+                    )
 
         if is_retired:
             target_status = "superseded"
@@ -667,10 +686,12 @@ async def handle_key_rotation(
     old_key: str | None = None,
     old_credential_scope: str | None = None,
     session_maker: Any = None,
+    session: AsyncSession | None = None,
 ) -> int:
     """
     Supersede active incidents when an API key is rotated in AIConfig, without false replenishment alerts.
     Supersedes across the database, ensuring Telegram and companion MAX instances in shared DB are both transitioned.
+    Supports running within an existing database transaction (pass session) or managing its own.
     """
     try:
         return await _handle_key_rotation_impl(
@@ -681,9 +702,12 @@ async def handle_key_rotation(
             old_key=old_key,
             old_credential_scope=old_credential_scope,
             session_maker=session_maker,
+            session=session,
         )
     except Exception as exc:
         logger.error("[AI Incident] Unexpected error in handle_key_rotation: %s", exc, exc_info=True)
+        if session is not None:
+            raise
         return 0
 
 
@@ -695,6 +719,7 @@ async def _handle_key_rotation_impl(
     old_key: str | None = None,
     old_credential_scope: str | None = None,
     session_maker: Any = None,
+    session: AsyncSession | None = None,
 ) -> int:
     current_inst = detect_current_instance()
     if not origin_instance_id:
@@ -729,7 +754,6 @@ async def _handle_key_rotation_impl(
     new_fp = get_provider_account_fingerprint(new_key, base_url)
     sm = session_maker or async_session_maker
     now = datetime.utcnow()
-    superseded_count = 0
 
     # Determine origin and companion instance names to avoid touching foreign bot incidents in shared DB
     companion_def = resolve_companion_telegram_instance(source_def) if source_def else None
@@ -738,39 +762,48 @@ async def _handle_key_rotation_impl(
         origin_names.update({companion_def.get("pm2_name"), companion_def.get("bot_instance_id")})
     origin_names.discard(None)
 
-    old_fp: str | None = None
+    old_fps: set[str] = set()
+    old_fp_passed = False
     if old_credential_scope:
-        old_fp = old_credential_scope
+        old_fps.add(old_credential_scope)
+        old_fp_passed = True
     elif old_key:
         old_b_url = base_url if prov_norm == "KIE" else None
-        old_fp = get_provider_account_fingerprint(old_key, old_b_url)
+        old_fps.add(get_provider_account_fingerprint(old_key, old_b_url))
+        old_fps.add(get_provider_account_fingerprint(old_key, None))
+        old_fp_passed = True
+    old_fps.discard("unconfigured")
+    old_fps.discard(new_fp)
 
-    async with sm() as session:
-        if not old_fp:
-            from database import AIConfig
-            ai_cfg = await session.get(AIConfig, 1)
-            old_k = get_provider_api_key(ai_cfg, prov_norm) if ai_cfg else None
-            old_b_url = getattr(ai_cfg, "kie_base_url", None) if (ai_cfg and prov_norm == "KIE") else None
-            old_fp = get_provider_account_fingerprint(old_k, old_b_url) if old_k else None
+    async def _execute_rotation(sess: AsyncSession) -> int:
+        nonlocal old_fps, old_fp_passed
+        superseded_count = 0
+        target_tombstones = set(old_fps)
 
-        # Supersede active incidents for this provider that belong ONLY to this bot instance or its companion
+        # Supersede active and transient incidents ONLY for the replaced credential scope
         stmt = select(AIProviderIncidentModel).where(
             AIProviderIncidentModel.provider == prov_norm,
-            AIProviderIncidentModel.credential_scope != new_fp,
-            AIProviderIncidentModel.status == "active",
+            AIProviderIncidentModel.status.in_(["active", "transient"]),
             or_(
                 AIProviderIncidentModel.origin_instance_id.in_(origin_names),
                 AIProviderIncidentModel.companion_instance_id.in_(origin_names),
             ),
         )
-        active_old = (await session.execute(stmt)).scalars().all()
+        if old_fp_passed and old_fps:
+            stmt = stmt.where(AIProviderIncidentModel.credential_scope.in_(old_fps))
+        else:
+            stmt = stmt.where(AIProviderIncidentModel.credential_scope != new_fp)
+
+        active_old = (await sess.execute(stmt)).scalars().all()
         for inc in active_old:
             inc.status = "superseded"
             inc.resolved_at = now
             superseded_count += 1
+            if inc.credential_scope and inc.credential_scope != new_fp:
+                target_tombstones.add(inc.credential_scope)
 
             # Cancel pending/processing notifications without sending alerts
-            await session.execute(
+            await sess.execute(
                 update(AIIncidentNotificationModel)
                 .where(
                     AIIncidentNotificationModel.incident_id == inc.id,
@@ -783,44 +816,50 @@ async def _handle_key_rotation_impl(
                 )
             )
 
-        # Clear any historical superseded records for new_fp so reactivated keys (A -> B -> A)
-        # start with a completely clean slate.
-        await session.execute(
-            delete(AIProviderIncidentModel).where(
-                AIProviderIncidentModel.provider == prov_norm,
-                AIProviderIncidentModel.credential_scope == new_fp,
-                AIProviderIncidentModel.status == "superseded",
-                or_(
-                    AIProviderIncidentModel.origin_instance_id.in_(origin_names),
-                    AIProviderIncidentModel.companion_instance_id.in_(origin_names),
-                ),
-            )
-        )
+        # If no tombstones were registered yet and caller didn't pass old key/scope,
+        # inspect AIConfig to check if a previously active key existed.
+        if not target_tombstones:
+            from database import AIConfig
+            ai_cfg = await sess.get(AIConfig, 1)
+            old_k = get_provider_api_key(ai_cfg, prov_norm) if ai_cfg else None
+            old_b_url = getattr(ai_cfg, "kie_base_url", None) if (ai_cfg and prov_norm == "KIE") else None
+            cfg_fp = get_provider_account_fingerprint(old_k, old_b_url) if old_k else None
+            if cfg_fp and cfg_fp != "unconfigured" and cfg_fp != new_fp:
+                target_tombstones.add(cfg_fp)
 
-        # Ensure a tombstone record exists for old_fp so concurrent in-flight failures
-        # are recognized as superseded and do not open a new active incident
-        if superseded_count == 0 and old_fp and old_fp != "unconfigured" and old_fp != new_fp:
+        # Ensure a tombstone record exists for old fingerprints so concurrent in-flight failures
+        # are recognized as superseded and do not open a new active incident.
+        # Historical superseded records are NEVER deleted (audit preserved).
+        for tomb_fp in target_tombstones:
+            if not tomb_fp or tomb_fp == "unconfigured" or tomb_fp == new_fp:
+                continue
             tomb_stmt = select(AIProviderIncidentModel).where(
                 AIProviderIncidentModel.provider == prov_norm,
-                AIProviderIncidentModel.credential_scope == old_fp,
+                AIProviderIncidentModel.credential_scope == tomb_fp,
                 AIProviderIncidentModel.status == "superseded",
                 AIProviderIncidentModel.origin_instance_id.in_(origin_names),
             ).limit(1)
-            tomb = await session.scalar(tomb_stmt)
+            tomb = await sess.scalar(tomb_stmt)
             if not tomb:
                 tomb = AIProviderIncidentModel(
                     origin_instance_id=source_def.get("pm2_name"),
                     companion_instance_id=companion_def.get("pm2_name") if companion_def else None,
                     provider=prov_norm,
-                    credential_scope=old_fp,
+                    credential_scope=tomb_fp,
                     operation="chat",
                     model_scope="*",
                     incident_type="key_rotated",
                     status="superseded",
                     occurrence_count=1,
+                    reminder_cycle=0,
+                    first_seen_at=now,
+                    last_seen_at=now,
+                    last_alerted_at=now,
                     resolved_at=now,
                 )
-                session.add(tomb)
+                sess.add(tomb)
+            else:
+                tomb.resolved_at = now
 
         if prov_norm == "KIE":
             # Reconcile kie_credit_alert_sent with whether new_fp has an active low_credit_warning for this bot
@@ -834,21 +873,27 @@ async def _handle_key_rotation_impl(
                     AIProviderIncidentModel.companion_instance_id.in_(origin_names),
                 ),
             )
-            has_active_warn = (await session.scalar(stmt_active_warn)) is not None
+            has_active_warn = (await sess.scalar(stmt_active_warn)) is not None
             from database import AIConfig
-            ai_cfg = await session.get(AIConfig, 1)
+            ai_cfg = await sess.get(AIConfig, 1)
             if ai_cfg and ai_cfg.kie_credit_alert_sent != has_active_warn:
                 ai_cfg.kie_credit_alert_sent = has_active_warn
 
-        await session.commit()
+        logger.info(
+            "[AI Incident] Key rotation for %s: superseded %d incidents (target tombstones=%s, new fp=%s).",
+            prov_norm,
+            superseded_count,
+            target_tombstones,
+            new_fp,
+        )
+        return superseded_count
 
-    logger.info(
-        "[AI Incident] Key rotation for %s: superseded %d active incidents (new fp=%s).",
-        prov_norm,
-        superseded_count,
-        new_fp,
-    )
-    return superseded_count
+    if session is not None:
+        return await _execute_rotation(session)
+    else:
+        async with sm() as sess:
+            async with sess.begin():
+                return await _execute_rotation(sess)
 
 
 async def record_low_credit_warning(
@@ -1093,59 +1138,77 @@ async def enqueue_terminal_ai_failure_notification(
         cooldown_threshold = now - timedelta(seconds=cooldown_seconds)
 
         async with sm() as session:
-            # Check DB-backed deduplication / cooldown for this incident
-            recent_stmt = (
-                select(AIIncidentNotificationModel.id)
-                .where(
+            async with session.begin():
+                # Lock parent incident row in DB to serialize concurrent callers
+                stmt_lock = (
+                    select(AIProviderIncidentModel)
+                    .where(AIProviderIncidentModel.id == incident_id)
+                    .with_for_update()
+                )
+                parent_inc = await session.scalar(stmt_lock)
+                if not parent_inc:
+                    logger.error("[AI Incident] Parent incident %s not found for terminal alert.", incident_id)
+                    return False
+
+                # Check true elapsed time since last terminal_failure notification on this incident
+                recent_stmt = (
+                    select(func.max(AIIncidentNotificationModel.created_at))
+                    .where(
+                        AIIncidentNotificationModel.incident_id == incident_id,
+                        AIIncidentNotificationModel.event_type == "terminal_failure",
+                    )
+                )
+                last_created_at = await session.scalar(recent_stmt)
+                if last_created_at is not None:
+                    elapsed = (now - last_created_at).total_seconds()
+                    if elapsed < cooldown_seconds:
+                        logger.info(
+                            "[AI Incident] Terminal failure alert for incident %s suppressed by DB cooldown (elapsed %.2fs < %ss).",
+                            incident_id,
+                            elapsed,
+                            cooldown_seconds,
+                        )
+                        return False
+
+                admin_ids = await resolve_target_admin_ids(companion_def, current_instance=source_def, session=session)
+                if not admin_ids:
+                    return False
+
+                max_cycle_stmt = select(func.max(AIIncidentNotificationModel.cycle_index)).where(
                     AIIncidentNotificationModel.incident_id == incident_id,
                     AIIncidentNotificationModel.event_type == "terminal_failure",
-                    AIIncidentNotificationModel.created_at >= cooldown_threshold,
                 )
-                .limit(1)
-            )
-            existing_recent = await session.scalar(recent_stmt)
-            if existing_recent is not None:
-                logger.info(
-                    "[AI Incident] Terminal failure alert for incident %s suppressed by DB cooldown (%ss).",
-                    incident_id,
-                    cooldown_seconds,
-                )
-                return False
+                max_cycle = await session.scalar(max_cycle_stmt)
+                next_cycle = 0 if max_cycle is None else max_cycle + 1
 
-            admin_ids = await resolve_target_admin_ids(companion_def, current_instance=source_def, session=session)
-            if not admin_ids:
-                return False
+                enqueued_count = 0
+                for adm_id in admin_ids:
+                    if not is_valid_telegram_user_id(adm_id):
+                        continue
+                    notif = AIIncidentNotificationModel(
+                        incident_id=incident_id,
+                        event_type="terminal_failure",
+                        cycle_index=next_cycle,
+                        recipient_id=adm_id,
+                        authorized_instance_id=authorized_instance_id,
+                        message_text=text,
+                        status="pending",
+                        attempts=0,
+                        max_attempts=MAX_OUTBOX_ATTEMPTS,
+                        next_retry_at=now,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    try:
+                        async with session.begin_nested():
+                            session.add(notif)
+                            await session.flush()
+                        enqueued_count += 1
+                    except IntegrityError:
+                        pass
 
-            cycle_idx = int(now.timestamp() // max(cooldown_seconds, 1))
-
-            enqueued_count = 0
-            for adm_id in admin_ids:
-                if not is_valid_telegram_user_id(adm_id):
-                    continue
-                notif = AIIncidentNotificationModel(
-                    incident_id=incident_id,
-                    event_type="terminal_failure",
-                    cycle_index=cycle_idx,
-                    recipient_id=adm_id,
-                    authorized_instance_id=authorized_instance_id,
-                    message_text=text,
-                    status="pending",
-                    attempts=0,
-                    max_attempts=MAX_OUTBOX_ATTEMPTS,
-                    next_retry_at=now,
-                    created_at=now,
-                    updated_at=now,
-                )
-                try:
-                    async with session.begin_nested():
-                        session.add(notif)
-                        await session.flush()
-                    enqueued_count += 1
-                except IntegrityError:
-                    pass
-
-            await session.commit()
-            return enqueued_count > 0
+                parent_inc.last_alerted_at = now
+                return enqueued_count > 0
     except Exception as exc:
         logger.error("[AI Incident] Failed to enqueue terminal failure notification: %s", exc, exc_info=True)
         return False

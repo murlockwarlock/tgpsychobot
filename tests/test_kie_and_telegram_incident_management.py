@@ -472,6 +472,7 @@ async def test_scenario_7_key_rotation_supersedes_incidents_without_false_alert(
         origin_instance_id="tg_bot_rot",
         provider="KIE",
         new_key="new_fresh_key",
+        old_credential_scope="old_fingerprint",
         session_maker=test_db_session_maker,
     )
     assert superseded == 1
@@ -4612,3 +4613,382 @@ async def test_real_postgresql_concurrent_transient_failure_and_terminal_alert(p
             )
         )).scalars().all()
         assert len(notifs) == 1
+
+
+@pytest.mark.asyncio
+async def test_admin_key_rotation_atomic_transaction_rollback_preserves_old_config(test_db_session_maker, monkeypatch):
+    """Blocker 1: Failure during rotation rolls back AIConfig update atomically in handlers.process_api_input."""
+    import handlers
+    from datetime import timezone
+    from aiogram import Dispatcher
+    from aiogram.fsm.storage.memory import MemoryStorage
+    from aiogram.types import CallbackQuery, Chat, Message, Update
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+
+    bot_token = "8224473896:AAFtest_token_veraveda"
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+    monkeypatch.setattr(handlers, "async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+    monkeypatch.setattr(handlers, "is_admin", AsyncMock(side_effect=lambda user_id: user_id == 777))
+
+    key_orig = "kie_original_key_111"
+    key_fail = "kie_failed_rotation_222"
+
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="KIE", kie_api_key=key_orig)
+            session.add(cfg)
+        else:
+            cfg.provider = "KIE"
+            cfg.kie_api_key = key_orig
+        await session.commit()
+
+    # Simulate handle_key_rotation raising an exception during the atomic transaction
+    async def mock_handle_rotation(*args, **kwargs):
+        raise RuntimeError("Simulated crash/DB failure during key rotation")
+
+    monkeypatch.setattr("ai_incident_manager.handle_key_rotation", mock_handle_rotation)
+
+    storage = MemoryStorage()
+    handlers.router._parent_router = None
+    dp = Dispatcher(storage=storage)
+    dp.include_router(handlers.router)
+
+    telegram_session = ValidatingTelegramSession()
+    bot = Bot(token=bot_token, session=telegram_session)
+    bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    admin_user = TgUser(id=777, is_bot=False, first_name="Admin", username="admin777")
+    admin_chat = Chat(id=777, type="private")
+    fsm_ctx = dp.fsm.get_context(bot=bot, user_id=777, chat_id=777)
+
+    # Set FSM state to editing KIE API key
+    await fsm_ctx.set_state(handlers.AdminStates.set_api_key)
+    await fsm_ctx.update_data(provider="KIE", settings_chat_id=777, settings_message_id=90)
+
+    # Admin sends new key
+    key_msg = Message(message_id=91, date=datetime.now(timezone.utc), chat=admin_chat, from_user=admin_user, text=key_fail)
+    with pytest.raises(RuntimeError, match="Simulated crash/DB failure"):
+        await dp.feed_update(bot, Update(update_id=501, message=key_msg))
+
+    # Assert: AIConfig was rolled back! Original key remains in DB!
+    async with test_db_session_maker() as session:
+        cfg_after = await session.get(AIConfig, 1)
+        assert cfg_after.kie_api_key == key_orig
+
+
+@pytest.mark.asyncio
+async def test_key_rotation_companion_shared_db_two_keys_isolation(test_db_session_maker, monkeypatch):
+    """Blocker 2: Rotating Telegram bot's key does NOT touch active incidents of MAX companion using a different key for the same provider."""
+    inst_tg = {"pm2_name": "tg_veraveda777_bot_legacy", "bot_instance_id": "tg_veraveda777_bot_legacy", "companion_instance": "max_se13639182_bot_legacy", "platform": "telegram", "admins": [777]}
+    inst_max = {"pm2_name": "max_se13639182_bot_legacy", "bot_instance_id": "max_se13639182_bot_legacy", "companion_instance": "tg_veraveda777_bot_legacy", "platform": "max"}
+
+    def mock_get_inst(name):
+        if name == "tg_veraveda777_bot_legacy": return inst_tg
+        if name == "max_se13639182_bot_legacy": return inst_max
+        return None
+
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", mock_get_inst)
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_tg)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[777]))
+
+    key_tg_1 = "kie_tg_key_111"
+    key_max_2 = "kie_max_key_222"
+    key_tg_3 = "kie_tg_key_333"
+
+    scope_tg = get_provider_account_fingerprint(key_tg_1, "https://api.kie.ai")
+    scope_max = get_provider_account_fingerprint(key_max_2, "https://api.kie.ai")
+
+    err = InsufficientBalanceError("KIE credits empty")
+    err.provider = "KIE"
+
+    # Incident 1 on Telegram bot with key 1
+    inc_tg = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=err,
+        operation="chat",
+        model="kie-v1",
+        credential_scope=scope_tg,
+        session_maker=test_db_session_maker,
+    )
+    # Incident 2 on MAX bot with key 2
+    inc_max = await record_ai_provider_failure(
+        origin_instance_id="max_se13639182_bot_legacy",
+        provider="KIE",
+        error=err,
+        operation="vision",
+        model="kie-vision",
+        credential_scope=scope_max,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_tg.status == "active"
+    assert inc_max.status == "active"
+
+    # Telegram rotates key 1 -> key 3
+    superseded = await handle_key_rotation(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        new_key=key_tg_3,
+        base_url="https://api.kie.ai",
+        old_key=key_tg_1,
+        session_maker=test_db_session_maker,
+    )
+    # Exactly Telegram's incident (key 1) was superseded!
+    assert superseded == 1
+
+    async with test_db_session_maker() as session:
+        inc_tg_db = await session.get(AIProviderIncidentModel, inc_tg.id)
+        inc_max_db = await session.get(AIProviderIncidentModel, inc_max.id)
+        assert inc_tg_db.status == "superseded"
+        # MAX bot's incident for key 2 remains completely ACTIVE!
+        assert inc_max_db.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_transient_terminal_alert_stale_skipped_after_key_rotation_retry(test_db_session_maker, monkeypatch):
+    """Blocker 3: Transient incident and pending terminal_failure alert are superseded on key rotation; retrying worker skips delivery."""
+    inst_def = {"pm2_name": "tg_veraveda777_bot_legacy", "platform": "telegram", "admins": [777]}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[777]))
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+
+    key_a = "key_transient_alpha_1"
+    key_b = "key_transient_beta_2"
+    scope_a = get_provider_account_fingerprint(key_a, None)
+
+    # 1. Non-operator failure (transient) on key A
+    class GatewayTimeout(Exception): pass
+    inc_trans = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=GatewayTimeout("Gateway 504"),
+        operation="chat",
+        model="gpt-4o",
+        credential_scope=scope_a,
+        session_maker=test_db_session_maker,
+        enqueue_notification=False,
+    )
+    assert inc_trans.status == "transient"
+
+    # Enqueue terminal alert
+    enq_ok = await enqueue_terminal_ai_failure_notification(
+        incident_id=inc_trans.id,
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        text="🚨 Transient terminal alert",
+        cooldown_seconds=1800,
+        session_maker=test_db_session_maker,
+    )
+    assert enq_ok is True
+
+    # 2. Worker attempts delivery, encounters temporary rate limit -> status stays pending with retry
+    from aiogram.exceptions import TelegramRetryAfter
+    bot = AsyncMock(spec=Bot)
+    bot.token = "8224473896:AAFtest_token_veraveda"
+    bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+    bot.send_message = AsyncMock(side_effect=TelegramRetryAfter(method=None, message="Rate limit", retry_after=10))
+
+    delivered = await process_ai_incident_notifications(bot=bot, session_maker=test_db_session_maker)
+    assert delivered == 0
+
+    # 3. Admin rotates key A -> key B
+    await handle_key_rotation(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        new_key=key_b,
+        old_key=key_a,
+        session_maker=test_db_session_maker,
+    )
+
+    # Assert: transient incident is superseded and pending notification cancelled!
+    async with test_db_session_maker() as session:
+        inc_check = await session.get(AIProviderIncidentModel, inc_trans.id)
+        assert inc_check.status == "superseded"
+
+        notif = (await session.execute(select(AIIncidentNotificationModel))).scalar_one()
+        assert notif.status == "cancelled"
+        assert notif.last_error == "superseded_by_key_rotation"
+
+        # Simulate a race where a notification remained pending (e.g. lease timeout or missed lock)
+        notif.status = "pending"
+        notif.next_retry_at = datetime.utcnow() - timedelta(seconds=1)
+        await session.commit()
+
+    # 4. Outbox worker retries delivery, finds parent incident superseded -> skipped_stale
+    bot.send_message = AsyncMock(return_value=True)
+    delivered_retry = await process_ai_incident_notifications(bot=bot, session_maker=test_db_session_maker)
+    assert delivered_retry == 0  # Did NOT send alert!
+    assert bot.send_message.call_count == 0
+
+    async with test_db_session_maker() as session:
+        notif_after = (await session.execute(select(AIIncidentNotificationModel))).scalar_one()
+        assert notif_after.status == "skipped_stale"
+        assert notif_after.last_error == "incident_superseded_before_send"
+
+
+@pytest.mark.asyncio
+async def test_key_rotation_a_b_a_preserves_history_and_separates_old_inflight(test_db_session_maker, monkeypatch):
+    """Blocker 5: A -> B -> A preserves historical superseded records and delivery audit; old in-flight request started before rotation is marked superseded."""
+    inst_def = {"pm2_name": "tg_veraveda777_bot_legacy", "platform": "telegram", "admins": [777]}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[777]))
+
+    key_a = "key_preservation_alpha"
+    key_b = "key_preservation_beta"
+    scope_a = get_provider_account_fingerprint(key_a, None)
+
+    # Step 1: Initial config Key A
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="OpenAI", openai_api_key=key_a)
+            session.add(cfg)
+        else:
+            cfg.provider = "OpenAI"
+            cfg.openai_api_key = key_a
+        await session.commit()
+
+    t_r1_start = datetime.utcnow() - timedelta(seconds=15)
+    err = InsufficientBalanceError("KIE credits empty on A")
+    err.provider = "OpenAI"
+
+    # Incident opens on Key A
+    inc_a1 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=err,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope=scope_a,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_a1.status == "active"
+
+    # Step 2: Rotate to Key B
+    await handle_key_rotation(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        new_key=key_b,
+        old_key=key_a,
+        session_maker=test_db_session_maker,
+    )
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.openai_api_key = key_b
+        await session.commit()
+
+    # Step 3: Rotate back to Key A (A -> B -> A)
+    await handle_key_rotation(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        new_key=key_a,
+        old_key=key_b,
+        session_maker=test_db_session_maker,
+    )
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.openai_api_key = key_a
+        await session.commit()
+
+    # Assert: Historical superseded incident and notifications for Key A STILL EXIST (audit preserved!)
+    async with test_db_session_maker() as session:
+        inc_old = await session.get(AIProviderIncidentModel, inc_a1.id)
+        assert inc_old is not None
+        assert inc_old.status == "superseded"
+
+    # Step 4: Old request R1 (started at t_r1_start before rotation) finishes NOW with error
+    inc_r1 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=err,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope=scope_a,
+        attempt_started_at=t_r1_start,
+        session_maker=test_db_session_maker,
+    )
+    # Recorded as superseded, zero active incidents
+    assert inc_r1.status == "superseded"
+
+    # Step 5: New request R2 (started NOW on reactivated Key A) fails
+    t_r2_start = datetime.utcnow()
+    inc_r2 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=err,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope=scope_a,
+        attempt_started_at=t_r2_start,
+        session_maker=test_db_session_maker,
+    )
+    # Recorded as ACTIVE!
+    assert inc_r2.status == "active"
+    assert inc_r2.id != inc_a1.id
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_concurrent_terminal_failure_dedup_boundary_transactions(pg_test_session_maker, monkeypatch):
+    """Blocker 4: Concurrent transactions in PostgreSQL across cooldown boundary serialize via with_for_update; exactly one alert enqueued."""
+    bot_token = "8281390498:AAFtest_telegram_token_boundary"
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", bot_token)
+
+    inst_def = {"pm2_name": "tg_someonewithyou01_bot_new", "platform": "telegram", "platform_id": 8281390498, "admins": [1001], "username": "someonewithyou01_bot"}
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: inst_def)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[1001]))
+
+    scope = get_provider_account_fingerprint("pg_test_boundary_key", None)
+    class Timeout504(Exception): pass
+
+    inc = await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="OpenAI",
+        error=Timeout504("Gateway 504"),
+        operation="chat",
+        model="gpt-4o",
+        credential_scope=scope,
+        session_maker=pg_test_session_maker,
+        enqueue_notification=False,
+    )
+    assert inc is not None
+
+    # Two concurrent transactions in PostgreSQL
+    res1, res2 = await asyncio.gather(
+        enqueue_terminal_ai_failure_notification(
+            incident_id=inc.id,
+            origin_instance_id="tg_someonewithyou01_bot_new",
+            text="Boundary alert A",
+            cooldown_seconds=1800,
+            session_maker=pg_test_session_maker,
+        ),
+        enqueue_terminal_ai_failure_notification(
+            incident_id=inc.id,
+            origin_instance_id="tg_someonewithyou01_bot_new",
+            text="Boundary alert B",
+            cooldown_seconds=1800,
+            session_maker=pg_test_session_maker,
+        ),
+    )
+    assert (res1, res2) in [(True, False), (False, True)]
+
+    # Exactly 1 row in PostgreSQL
+    async with pg_test_session_maker() as session:
+        notifs = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.incident_id == inc.id,
+                AIIncidentNotificationModel.event_type == "terminal_failure",
+            )
+        )).scalars().all()
+        assert len(notifs) == 1
+        assert notifs[0].cycle_index == 0

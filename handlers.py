@@ -7582,36 +7582,32 @@ async def process_api_input(message: Message, state: FSMContext, bot: Bot):
         await message.answer("Недопустимый провайдер. Настройки не изменены.")
         return
 
-    old_key = None
-    b_url = None
     if is_key:
+        from ai_incident_manager import handle_key_rotation
         async with async_session_maker() as session:
-            cfg_now = await session.get(AIConfig, 1)
-            if cfg_now:
-                old_key = getattr(cfg_now, column_name, None)
-                if provider.upper() == "KIE":
+            async with session.begin():
+                cfg_now = await session.get(AIConfig, 1)
+                old_key = getattr(cfg_now, column_name, None) if cfg_now else None
+                b_url = None
+                if provider.upper() == "KIE" and cfg_now:
                     b_url = getattr(cfg_now, "kie_base_url", None)
-            stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
-            await session.execute(stmt)
-            await session.commit()
+                stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
+                await session.execute(stmt)
+
+                if value:
+                    await handle_key_rotation(
+                        origin_instance_id=None,
+                        provider=provider,
+                        new_key=value,
+                        base_url=b_url,
+                        old_key=old_key,
+                        session=session,
+                    )
     else:
         async with async_session_maker() as session:
             stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
             await session.execute(stmt)
             await session.commit()
-
-    if is_key and value:
-        try:
-            from ai_incident_manager import handle_key_rotation
-            await handle_key_rotation(
-                origin_instance_id=None,
-                provider=provider,
-                new_key=value,
-                base_url=b_url,
-                old_key=old_key,
-            )
-        except Exception as rot_exc:
-            logging.warning("Failed to rotate key incidents for %s: %s", provider, rot_exc)
 
     await state.clear()
 
