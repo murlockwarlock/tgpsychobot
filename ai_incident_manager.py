@@ -15,6 +15,7 @@ Enforces the canonical lifecycle for AI provider incidents across Psychobot inst
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import logging
@@ -1083,6 +1084,21 @@ async def resolve_low_credit_warning(
         return False
 
 
+_enqueue_locks: dict[int, asyncio.Lock] = {}
+_enqueue_lock_guard = asyncio.Lock()
+
+
+async def _get_incident_enqueue_lock(incident_id: int) -> asyncio.Lock:
+    async with _enqueue_lock_guard:
+        if len(_enqueue_locks) > 2000:
+            _enqueue_locks.clear()
+        lock = _enqueue_locks.get(incident_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _enqueue_locks[incident_id] = lock
+        return lock
+
+
 async def enqueue_terminal_ai_failure_notification(
     incident_id: int,
     origin_instance_id: str | None,
@@ -1134,81 +1150,82 @@ async def enqueue_terminal_ai_failure_notification(
 
         authorized_instance_id = companion_def["pm2_name"]
         sm = session_maker or async_session_maker
-        now = datetime.utcnow()
-        cooldown_threshold = now - timedelta(seconds=cooldown_seconds)
+        inc_lock = await _get_incident_enqueue_lock(incident_id)
 
-        async with sm() as session:
-            async with session.begin():
-                # Lock parent incident row in DB to serialize concurrent callers
-                stmt_lock = (
-                    select(AIProviderIncidentModel)
-                    .where(AIProviderIncidentModel.id == incident_id)
-                    .with_for_update()
-                )
-                parent_inc = await session.scalar(stmt_lock)
-                if not parent_inc:
-                    logger.error("[AI Incident] Parent incident %s not found for terminal alert.", incident_id)
-                    return False
+        async with inc_lock:
+            now = datetime.utcnow()
+            async with sm() as session:
+                async with session.begin():
+                    # Lock parent incident row in DB to serialize concurrent callers across processes
+                    stmt_lock = (
+                        select(AIProviderIncidentModel)
+                        .where(AIProviderIncidentModel.id == incident_id)
+                        .with_for_update()
+                    )
+                    parent_inc = await session.scalar(stmt_lock)
+                    if not parent_inc:
+                        logger.error("[AI Incident] Parent incident %s not found for terminal alert.", incident_id)
+                        return False
 
-                # Check true elapsed time since last terminal_failure notification on this incident
-                recent_stmt = (
-                    select(func.max(AIIncidentNotificationModel.created_at))
-                    .where(
+                    # Check true elapsed time since last terminal_failure notification on this incident
+                    recent_stmt = (
+                        select(func.max(AIIncidentNotificationModel.created_at))
+                        .where(
+                            AIIncidentNotificationModel.incident_id == incident_id,
+                            AIIncidentNotificationModel.event_type == "terminal_failure",
+                        )
+                    )
+                    last_created_at = await session.scalar(recent_stmt)
+                    if last_created_at is not None:
+                        elapsed = (now - last_created_at).total_seconds()
+                        if elapsed < cooldown_seconds:
+                            logger.info(
+                                "[AI Incident] Terminal failure alert for incident %s suppressed by DB cooldown (elapsed %.2fs < %ss).",
+                                incident_id,
+                                elapsed,
+                                cooldown_seconds,
+                            )
+                            return False
+
+                    admin_ids = await resolve_target_admin_ids(companion_def, current_instance=source_def, session=session)
+                    if not admin_ids:
+                        return False
+
+                    max_cycle_stmt = select(func.max(AIIncidentNotificationModel.cycle_index)).where(
                         AIIncidentNotificationModel.incident_id == incident_id,
                         AIIncidentNotificationModel.event_type == "terminal_failure",
                     )
-                )
-                last_created_at = await session.scalar(recent_stmt)
-                if last_created_at is not None:
-                    elapsed = (now - last_created_at).total_seconds()
-                    if elapsed < cooldown_seconds:
-                        logger.info(
-                            "[AI Incident] Terminal failure alert for incident %s suppressed by DB cooldown (elapsed %.2fs < %ss).",
-                            incident_id,
-                            elapsed,
-                            cooldown_seconds,
+                    max_cycle = await session.scalar(max_cycle_stmt)
+                    next_cycle = 0 if max_cycle is None else max_cycle + 1
+
+                    enqueued_count = 0
+                    for adm_id in admin_ids:
+                        if not is_valid_telegram_user_id(adm_id):
+                            continue
+                        notif = AIIncidentNotificationModel(
+                            incident_id=incident_id,
+                            event_type="terminal_failure",
+                            cycle_index=next_cycle,
+                            recipient_id=adm_id,
+                            authorized_instance_id=authorized_instance_id,
+                            message_text=text,
+                            status="pending",
+                            attempts=0,
+                            max_attempts=MAX_OUTBOX_ATTEMPTS,
+                            next_retry_at=now,
+                            created_at=now,
+                            updated_at=now,
                         )
-                        return False
+                        try:
+                            async with session.begin_nested():
+                                session.add(notif)
+                                await session.flush()
+                            enqueued_count += 1
+                        except IntegrityError:
+                            pass
 
-                admin_ids = await resolve_target_admin_ids(companion_def, current_instance=source_def, session=session)
-                if not admin_ids:
-                    return False
-
-                max_cycle_stmt = select(func.max(AIIncidentNotificationModel.cycle_index)).where(
-                    AIIncidentNotificationModel.incident_id == incident_id,
-                    AIIncidentNotificationModel.event_type == "terminal_failure",
-                )
-                max_cycle = await session.scalar(max_cycle_stmt)
-                next_cycle = 0 if max_cycle is None else max_cycle + 1
-
-                enqueued_count = 0
-                for adm_id in admin_ids:
-                    if not is_valid_telegram_user_id(adm_id):
-                        continue
-                    notif = AIIncidentNotificationModel(
-                        incident_id=incident_id,
-                        event_type="terminal_failure",
-                        cycle_index=next_cycle,
-                        recipient_id=adm_id,
-                        authorized_instance_id=authorized_instance_id,
-                        message_text=text,
-                        status="pending",
-                        attempts=0,
-                        max_attempts=MAX_OUTBOX_ATTEMPTS,
-                        next_retry_at=now,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                    try:
-                        async with session.begin_nested():
-                            session.add(notif)
-                            await session.flush()
-                        enqueued_count += 1
-                    except IntegrityError:
-                        pass
-
-                parent_inc.last_alerted_at = now
-                return enqueued_count > 0
+                    parent_inc.last_alerted_at = now
+                    return enqueued_count > 0
     except Exception as exc:
         logger.error("[AI Incident] Failed to enqueue terminal failure notification: %s", exc, exc_info=True)
         return False
