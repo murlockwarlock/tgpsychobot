@@ -7583,26 +7583,32 @@ async def process_api_input(message: Message, state: FSMContext, bot: Bot):
         return
 
     if is_key:
-        from ai_incident_manager import handle_key_rotation
-        async with async_session_maker() as session:
-            async with session.begin():
-                cfg_now = await session.get(AIConfig, 1)
-                old_key = getattr(cfg_now, column_name, None) if cfg_now else None
-                b_url = None
-                if provider.upper() == "KIE" and cfg_now:
-                    b_url = getattr(cfg_now, "kie_base_url", None)
-                stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
-                await session.execute(stmt)
+        from ai_incident_manager import IncidentSecurityError, handle_key_rotation
+        try:
+            async with async_session_maker() as session:
+                async with session.begin():
+                    cfg_now = await session.get(AIConfig, 1)
+                    old_key = getattr(cfg_now, column_name, None) if cfg_now else None
+                    b_url = None
+                    if provider.upper() == "KIE" and cfg_now:
+                        b_url = getattr(cfg_now, "kie_base_url", None)
+                    stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
+                    await session.execute(stmt)
 
-                if value:
-                    await handle_key_rotation(
-                        origin_instance_id=None,
-                        provider=provider,
-                        new_key=value,
-                        base_url=b_url,
-                        old_key=old_key,
-                        session=session,
-                    )
+                    if value:
+                        await handle_key_rotation(
+                            origin_instance_id=None,
+                            provider=provider,
+                            new_key=value,
+                            base_url=b_url,
+                            old_key=old_key,
+                            session=session,
+                        )
+        except IncidentSecurityError as sec_err:
+            logging.error("Security/identity validation failed during key rotation: %s", sec_err)
+            await message.answer("Ошибка авторизации экземпляра бота. Настройки не изменены.")
+            await state.clear()
+            return
     else:
         async with async_session_maker() as session:
             stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})

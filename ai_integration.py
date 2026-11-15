@@ -1872,13 +1872,14 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
             api_key = ai_config.openai_api_key
             if not api_key:
                 raise AIServiceError(f"API ключ для {provider} (для транскрибации) не установлен администратором.")
+            attempt_started_at = datetime.utcnow()
             try:
                 response_text = await _call_openai_transcribe(api_key, file_bytes, filename)
                 from ai_incident_manager import get_provider_account_fingerprint, record_ai_operation_success
                 await record_ai_operation_success(None, "OpenAI", get_provider_account_fingerprint(api_key), "transcription", "whisper-1")
             except Exception as oai_err:
                 from ai_incident_manager import get_provider_account_fingerprint, record_ai_provider_failure
-                await record_ai_provider_failure(None, "OpenAI", oai_err, "transcription", model="whisper-1", credential_scope=get_provider_account_fingerprint(api_key))
+                await record_ai_provider_failure(None, "OpenAI", oai_err, "transcription", model="whisper-1", credential_scope=get_provider_account_fingerprint(api_key), attempt_started_at=attempt_started_at)
                 raise
 
         elif provider == "Gemini":
@@ -1886,13 +1887,14 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
             model = get_default_model(PROVIDER_GEMINI, channel="transcription")
             if not api_key:
                 raise AIServiceError(f"API ключ для {provider} (для транскрибации) не установлен администратором.")
+            attempt_started_at = datetime.utcnow()
             try:
                 response_text = await _call_gemini_transcribe(api_key, model, file_bytes, filename)
                 from ai_incident_manager import get_provider_account_fingerprint, record_ai_operation_success
                 await record_ai_operation_success(None, "Gemini", get_provider_account_fingerprint(api_key), "transcription", model)
             except Exception as gem_err:
                 from ai_incident_manager import get_provider_account_fingerprint, record_ai_provider_failure
-                await record_ai_provider_failure(None, "Gemini", gem_err, "transcription", model=model, credential_scope=get_provider_account_fingerprint(api_key))
+                await record_ai_provider_failure(None, "Gemini", gem_err, "transcription", model=model, credential_scope=get_provider_account_fingerprint(api_key), attempt_started_at=attempt_started_at)
                 raise
         elif provider == "KIE":
             api_key = ai_config.kie_api_key
@@ -1900,6 +1902,7 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
             if not api_key:
                 raise AIServiceError(f"API ключ для {provider} (для транскрибации) не установлен администратором.")
             kie_ok = False
+            kie_started_at = datetime.utcnow()
             try:
                 response_text = await _call_kie_transcribe(
                     api_key,
@@ -1916,7 +1919,7 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
                 if not openai_api_key:
                     try:
                         from ai_incident_manager import record_ai_provider_failure
-                        await record_ai_provider_failure(None, "KIE", kie_exc, "transcription", model=model, credential_scope=kie_fp)
+                        await record_ai_provider_failure(None, "KIE", kie_exc, "transcription", model=model, credential_scope=kie_fp, attempt_started_at=kie_started_at)
                     except Exception as inc_exc:
                         logging.warning("Failed to record KIE transcription failure: %s", inc_exc)
                     raise
@@ -1926,6 +1929,7 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
                     model,
                 )
                 fb_ok = False
+                fb_started_at = datetime.utcnow()
                 try:
                     response_text = await _call_openai_transcribe(openai_api_key, file_bytes, filename)
                     fb_ok = True
@@ -1937,10 +1941,12 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
                             None, "KIE", kie_exc, "transcription", model=model,
                             fallback_provider="OpenAI", fallback_model="whisper-1", fallback_succeeded=False,
                             credential_scope=kie_fp,
+                            attempt_started_at=kie_started_at,
                         )
                         await record_ai_provider_failure(
                             None, "OpenAI", fallback_exc, "transcription", model="whisper-1",
                             credential_scope=oai_fp,
+                            attempt_started_at=fb_started_at,
                         )
                     except Exception as inc_exc:
                         logging.warning("Failed to record transcription failures: %s", inc_exc)
@@ -1966,6 +1972,7 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
                             None, "KIE", kie_exc, "transcription", model=model,
                             fallback_provider="OpenAI", fallback_model="whisper-1", fallback_succeeded=True,
                             credential_scope=kie_fp,
+                            attempt_started_at=kie_started_at,
                         )
                         await record_ai_operation_success(
                             None, "OpenAI", oai_fp, "transcription", "whisper-1",
@@ -1985,13 +1992,14 @@ async def transcribe_voice_message(file_bytes: bytes, filename: str) -> str:
         elif provider == PROVIDER_DEEPGRAM:
             api_key = getattr(ai_config, "deepgram_api_key", None)
             model = getattr(ai_config, "deepgram_model", None) or DEEPGRAM_DEFAULT_MODEL
+            attempt_started_at = datetime.utcnow()
             try:
                 response_text = await call_deepgram(api_key, file_bytes, filename, model=model)
                 from ai_incident_manager import get_provider_account_fingerprint, record_ai_operation_success
                 await record_ai_operation_success(None, "Deepgram", get_provider_account_fingerprint(api_key), "transcription", model)
             except ProviderAdapterError as exc:
                 from ai_incident_manager import get_provider_account_fingerprint, record_ai_provider_failure
-                await record_ai_provider_failure(None, "Deepgram", exc, "transcription", model=model, credential_scope=get_provider_account_fingerprint(api_key))
+                await record_ai_provider_failure(None, "Deepgram", exc, "transcription", model=model, credential_scope=get_provider_account_fingerprint(api_key), attempt_started_at=attempt_started_at)
                 raise _wrap_provider_adapter_error(exc) from exc
 
         else:
@@ -2383,6 +2391,7 @@ async def get_ai_response(
         latency_ms = 0
 
         primary_start = time.monotonic()
+        primary_started_at = datetime.utcnow()
         primary_succeeded = False
         try:
             if primary_config_error is not None:
@@ -2521,6 +2530,7 @@ async def get_ai_response(
                         fallback_model=fb_model if allow_fallback else None,
                         fallback_succeeded=False,
                         credential_scope=prim_cred_scope,
+                        attempt_started_at=primary_started_at,
                     )
                 except Exception as rec_err:
                     logging.warning("Failed to record AI provider failure: %s", rec_err)
@@ -2683,6 +2693,7 @@ async def get_ai_response(
                 f"falling back to '{fb_provider}' / '{fb_model}'"
             )
             fallback_start = time.monotonic()
+            fallback_started_at = datetime.utcnow()
             try:
                 response_text = await _dispatch_call(fb_key, fb_api_key, fb_model, fallback_capture)
                 fallback_latency = int((time.monotonic() - fallback_start) * 1000)
@@ -2744,6 +2755,7 @@ async def get_ai_response(
                         fallback_model=fb_mod,
                         fallback_succeeded=True,
                         credential_scope=prim_cred_scope,
+                        attempt_started_at=primary_started_at,
                     )
                     fb_b_url = _get_kie_base_url(ai_config) if fb_prov == "KIE" else None
                     await record_ai_operation_success(
@@ -2819,6 +2831,7 @@ async def get_ai_response(
                         fallback_succeeded=False,
                         credential_scope=prim_cred_scope,
                         enqueue_notification=False,
+                        attempt_started_at=primary_started_at,
                     )
                     inc_fb = await record_ai_provider_failure(
                         None,
@@ -2829,6 +2842,7 @@ async def get_ai_response(
                         fallback_succeeded=False,
                         credential_scope=fb_cred_scope,
                         enqueue_notification=False,
+                        attempt_started_at=fallback_started_at,
                     )
                 except Exception as rec_err:
                     logging.warning("Failed to record AI fallback failure: %s", rec_err)
@@ -3227,6 +3241,7 @@ async def generate_image(prompt: str) -> any:
     gen_model = model
     gen_api_key = None
     gen_base_url = None
+    gen_started_at = datetime.utcnow()
     try:
         if provider_key == 'gemini':
             ensure_model_available(PROVIDER_GEMINI, model, channel="image_gen")
@@ -3260,6 +3275,7 @@ async def generate_image(prompt: str) -> any:
                 "image_generation",
                 model=model,
                 credential_scope=get_provider_account_fingerprint(gen_api_key, gen_base_url),
+                attempt_started_at=gen_started_at,
             )
         except Exception as inc_exc:
             logging.warning("Failed to record image generation failure: %s", inc_exc)
@@ -3295,6 +3311,7 @@ async def edit_image(prompt: str, image_bytes: bytes) -> bytes:
     edit_model = model
     edit_api_key = None
     edit_base_url = None
+    edit_started_at = datetime.utcnow()
     try:
         if provider_key == "gemini":
             ensure_model_available(PROVIDER_GEMINI, model, channel="image_edit")
@@ -3332,6 +3349,7 @@ async def edit_image(prompt: str, image_bytes: bytes) -> bytes:
                 "image_edit",
                 model=model,
                 credential_scope=get_provider_account_fingerprint(edit_api_key, edit_base_url),
+                attempt_started_at=edit_started_at,
             )
         except Exception as inc_exc:
             logging.warning("Failed to record image edit failure: %s", inc_exc)
@@ -4179,6 +4197,7 @@ async def analyze_image_content(
     last_failed_model: str = primary_target_model
     last_failed_budget: int = 4096 if primary_provider == "KIE" else get_provider_vision_max_tokens(primary_provider, primary_target_model)
     success_result: str | None = None
+    prim_started_at = datetime.utcnow()
 
     if primary_provider == "KIE":
         uploaded_file_url = None
@@ -4543,6 +4562,7 @@ async def analyze_image_content(
                 fallback_model=eff_fallback_model if eff_allow_fallback else None,
                 fallback_succeeded=False,
                 credential_scope=prim_cred_scope,
+                attempt_started_at=prim_started_at,
             )
         except Exception as rec_err:
             logging.warning("Failed to record vision primary failure: %s", rec_err)
@@ -4550,6 +4570,7 @@ async def analyze_image_content(
     if fb_eligible:
         fallback_attempted = True
         fb_start = time.monotonic()
+        fb_started_at = datetime.utcnow()
         fb_stage_cap = 15.0
         fb_capture = {}
         try:
@@ -4764,6 +4785,7 @@ async def analyze_image_content(
                     fallback_model=eff_fallback_model,
                     fallback_succeeded=True,
                     credential_scope=prim_cred_scope,
+                    attempt_started_at=prim_started_at,
                 )
                 fb_k = getattr(config, f"{eff_fallback_provider.lower()}_api_key", None)
                 if eff_fallback_provider.lower() in ("claude", "anthropic"):
@@ -4843,6 +4865,7 @@ async def analyze_image_content(
                     fallback_succeeded=False,
                     credential_scope=prim_cred_scope,
                     enqueue_notification=False,
+                    attempt_started_at=prim_started_at,
                 )
                 inc_fb = await record_ai_provider_failure(
                     None,
@@ -4853,6 +4876,7 @@ async def analyze_image_content(
                     fallback_succeeded=False,
                     credential_scope=fb_cred_scope,
                     enqueue_notification=False,
+                    attempt_started_at=fb_started_at,
                 )
             except Exception as rec_err:
                 logging.warning("Failed to record vision fallback failure: %s", rec_err)

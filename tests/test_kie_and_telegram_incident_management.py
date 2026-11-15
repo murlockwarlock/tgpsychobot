@@ -1298,6 +1298,7 @@ async def test_admin_key_change_triggers_handle_key_rotation(test_db_session_mak
         provider="KIE",
         new_key="new_super_secret_kie_key_2026",
         base_url="https://api.kie.ai",
+        old_credential_scope="old_kie_fp_1",
         session_maker=test_db_session_maker,
     )
     assert superseded == 2
@@ -2654,6 +2655,7 @@ async def test_real_postgresql_key_rotation_superseded_no_false_alert(pg_test_se
         provider="KIE",
         new_key="new_pg_secret_kie_key_2026",
         base_url="https://api.kie.ai",
+        old_credential_scope="old_pg_scope_1",
         session_maker=pg_test_session_maker,
     )
     assert superseded == 1
@@ -3888,21 +3890,32 @@ async def test_handle_key_rotation_fail_closed_and_protects_foreign_instances(te
     """
     monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
 
-    # Part 1: Fail closed when BOT_INSTANCE_ID is missing or not registered
+    # Part 1: Fail closed with IncidentSecurityError when BOT_INSTANCE_ID is missing or foreign origin unauthorized
+    from ai_incident_manager import IncidentSecurityError
     monkeypatch.delenv("BOT_INSTANCE_ID", raising=False)
-    fail_closed_res = await handle_key_rotation(
-        origin_instance_id=None,
-        provider="KIE",
-        new_key="new_key_1",
-        session_maker=test_db_session_maker,
-    )
-    assert fail_closed_res == 0, "handle_key_rotation must fail closed when instance cannot be determined"
+    with pytest.raises(IncidentSecurityError):
+        await handle_key_rotation(
+            origin_instance_id=None,
+            provider="KIE",
+            new_key="new_key_1",
+            session_maker=test_db_session_maker,
+        )
+
+    # Unauthorized foreign origin also raises IncidentSecurityError
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    with pytest.raises(IncidentSecurityError):
+        await handle_key_rotation(
+            origin_instance_id="tg_yourself_way_bot_new",
+            provider="KIE",
+            new_key="new_key_1",
+            session_maker=test_db_session_maker,
+        )
 
     # Part 2: Shared DB isolation between instances
     # Instance A: tg_someonewithyou01_bot_new
     # Instance B: tg_yourself_way_bot_new
-    scope_a = get_provider_account_fingerprint("KIE", "key_inst_a")
-    scope_b = get_provider_account_fingerprint("KIE", "key_inst_b")
+    scope_a = get_provider_account_fingerprint("key_inst_a", None)
+    scope_b = get_provider_account_fingerprint("key_inst_b", None)
 
     async with test_db_session_maker() as session:
         inc_a = AIProviderIncidentModel(
@@ -3933,6 +3946,7 @@ async def test_handle_key_rotation_fail_closed_and_protects_foreign_instances(te
         origin_instance_id="tg_someonewithyou01_bot_new",
         provider="KIE",
         new_key="key_inst_a_new",
+        old_credential_scope=scope_a,
         session_maker=test_db_session_maker,
     )
     assert rotation_count == 1
@@ -4992,3 +5006,312 @@ async def test_real_postgresql_concurrent_terminal_failure_dedup_boundary_transa
         )).scalars().all()
         assert len(notifs) == 1
         assert notifs[0].cycle_index == 0
+
+
+# ==============================================================================
+# Review Follow-up Verification Tests (PR #97 Gaps 1, 2, 3)
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_safe_no_op_key_rotation_identical_key_sqlite(test_db_session_maker, monkeypatch):
+    """Gap 2: Safe no-op rotation: old_key == new_key or old_credential_scope == new_fp returns 0 and leaves incidents intact (SQLite)."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_telegram_token_123456789012")
+
+    same_key = "kie_same_key_999"
+    same_fp = get_provider_account_fingerprint(same_key, None)
+
+    err = InsufficientBalanceError("KIE credits empty")
+    err.provider = "KIE"
+    inc = await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        error=err,
+        operation="chat",
+        model="kie-v1",
+        credential_scope=same_fp,
+        session_maker=test_db_session_maker,
+    )
+    assert inc is not None
+    assert inc.status == "active"
+
+    # 1. No-op via old_key == new_key
+    res_noop_1 = await handle_key_rotation(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        new_key=same_key,
+        old_key=same_key,
+        session_maker=test_db_session_maker,
+    )
+    assert res_noop_1 == 0
+
+    # 2. No-op via old_credential_scope == new_fp
+    res_noop_2 = await handle_key_rotation(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        new_key=same_key,
+        old_credential_scope=same_fp,
+        session_maker=test_db_session_maker,
+    )
+    assert res_noop_2 == 0
+
+    # Incident remains untouched and active
+    async with test_db_session_maker() as session:
+        db_inc = await session.get(AIProviderIncidentModel, inc.id)
+        assert db_inc.status == "active"
+        assert db_inc.resolved_at is None
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_safe_no_op_key_rotation_identical_key_postgresql(pg_test_session_maker, monkeypatch):
+    """Gap 2: Safe no-op rotation: old_key == new_key or old_credential_scope == new_fp returns 0 and leaves incidents intact (PostgreSQL)."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_telegram_token_123456789012")
+
+    same_key = "kie_pg_same_key_999"
+    same_fp = get_provider_account_fingerprint(same_key, None)
+
+    err = InsufficientBalanceError("KIE credits empty")
+    err.provider = "KIE"
+    inc = await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        error=err,
+        operation="chat",
+        model="kie-v1",
+        credential_scope=same_fp,
+        session_maker=pg_test_session_maker,
+    )
+    assert inc is not None
+    assert inc.status == "active"
+
+    # No-op call on PostgreSQL
+    res = await handle_key_rotation(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        new_key=same_key,
+        old_key=same_key,
+        session_maker=pg_test_session_maker,
+    )
+    assert res == 0
+
+    async with pg_test_session_maker() as session:
+        db_inc = await session.get(AIProviderIncidentModel, inc.id)
+        assert db_inc.status == "active"
+        assert db_inc.resolved_at is None
+
+
+@pytest.mark.asyncio
+async def test_missing_old_key_does_not_broadly_supersede_companion_keys(test_db_session_maker, monkeypatch):
+    """Gap 2: When old key is unknown/unconfigured, handle_key_rotation does NOT broadly supersede other keys in shared DB."""
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_telegram_token_123456789012")
+
+    scope_companion = get_provider_account_fingerprint("companion_secret_key_123", None)
+
+    # Incident belonging to a companion/alternate key in shared DB
+    err = InsufficientBalanceError("KIE credits empty")
+    err.provider = "KIE"
+    inc = await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        error=err,
+        operation="chat",
+        model="kie-v1",
+        credential_scope=scope_companion,
+        session_maker=test_db_session_maker,
+    )
+    assert inc is not None
+    assert inc.status == "active"
+
+    # Rotate with NO old_key passed, NO old_credential_scope passed, and AIConfig without old key
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if cfg:
+            cfg.kie_api_key = None
+            await session.commit()
+
+    superseded = await handle_key_rotation(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        new_key="completely_new_key_777",
+        old_key=None,
+        old_credential_scope=None,
+        session_maker=test_db_session_maker,
+    )
+    assert superseded == 0
+
+    # Ensure companion incident is NOT superseded
+    async with test_db_session_maker() as session:
+        db_inc = await session.get(AIProviderIncidentModel, inc.id)
+        assert db_inc.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_real_dispatcher_key_rotation_fail_closed_on_missing_instance_id(test_db_session_maker, monkeypatch):
+    """Gap 3: Full fail-closed via Dispatcher/FSM: when BOT_INSTANCE_ID is missing,
+    IncidentSecurityError is raised and caught, rolling back the transaction so AIConfig is unchanged,
+    FSM state is cleared, and an authorization error message is sent to admin.
+    """
+    from datetime import timezone
+    from aiogram import Dispatcher
+    from aiogram.fsm.storage.memory import MemoryStorage
+    from aiogram.types import Chat, Message, Update
+    import handlers
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+
+    monkeypatch.setattr(handlers, "async_session_maker", test_db_session_maker)
+    monkeypatch.setattr("ai_incident_manager.async_session_maker", test_db_session_maker)
+    monkeypatch.setattr(handlers, "is_admin", lambda user_id: True)
+
+    # Initial AIConfig with an existing valid key
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="KIE", kie_api_key="original_kie_key_100")
+            session.add(cfg)
+        else:
+            cfg.kie_api_key = "original_kie_key_100"
+        await session.commit()
+
+    storage = MemoryStorage()
+    handlers.router._parent_router = None
+    dp = Dispatcher(storage=storage)
+    dp.include_router(handlers.router)
+
+    telegram_session = ValidatingTelegramSession()
+    bot = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session)
+
+    user = TgUser(id=777, is_bot=False, first_name="Admin", username="admin777")
+    chat = Chat(id=777, type="private")
+
+    # Set FSM state to set_api_key for KIE
+    fsm_ctx = dp.fsm.get_context(bot=bot, user_id=777, chat_id=777)
+    await fsm_ctx.set_state(handlers.AdminStates.set_api_key)
+    await fsm_ctx.update_data(provider="KIE", setting_type="api_key")
+
+    # MISSING BOT_INSTANCE_ID to trigger fail-closed!
+    monkeypatch.delenv("BOT_INSTANCE_ID", raising=False)
+
+    # Send new API key via Message Update into Dispatcher
+    update_msg = Update(
+        update_id=201,
+        message=Message(
+            message_id=21,
+            date=datetime.now(timezone.utc),
+            chat=chat,
+            from_user=user,
+            text="new_unauthorized_key_attempt_555",
+        ),
+    )
+    await dp.feed_update(bot, update_msg)
+
+    # 1. State must be cleared
+    assert await fsm_ctx.get_state() is None
+
+    # 2. AIConfig must remain ROLLED BACK to original_kie_key_100
+    async with test_db_session_maker() as session:
+        cfg_after = await session.get(AIConfig, 1)
+        assert cfg_after.kie_api_key == "original_kie_key_100"
+
+    # 3. Admin received typed authorization error message
+    sent_texts = [getattr(call, "text", "") for call in telegram_session.calls]
+    assert any("Ошибка авторизации экземпляра бота. Настройки не изменены." in t for t in sent_texts)
+
+
+@pytest.mark.asyncio
+async def test_runtime_attempt_started_at_prevents_stale_in_flight_reopening_reactivated_key(test_db_session_maker, monkeypatch):
+    """Gap 1: In A -> B -> A key rotation, stale in-flight request R1 started before rotation
+    must NOT reopen an active incident on reactivated key A, while new request R2 does.
+    """
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_someonewithyou01_bot_new")
+    monkeypatch.setenv("BOT_TOKEN", "8281390498:AAFtest_telegram_token_123456789012")
+
+    key_a = "kie_key_alpha_111"
+    key_b = "kie_key_beta_222"
+    scope_a = get_provider_account_fingerprint(key_a, None)
+    scope_b = get_provider_account_fingerprint(key_b, None)
+
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="KIE", kie_api_key=key_a)
+            session.add(cfg)
+        else:
+            cfg.kie_api_key = key_a
+        await session.commit()
+
+    # Step 1: In-flight request R1 begins execution at t0
+    t0_r1_start = datetime.utcnow()
+    await asyncio.sleep(0.01)
+
+    # Step 2: Rotation 1: Admin rotates A -> B at t1
+    await handle_key_rotation(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        new_key=key_b,
+        old_key=key_a,
+        session_maker=test_db_session_maker,
+    )
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.kie_api_key = key_b
+        await session.commit()
+
+    await asyncio.sleep(0.01)
+
+    # Step 3: Rotation 2: Admin reactivates key A (B -> A) at t2
+    await handle_key_rotation(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        new_key=key_a,
+        old_key=key_b,
+        session_maker=test_db_session_maker,
+    )
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        cfg.kie_api_key = key_a
+        await session.commit()
+
+    await asyncio.sleep(0.01)
+
+    # Step 4: Stale in-flight request R1 (started at t0 < t1) finally completes with failure at t3
+    err = InsufficientBalanceError("KIE credits empty from old in-flight request")
+    err.provider = "KIE"
+    inc_r1 = await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        error=err,
+        operation="chat",
+        model="kie-v1",
+        credential_scope=scope_a,
+        session_maker=test_db_session_maker,
+        attempt_started_at=t0_r1_start,
+    )
+    assert inc_r1 is not None
+    # Must be marked superseded because it was started before key A's previous resolved_at!
+    assert inc_r1.status == "superseded"
+
+    # Verify no notifications were enqueued for stale R1
+    async with test_db_session_maker() as session:
+        notifs_r1 = (await session.execute(
+            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.incident_id == inc_r1.id)
+        )).scalars().all()
+        assert len(notifs_r1) == 0
+
+    # Step 5: New request R2 starts at t4 > t2 on reactivated key A
+    t4_r2_start = datetime.utcnow()
+    inc_r2 = await record_ai_provider_failure(
+        origin_instance_id="tg_someonewithyou01_bot_new",
+        provider="KIE",
+        error=err,
+        operation="chat",
+        model="kie-v1",
+        credential_scope=scope_a,
+        session_maker=test_db_session_maker,
+        attempt_started_at=t4_r2_start,
+    )
+    assert inc_r2 is not None
+    # Must be active because it was started on the newly reactivated key generation!
+    assert inc_r2.status == "active"

@@ -58,6 +58,11 @@ from provider_failures import ProviderFailure, normalize_exception
 
 logger = logging.getLogger("ai_incident_manager")
 
+
+class IncidentSecurityError(RuntimeError):
+    """Raised when instance identity cannot be determined or origin instance is unauthorized."""
+    pass
+
 DEFAULT_REPEAT_ALERT_SECONDS = 6 * 3600  # 6 hours
 OUTBOX_LEASE_SECONDS = 60
 MAX_OUTBOX_ATTEMPTS = 5
@@ -388,7 +393,9 @@ async def _record_ai_provider_failure_impl(
             elif attempt_started_at and existing_superseded.resolved_at:
                 # If this specific request was started BEFORE the key was rotated out at resolved_at,
                 # it belongs to the previous superseded generation and must NOT open a new incident.
-                if attempt_started_at <= existing_superseded.resolved_at:
+                att_dt = attempt_started_at.replace(tzinfo=None) if attempt_started_at.tzinfo else attempt_started_at
+                res_dt = existing_superseded.resolved_at.replace(tzinfo=None) if existing_superseded.resolved_at.tzinfo else existing_superseded.resolved_at
+                if att_dt <= res_dt:
                     is_retired = True
                     logger.info(
                         "[AI Incident] Finished AI attempt for %s started at %s before rotation resolved_at %s. Preserving record as superseded.",
@@ -693,6 +700,7 @@ async def handle_key_rotation(
     Supersede active incidents when an API key is rotated in AIConfig, without false replenishment alerts.
     Supersedes across the database, ensuring Telegram and companion MAX instances in shared DB are both transitioned.
     Supports running within an existing database transaction (pass session) or managing its own.
+    Fails closed with IncidentSecurityError if bot instance identity or authorization cannot be established.
     """
     try:
         return await _handle_key_rotation_impl(
@@ -705,6 +713,9 @@ async def handle_key_rotation(
             session_maker=session_maker,
             session=session,
         )
+    except IncidentSecurityError:
+        # Never mask security / authorization fail-closed errors
+        raise
     except Exception as exc:
         logger.error("[AI Incident] Unexpected error in handle_key_rotation: %s", exc, exc_info=True)
         if session is not None:
@@ -726,14 +737,14 @@ async def _handle_key_rotation_impl(
     if not origin_instance_id:
         if not current_inst:
             logger.critical("[AI Incident] Fail-closed: cannot determine instance identity for key rotation.")
-            return 0
+            raise IncidentSecurityError("Cannot determine current bot instance identity for key rotation.")
         source_def = current_inst
         origin_instance_id = current_inst.get("pm2_name")
     else:
         source_def = get_instance_by_pm2_name(origin_instance_id)
         if not source_def:
             logger.critical("[AI Incident] Fail-closed: origin_instance_id %r not in registry for key rotation.", origin_instance_id)
-            return 0
+            raise IncidentSecurityError(f"Origin instance {origin_instance_id!r} not found in registry.")
         if current_inst:
             is_same = (
                 source_def.get("pm2_name") == current_inst.get("pm2_name")
@@ -749,7 +760,12 @@ async def _handle_key_rotation_impl(
                     origin_instance_id,
                     current_inst.get("pm2_name"),
                 )
-                return 0
+                raise IncidentSecurityError(
+                    f"Origin instance {origin_instance_id!r} not authorized from current instance {current_inst.get('pm2_name')!r}."
+                )
+        else:
+            logger.critical("[AI Incident] Fail-closed: cannot determine instance identity for key rotation with origin %r.", origin_instance_id)
+            raise IncidentSecurityError("Cannot determine current bot instance identity for key rotation.")
 
     prov_norm = provider.strip().upper()
     new_fp = get_provider_account_fingerprint(new_key, base_url)
@@ -762,6 +778,14 @@ async def _handle_key_rotation_impl(
     if companion_def:
         origin_names.update({companion_def.get("pm2_name"), companion_def.get("bot_instance_id")})
     origin_names.discard(None)
+
+    # Safe no-op check: if identical key is being submitted, do not touch any incidents
+    if old_key is not None and old_key == new_key:
+        logger.info("[AI Incident] No-op key rotation for %s: old_key matches new_key.", prov_norm)
+        return 0
+    if old_credential_scope is not None and old_credential_scope == new_fp:
+        logger.info("[AI Incident] No-op key rotation for %s: old_credential_scope matches new_fp.", prov_norm)
+        return 0
 
     old_fps: set[str] = set()
     old_fp_passed = False
@@ -776,24 +800,46 @@ async def _handle_key_rotation_impl(
     old_fps.discard("unconfigured")
     old_fps.discard(new_fp)
 
+    if old_fp_passed and not old_fps:
+        logger.info("[AI Incident] No-op key rotation for %s: old fingerprint matches new_fp.", prov_norm)
+        return 0
+
     async def _execute_rotation(sess: AsyncSession) -> int:
         nonlocal old_fps, old_fp_passed
         superseded_count = 0
+
+        # If caller did not provide old key/scope, inspect AIConfig for this provider
+        if not old_fp_passed:
+            from database import AIConfig
+            ai_cfg = await sess.get(AIConfig, 1)
+            old_k = get_provider_api_key(ai_cfg, prov_norm) if ai_cfg else None
+            old_b_url = getattr(ai_cfg, "kie_base_url", None) if (ai_cfg and prov_norm == "KIE") else None
+            if old_k:
+                if old_k == new_key:
+                    logger.info("[AI Incident] No-op key rotation for %s: configured key matches new_key.", prov_norm)
+                    return 0
+                old_fps.add(get_provider_account_fingerprint(old_k, old_b_url))
+                old_fps.add(get_provider_account_fingerprint(old_k, None))
+                old_fps.discard("unconfigured")
+                old_fps.discard(new_fp)
+
+        # If no distinct prior key exists, do NOT perform a broad fallback (no credential_scope != new_fp)
+        if not old_fps:
+            logger.info("[AI Incident] No distinct prior key found for %s rotation; no incidents superseded.", prov_norm)
+            return 0
+
         target_tombstones = set(old_fps)
 
-        # Supersede active and transient incidents ONLY for the replaced credential scope
+        # Supersede active and transient incidents ONLY for the replaced credential scope(s)
         stmt = select(AIProviderIncidentModel).where(
             AIProviderIncidentModel.provider == prov_norm,
             AIProviderIncidentModel.status.in_(["active", "transient"]),
+            AIProviderIncidentModel.credential_scope.in_(old_fps),
             or_(
                 AIProviderIncidentModel.origin_instance_id.in_(origin_names),
                 AIProviderIncidentModel.companion_instance_id.in_(origin_names),
             ),
         )
-        if old_fp_passed and old_fps:
-            stmt = stmt.where(AIProviderIncidentModel.credential_scope.in_(old_fps))
-        else:
-            stmt = stmt.where(AIProviderIncidentModel.credential_scope != new_fp)
 
         active_old = (await sess.execute(stmt)).scalars().all()
         for inc in active_old:
@@ -816,17 +862,6 @@ async def _handle_key_rotation_impl(
                     updated_at=now,
                 )
             )
-
-        # If no tombstones were registered yet and caller didn't pass old key/scope,
-        # inspect AIConfig to check if a previously active key existed.
-        if not target_tombstones:
-            from database import AIConfig
-            ai_cfg = await sess.get(AIConfig, 1)
-            old_k = get_provider_api_key(ai_cfg, prov_norm) if ai_cfg else None
-            old_b_url = getattr(ai_cfg, "kie_base_url", None) if (ai_cfg and prov_norm == "KIE") else None
-            cfg_fp = get_provider_account_fingerprint(old_k, old_b_url) if old_k else None
-            if cfg_fp and cfg_fp != "unconfigured" and cfg_fp != new_fp:
-                target_tombstones.add(cfg_fp)
 
         # Ensure a tombstone record exists for old fingerprints so concurrent in-flight failures
         # are recognized as superseded and do not open a new active incident.
