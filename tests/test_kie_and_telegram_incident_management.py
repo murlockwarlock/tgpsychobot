@@ -8284,10 +8284,20 @@ async def test_production_init_db_migration_ai_incident_notifications_postgresql
                 updated_at TIMESTAMP NOT NULL
             )
         """))
-        # Ensure parent incident exists
+        # Ensure parent incident exists with all non-null columns
         await conn.execute(text("""
-            INSERT INTO ai_provider_incidents (id, provider, operation, model_scope, credential_scope, incident_type, status, detail_code, origin_instance_id, companion_instance_id)
-            VALUES (1, 'KIE', 'chat', 'model-1', 'scope-1', 'provider_5xx', 'active', '500', 'inst1', 'inst1')
+            INSERT INTO ai_provider_incidents (
+                id, origin_instance_id, companion_instance_id, provider, credential_scope,
+                operation, model_scope, incident_type, evidence_tier, detail_code,
+                classification_source, status, occurrence_count, reminder_cycle,
+                first_seen_at, last_seen_at
+            )
+            VALUES (
+                1, 'inst1', 'inst1', 'KIE', 'scope-1',
+                'chat', 'model-1', 'provider_5xx', 'CONFIRMED_STRUCTURED', '500',
+                'provider_structured', 'active', 1, 0,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
             ON CONFLICT (id) DO NOTHING
         """))
         # Insert rows across all 4 statuses
