@@ -1061,6 +1061,7 @@ def _normalize_issue_for_signature(issue: str) -> str:
     text = re.sub(r"\b\d+ polling fetch errors\b", "N polling fetch errors", issue)
     text = re.sub(r"prompt_len=\d+", "prompt_len=N", text)
     text = re.sub(r"\btryings\s*=\s*\d+\b", "tryings=N", text)
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,\.]\d+)?\b", "TIMESTAMP", text)
     return text
 
 
@@ -1427,17 +1428,21 @@ def _queue_issue_notification(
     pending_notifications: dict,
     alert_text: str,
     now: int,
+    flat_remaining: list[str] | None = None,
 ) -> None:
     if "issue" not in pending_notifications:
         pending_notifications["issue"] = {
             "text": alert_text,
             "created_at": now,
             "delivered_recipients": [],
+            "flat_remaining": list(flat_remaining or []),
         }
         return
 
     existing = pending_notifications["issue"]
     if existing.get("text") == alert_text:
+        if flat_remaining and not existing.get("flat_remaining"):
+            existing["flat_remaining"] = list(flat_remaining)
         return
 
     # If the existing issue has not yet been partially delivered, update text in-place
@@ -1445,6 +1450,7 @@ def _queue_issue_notification(
     if not delivered:
         existing["text"] = alert_text
         existing["created_at"] = now
+        existing["flat_remaining"] = list(flat_remaining or [])
     else:
         # Partially delivered! Do NOT overwrite text or delivered_recipients.
         # Queue a new independent notification record so the new event is tracked separately
@@ -1455,6 +1461,7 @@ def _queue_issue_notification(
                 "text": alert_text,
                 "created_at": now,
                 "delivered_recipients": [],
+                "flat_remaining": list(flat_remaining or []),
             }
 
 
@@ -1732,7 +1739,7 @@ async def run_check(
                 total_tg_bots=len(telegram_apps),
                 proxy_status=proxy_status,
             )
-            _queue_issue_notification(pending_notifications, alert_text, now)
+            _queue_issue_notification(pending_notifications, alert_text, now, flat_remaining=flat_remaining)
 
         # Deliver all queued issue notifications in order
         issue_keys = [
@@ -1744,6 +1751,9 @@ async def run_check(
             p_issue = pending_notifications[k]
             delivered = await _deliver_notification(apps, p_issue, state)
             if delivered:
+                notif_flat = p_issue.get("flat_remaining")
+                if notif_flat:
+                    record_alert_delivered(notif_flat, state)
                 pending_notifications.pop(k, None)
             else:
                 all_delivered = False
@@ -1759,7 +1769,7 @@ async def run_check(
                 if single_inc and (should_alert_single_net or int(single_inc.get("last_alerted", 0)) == 0):
                     single_inc["last_alerted"] = now
                     single_inc["alert_count"] = single_inc.get("alert_count", 0) + 1
-            if should_alert_other:
+            if should_alert_other and flat_remaining:
                 record_alert_delivered(flat_remaining, state)
 
         save_state(state)

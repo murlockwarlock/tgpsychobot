@@ -2290,6 +2290,14 @@ async def init_db():
                 pass
 
             verify_event_reminder_chains_schema(sync_conn)
+
+            if insp.has_table('ai_incident_notifications'):
+                ai_notif_cols = [c['name'] for c in insp.get_columns('ai_incident_notifications')]
+                if 'max_attempts' not in ai_notif_cols:
+                    sync_conn.execute(text("ALTER TABLE ai_incident_notifications ADD COLUMN max_attempts INTEGER DEFAULT 6 NOT NULL"))
+                if 'next_retry_at' not in ai_notif_cols:
+                    sync_conn.execute(text("ALTER TABLE ai_incident_notifications ADD COLUMN next_retry_at TIMESTAMP"))
+
             return legacy_system_messages_migrated
 
         legacy_system_messages_migrated = await conn.run_sync(_check_and_migrate)

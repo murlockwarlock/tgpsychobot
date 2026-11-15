@@ -402,7 +402,14 @@ async def _record_ai_provider_failure_impl(
     prov_norm = (provider or failure.provider or "unknown").strip().upper()
     op_norm = (operation or failure.operation or "chat").strip().lower()
     mod_norm = str(model or "*").strip()
-    inc_type = failure.classification
+    raw_cls = getattr(failure, "classification", None)
+    canon_cls = canonical_classification(raw_cls)
+    if canon_cls and canon_cls in CANONICAL_CLASSES and canon_cls != "unknown":
+        inc_type = canon_cls
+    elif str(raw_cls) in ("low_credit_warning",):
+        inc_type = str(raw_cls)
+    else:
+        inc_type = "provider_5xx" if getattr(failure, "retryable", False) else "unknown"
     det_code = sanitize_technical_code(
         failure.detail_code or failure.provider_error_code,
         classification=inc_type,
@@ -1272,6 +1279,7 @@ async def enqueue_ai_notification_event(
     text: str,
     cooldown_seconds: int = 1800,
     session_maker: Any = None,
+    max_attempts: int | None = None,
 ) -> bool:
     """
     Enqueue a durable AI notification event (terminal_failure, output_budget_exhausted, fallback_used)
@@ -1413,6 +1421,11 @@ async def enqueue_ai_notification_event(
                     next_cycle = 0 if max_cycle is None else max_cycle + 1
 
                     enqueued_count = 0
+                    eff_max_attempts = (
+                        max_attempts
+                        if (isinstance(max_attempts, int) and max_attempts > 0)
+                        else MAX_OUTBOX_ATTEMPTS
+                    )
                     for adm_id in admin_ids:
                         if not is_valid_telegram_user_id(adm_id):
                             continue
@@ -1425,7 +1438,7 @@ async def enqueue_ai_notification_event(
                             message_text=text,
                             status="pending",
                             attempts=0,
-                            max_attempts=MAX_OUTBOX_ATTEMPTS,
+                            max_attempts=eff_max_attempts,
                             next_retry_at=now,
                             created_at=now,
                             updated_at=now,
@@ -1451,6 +1464,7 @@ async def enqueue_terminal_ai_failure_notification(
     text: str,
     cooldown_seconds: int = 1800,
     session_maker: Any = None,
+    max_attempts: int | None = None,
 ) -> bool:
     """
     Enqueue a durable terminal AI failure notification for all Telegram admins.
@@ -1465,6 +1479,7 @@ async def enqueue_terminal_ai_failure_notification(
         text=text,
         cooldown_seconds=cooldown_seconds,
         session_maker=session_maker,
+        max_attempts=max_attempts,
     )
 
 
@@ -1736,6 +1751,12 @@ async def process_ai_incident_notifications(
                 return False
 
             attempts = row.attempts
+            raw_max_attempts = getattr(row, "max_attempts", None)
+            effective_max_attempts = (
+                raw_max_attempts
+                if (isinstance(raw_max_attempts, int) and raw_max_attempts > 0)
+                else MAX_OUTBOX_ATTEMPTS
+            )
 
         # Dispatch message via actual_bot
         send_success = False
@@ -1813,7 +1834,7 @@ async def process_ai_incident_notifications(
                 await session.commit()
                 return True
             else:
-                new_status = "failed_terminal" if is_terminal or attempts >= MAX_OUTBOX_ATTEMPTS else "pending"
+                new_status = "failed_terminal" if is_terminal or attempts >= effective_max_attempts else "pending"
                 next_retry = None if new_status == "failed_terminal" else (ts_post + retry_delay)
                 stmt = (
                     update(AIIncidentNotificationModel)

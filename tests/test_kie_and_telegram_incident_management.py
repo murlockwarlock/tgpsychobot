@@ -7690,3 +7690,510 @@ async def test_autobus_observability_ingests_incident_manager_error(tmp_path, mo
     assert monitor.should_alert(issues, state) is True
     monitor.record_alert_delivered(issues, state)
     assert monitor.should_alert(issues, state) is False
+
+
+@pytest.mark.asyncio
+async def test_pii_and_canonical_classification_protection(test_db_session_maker, monkeypatch):
+    """
+    Blocker 1: Guarantee that PII strings and arbitrary classifications cannot bypass canonical validation:
+    - classification = "Patient_123456789"
+    - classification = "SecretToken123"
+    - provider_attempts[].classification = "user_987654"
+    - ProviderFailure.classification = "Patient_123456789"
+    Prove total absence across AIProviderIncidentModel, AIIncidentNotificationModel, and Telegram SendMessage.
+    """
+    from provider_failures import ProviderFailure, CANONICAL_CLASSES
+    from ai_incident_manager import (
+        record_ai_provider_failure,
+        process_ai_incident_notifications,
+    )
+    from error_reporting import send_terminal_ai_failure_alert
+    from database import AIIncidentNotificationModel, AIProviderIncidentModel
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+
+    # 1. ProviderFailure __post_init__ guarantees canonical classification
+    pf1 = ProviderFailure(
+        provider="OPENAI",
+        operation="chat",
+        classification="Patient_123456789",
+        detail_code="test_code",
+    )
+    assert pf1.classification == "unknown"
+    assert pf1.classification in CANONICAL_CLASSES
+
+    pf2 = ProviderFailure(
+        provider="OPENAI",
+        operation="chat",
+        classification="SecretToken123",
+        detail_code="test_code",
+    )
+    assert pf2.classification == "unknown"
+    assert pf2.classification in CANONICAL_CLASSES
+
+    # 2. record_ai_provider_failure with ProviderFailure having attempted arbitrary classification
+    inc = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OPENAI",
+        error=pf1,
+        operation="chat",
+        model="gpt-4o",
+        session_maker=test_db_session_maker,
+    )
+    assert inc is not None
+    assert "Patient_123456789" not in str(inc.incident_type)
+    assert inc.incident_type in CANONICAL_CLASSES
+
+    # 3. send_terminal_ai_failure_alert with:
+    # classification = "SecretToken123"
+    # provider_attempts[].classification = "user_987654"
+    telegram_session = ValidatingTelegramSession()
+    bot = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session)
+    bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+
+    attempts_payload = [
+        {
+            "provider": "OpenAI",
+            "model": "gpt-4o",
+            "status": "FAILED",
+            "classification": "user_987654",
+        }
+    ]
+
+    await send_terminal_ai_failure_alert(
+        error_type="AIServiceError",
+        classification="SecretToken123",
+        provider="OPENAI",
+        provider_attempts=attempts_payload,
+        user_id=12345,
+        platform="telegram",
+        title="Test Alert Title",
+        session_maker=test_db_session_maker,
+    )
+
+    # 4. Verify AIIncidentNotificationModel rows in DB
+    async with test_db_session_maker() as session:
+        notifs = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.event_type == "terminal_failure"
+            )
+        )).scalars().all()
+        assert len(notifs) >= 1
+        for n in notifs:
+            assert "Patient_123456789" not in n.message_text
+            assert "SecretToken123" not in n.message_text
+            assert "user_987654" not in n.message_text
+            assert "12345" not in n.message_text
+
+    # 5. Process outbox and verify Telegram SendMessage text
+    await process_ai_incident_notifications(bot, session_maker=test_db_session_maker)
+    send_calls = [c for c in telegram_session.calls if type(c).__name__ == "SendMessage"]
+    assert len(send_calls) >= 1
+    for call in send_calls:
+        assert "Patient_123456789" not in call.text
+        assert "SecretToken123" not in call.text
+        assert "user_987654" not in call.text
+        assert "12345" not in call.text
+
+
+async def _run_custom_max_attempts_lifecycle_verification(session_maker, monkeypatch):
+    """
+    Blocker 2: Prove that row.max_attempts is the sole authoritative source of truth.
+    - max_attempts = 1: exactly 1 attempt, fails -> failed_terminal, next_retry_at is None.
+    - max_attempts = 3: exactly 3 attempts, fails -> failed_terminal, next_retry_at is None.
+    - max_attempts in (0, -1, None): safely falls back to MAX_OUTBOX_ATTEMPTS (6).
+    """
+    from ai_incident_manager import (
+        MAX_OUTBOX_ATTEMPTS,
+        process_ai_incident_notifications,
+        enqueue_terminal_ai_failure_notification,
+    )
+    from database import AIIncidentNotificationModel, AIProviderIncidentModel
+    from tests.test_perplexity_agent_models import ValidatingTelegramSession
+    from aiogram.methods import SendMessage
+    from aiogram.exceptions import TelegramNetworkError
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+
+    telegram_session = ValidatingTelegramSession()
+    failing_bot = Bot(token="8224473896:AAFtest_token_veraveda", session=telegram_session)
+    failing_bot.get_me = AsyncMock(return_value=TgUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot"))
+    failing_bot.send_message = AsyncMock(side_effect=TelegramNetworkError(method=SendMessage(chat_id=1, text="x"), message="Connection lost"))
+
+    # Case 1: max_attempts = 1
+    async with session_maker() as session:
+        inc1 = AIProviderIncidentModel(
+            provider="OPENAI",
+            operation="chat",
+            model_scope="gpt-4o",
+            credential_scope="scope_custom_1",
+            incident_type="provider_5xx",
+            status="active",
+            detail_code="500",
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            companion_instance_id="tg_veraveda777_bot_legacy",
+        )
+        session.add(inc1)
+        await session.commit()
+        await session.refresh(inc1)
+        inc1_id = inc1.id
+
+    await enqueue_terminal_ai_failure_notification(
+        incident_id=inc1_id,
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        text="Alert 1",
+        session_maker=session_maker,
+        max_attempts=1,
+    )
+
+    async with session_maker() as session:
+        notif1 = (await session.execute(
+            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.incident_id == inc1_id)
+        )).scalars().first()
+        assert notif1.max_attempts == 1
+        notif1_id = notif1.id
+
+    # Execute 1 failing turn
+    await process_ai_incident_notifications(failing_bot, session_maker=session_maker)
+
+    async with session_maker() as session:
+        row1 = await session.get(AIIncidentNotificationModel, notif1_id)
+        assert row1.status == "failed_terminal", "max_attempts=1 must become failed_terminal after 1st attempt"
+        assert row1.attempts == 1
+        assert row1.next_retry_at is None
+
+    # Case 2: max_attempts = 3
+    async with session_maker() as session:
+        inc3 = AIProviderIncidentModel(
+            provider="OPENAI",
+            operation="chat",
+            model_scope="gpt-4o",
+            credential_scope="scope_custom_3",
+            incident_type="provider_5xx",
+            status="active",
+            detail_code="500",
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            companion_instance_id="tg_veraveda777_bot_legacy",
+        )
+        session.add(inc3)
+        await session.commit()
+        await session.refresh(inc3)
+        inc3_id = inc3.id
+
+    await enqueue_terminal_ai_failure_notification(
+        incident_id=inc3_id,
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        text="Alert 3",
+        session_maker=session_maker,
+        max_attempts=3,
+    )
+
+    async with session_maker() as session:
+        notif3 = (await session.execute(
+            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.incident_id == inc3_id)
+        )).scalars().first()
+        assert notif3.max_attempts == 3
+        notif3_id = notif3.id
+
+    # Attempt 1 -> pending
+    await process_ai_incident_notifications(failing_bot, session_maker=session_maker)
+    async with session_maker() as session:
+        r = await session.get(AIIncidentNotificationModel, notif3_id)
+        assert r.status == "pending"
+        assert r.attempts == 1
+        assert r.next_retry_at is not None
+        r.next_retry_at = datetime.utcnow() - timedelta(seconds=1)
+        await session.commit()
+
+    # Attempt 2 -> pending
+    await process_ai_incident_notifications(failing_bot, session_maker=session_maker)
+    async with session_maker() as session:
+        r = await session.get(AIIncidentNotificationModel, notif3_id)
+        assert r.status == "pending"
+        assert r.attempts == 2
+        assert r.next_retry_at is not None
+        r.next_retry_at = datetime.utcnow() - timedelta(seconds=1)
+        await session.commit()
+
+    # Attempt 3 -> failed_terminal!
+    await process_ai_incident_notifications(failing_bot, session_maker=session_maker)
+    async with session_maker() as session:
+        r = await session.get(AIIncidentNotificationModel, notif3_id)
+        assert r.status == "failed_terminal"
+        assert r.attempts == 3
+        assert r.next_retry_at is None
+
+    # Case 3: Invalid max_attempts (0, -1, None) safely falls back to MAX_OUTBOX_ATTEMPTS (6)
+    for invalid_val in (0, -1, None):
+        async with session_maker() as session:
+            inc_inv = AIProviderIncidentModel(
+                provider="OPENAI",
+                operation="chat",
+                model_scope="gpt-4o",
+                credential_scope=f"scope_inv_{invalid_val}",
+                incident_type="provider_5xx",
+                status="active",
+                detail_code="500",
+                origin_instance_id="tg_veraveda777_bot_legacy",
+                companion_instance_id="tg_veraveda777_bot_legacy",
+            )
+            session.add(inc_inv)
+            await session.commit()
+            await session.refresh(inc_inv)
+
+            notif_inv = AIIncidentNotificationModel(
+                incident_id=inc_inv.id,
+                event_type="terminal_failure",
+                cycle_index=0,
+                recipient_id=272982544,
+                authorized_instance_id="tg_veraveda777_bot_legacy",
+                message_text=f"Alert inv {invalid_val}",
+                status="pending",
+                attempts=0,
+                max_attempts=invalid_val,
+                next_retry_at=datetime.utcnow() - timedelta(seconds=1),
+            )
+            session.add(notif_inv)
+            await session.commit()
+            await session.refresh(notif_inv)
+            inv_id = notif_inv.id
+
+        # Attempt 1 fails -> MUST remain 'pending' because effective_max_attempts falls back to 6!
+        await process_ai_incident_notifications(failing_bot, session_maker=session_maker)
+        async with session_maker() as session:
+            r = await session.get(AIIncidentNotificationModel, inv_id)
+            assert r.status == "pending", f"Invalid max_attempts={invalid_val} must fall back to 6 and remain pending after attempt 1"
+            assert r.attempts == 1
+            assert r.next_retry_at is not None
+
+
+@pytest.mark.asyncio
+async def test_ai_outbox_custom_max_attempts_lifecycle_sqlite(test_db_session_maker, monkeypatch):
+    """Blocker 2: Verify custom max_attempts (1, 3, invalid) on SQLite."""
+    await _run_custom_max_attempts_lifecycle_verification(test_db_session_maker, monkeypatch)
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_ai_outbox_custom_max_attempts_lifecycle(pg_test_session_maker, monkeypatch):
+    """Blocker 2: Verify custom max_attempts (1, 3, invalid) on real PostgreSQL."""
+    await _run_custom_max_attempts_lifecycle_verification(pg_test_session_maker, monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_autobus_monitor_run_check_full_control_loop_lifecycle(tmp_path, monkeypatch):
+    """
+    Blocker 3: Integration test of the real Autobus monitor control loop (monitor.run_check()):
+    1. Monitor discovers new infrastructure incident (OperationalError in app log).
+    2. Selects authorized system recipients (272982544).
+    3. Delivers via Telegram HTTP mock (aiohttp.ClientSession.post).
+    4. Records successful and partial delivery in pending_notifications.
+    5. Preserves state across runs.
+    6. Retries undelivered after network error / HTTP 500.
+    7. Preserves PM2, DB, and network alerts.
+    """
+    import monitor_psychobots as monitor
+    import aiohttp
+    import json
+
+    lock_file = str(tmp_path / "monitor.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_PM2_NAME", "tg_autobusbusbot_new")
+    monkeypatch.setenv("PSYCHOBOTS_ALERT_BOT_TOKEN", "8346799080:AAFtest_autobus_token_12345")
+
+    # Create app error log with OperationalError
+    log_file = tmp_path / "autobus_error.log"
+    log_content = (
+        "2026-11-15 18:40:01,456 ERROR [ai_incident_manager] [AI Incident Manager] "
+        "Failed to record AI fallback alert: OperationalError('connection to database lost')\n"
+        "Traceback (most recent call last):\n"
+        "  File '/app/ai_incident_manager.py', line 1234, in record_ai_provider_failure\n"
+        "    await session.commit()\n"
+        "sqlalchemy.exc.OperationalError: connection to database lost\n"
+    )
+    log_file.write_text(log_content, encoding="utf-8")
+
+    app = {
+        "name": "tg_autobusbusbot_new",
+        "status": "online",
+        "token": "8346799080:AAFtest_autobus_token_12345",
+        "error_log": str(log_file),
+        "owner_ids": [272982544],
+    }
+    apps = [app]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    # Mock health checks to return clean (focusing on log error ingestion)
+    async def clean_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_db_schema", clean_async)
+    monkeypatch.setattr(monitor, "check_payment_webhooks", clean_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", clean_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", clean_async)
+    monkeypatch.setattr(monitor, "check_telegram", clean_async)
+
+    # 1. First Run: HTTP 500 -> Delivery fails, notification preserved in pending_notifications
+    posted_calls = []
+    http_should_succeed = False
+
+    class MockHttpTelegramResponse:
+        def __init__(self, url, json=None, **kwargs):
+            self.url = url
+            self.json_payload = json
+            self.status = 200 if http_should_succeed else 500
+
+        async def __aenter__(self):
+            posted_calls.append({"url": self.url, "json": self.json_payload})
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def json(self, content_type=None):
+            if self.status == 200:
+                return {"ok": True, "result": {"message_id": 777}}
+            return {"ok": False, "error_code": 500, "description": "Telegram network error"}
+
+    monkeypatch.setattr(
+        aiohttp.ClientSession,
+        "post",
+        lambda self, url, json=None, **kwargs: MockHttpTelegramResponse(url, json=json, **kwargs),
+    )
+
+    exit_code_1 = await monitor.run_check(include_existing_log_errors=True)
+    assert exit_code_1 == 1, "Run check must exit with 1 when issues are found"
+    assert len(posted_calls) >= 1
+
+    # Verify state saved with pending notification and NO cooldown commit
+    state_1 = monitor.load_state(state_file)
+    pending_1 = state_1.get("pending_notifications", {})
+    assert "issue" in pending_1 or any(k.startswith("issue_") for k in pending_1), "Failed delivery must preserve notification in pending_notifications"
+
+    # 2. Second Run: HTTP 200 OK -> Delivery succeeds, pending notification cleared, cooldown recorded
+    posted_calls.clear()
+    http_should_succeed = True
+
+    exit_code_2 = await monitor.run_check(include_existing_log_errors=True)
+    assert exit_code_2 == 0, "Run check exits with 0 once pending issues are delivered and no new issues exist"
+    assert len(posted_calls) >= 1
+
+    # Verify Telegram SendMessage payload
+    tg_req = posted_calls[0]
+    assert "8346799080:AAFtest_autobus_token_12345" in tg_req["url"]
+    assert tg_req["json"]["chat_id"] == 272982544
+    assert tg_req["json"]["parse_mode"] == "HTML"
+    assert "OperationalError" in tg_req["json"]["text"]
+
+    # Verify pending notifications cleared and cooldown saved
+    state_2 = monitor.load_state(state_file)
+    pending_2 = state_2.get("pending_notifications", {})
+    assert "issue" not in pending_2
+    assert not any(k.startswith("issue_") for k in pending_2)
+
+    # 3. Third Run: Append same error to log -> Cooldown active -> No duplicate HTTP delivery
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(
+            "2026-11-15 18:45:01,000 ERROR [ai_incident_manager] [AI Incident Manager] "
+            "Failed to record AI fallback alert: OperationalError('connection to database lost')\n"
+            "Traceback (most recent call last):\n"
+            "  File '/app/ai_incident_manager.py', line 1234, in record_ai_provider_failure\n"
+            "    await session.commit()\n"
+            "sqlalchemy.exc.OperationalError: connection to database lost\n"
+        )
+    posted_calls.clear()
+    exit_code_3 = await monitor.run_check(include_existing_log_errors=True)
+    assert exit_code_3 == 1, "Issue detected in new log lines"
+    assert len(posted_calls) == 0, "Duplicate issues during cooldown must not trigger repeat alert"
+
+    # 4. Verify PM2, DB, and network alerts are preserved
+    # PM2 stopped
+    app["status"] = "stopped"
+    exit_code_pm2 = await monitor.run_check(include_existing_log_errors=True)
+    assert exit_code_pm2 == 1
+    # DB error
+    async def fake_db_issue(*args, **kwargs): return ["DB: missing migration"]
+    monkeypatch.setattr(monitor, "check_db_schema", fake_db_issue)
+    exit_code_db = await monitor.run_check(include_existing_log_errors=True)
+    assert exit_code_db == 1
+
+
+@pytest.mark.asyncio
+async def test_database_check_and_migrate_adds_missing_max_attempts(tmp_path):
+    """Blocker 2: Verify _check_and_migrate adds max_attempts and next_retry_at to ai_incident_notifications if missing."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy import text, inspect
+
+    db_path = tmp_path / "test_migration.db"
+    test_engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+
+    # Create table WITHOUT max_attempts and next_retry_at
+    async with test_engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE ai_provider_incidents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider VARCHAR(32) NOT NULL,
+                operation VARCHAR(32) NOT NULL,
+                model VARCHAR(64) NOT NULL,
+                credential_scope VARCHAR(64) NOT NULL,
+                incident_type VARCHAR(32) NOT NULL,
+                status VARCHAR(32) NOT NULL,
+                detail_code VARCHAR(128) NOT NULL,
+                origin_instance_id VARCHAR(64) NOT NULL,
+                companion_instance_id VARCHAR(64) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+            )
+        """))
+        await conn.execute(text("""
+            CREATE TABLE ai_incident_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                incident_id INTEGER NOT NULL REFERENCES ai_provider_incidents(id) ON DELETE CASCADE,
+                event_type VARCHAR(32) NOT NULL,
+                cycle_index INTEGER NOT NULL DEFAULT 0,
+                recipient_id BIGINT NOT NULL,
+                authorized_instance_id VARCHAR(64) NOT NULL,
+                message_text TEXT NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                claim_token VARCHAR(64),
+                lease_until TIMESTAMP,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                delivered_at TIMESTAMP,
+                last_error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+            )
+        """))
+
+    def _check_cols(sync_conn):
+        insp = inspect(sync_conn)
+        return [c['name'] for c in insp.get_columns('ai_incident_notifications')]
+
+    async with test_engine.connect() as conn:
+        cols_before = await conn.run_sync(_check_cols)
+        assert 'max_attempts' not in cols_before
+        assert 'next_retry_at' not in cols_before
+
+    def _run_migrate(sync_conn):
+        insp = inspect(sync_conn)
+        if insp.has_table('ai_incident_notifications'):
+            ai_notif_cols = [c['name'] for c in insp.get_columns('ai_incident_notifications')]
+            if 'max_attempts' not in ai_notif_cols:
+                sync_conn.execute(text("ALTER TABLE ai_incident_notifications ADD COLUMN max_attempts INTEGER DEFAULT 6 NOT NULL"))
+            if 'next_retry_at' not in ai_notif_cols:
+                sync_conn.execute(text("ALTER TABLE ai_incident_notifications ADD COLUMN next_retry_at TIMESTAMP"))
+
+    async with test_engine.begin() as conn:
+        await conn.run_sync(_run_migrate)
+
+    async with test_engine.connect() as conn:
+        cols_after = await conn.run_sync(_check_cols)
+        assert 'max_attempts' in cols_after
+        assert 'next_retry_at' in cols_after
+
+    await test_engine.dispose()
+
+

@@ -74,6 +74,18 @@ class ProviderFailure:
     classification_source: str = "provider_structured"
     provider_metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        raw_c = str(self.classification or "unknown").strip()
+        canon = canonical_classification(raw_c)
+        if canon and canon in CANONICAL_CLASSES and canon != "unknown":
+            safe_c = canon
+        elif raw_c in ("low_credit_warning",):
+            safe_c = raw_c
+        else:
+            safe_c = "unknown"
+        if safe_c != self.classification:
+            object.__setattr__(self, "classification", safe_c)
+
     def diagnostics(self) -> dict[str, Any]:
         return asdict(self)
 

@@ -908,16 +908,27 @@ async def send_terminal_ai_failure_alert(
         or detected_bot_name
         or "tgpsychobot"
     )
-    cls_str = classification or "provider_failure"
+    from provider_failures import (
+        CANONICAL_CLASSES,
+        KNOWN_EXCEPTION_NAMES,
+        KNOWN_TECHNICAL_CODES,
+        canonical_classification,
+    )
+    canon_cls = canonical_classification(classification) if classification else None
+    if canon_cls and canon_cls in CANONICAL_CLASSES and canon_cls != "unknown":
+        cls_str = canon_cls
+    else:
+        cls_str = "provider_failure"
     primary_p = primary_provider or "primary"
     fb_p = fallback_provider or "none"
 
-    if request_type == "vision":
-        alert_title = title or f"🚨 <b>[{platform_norm}] Сбой ИИ при анализе изображения</b>\n\n"
+    if title:
+        alert_title = sanitize_secret_values(str(title))
+    elif request_type == "vision":
+        alert_title = f"🚨 <b>[{platform_norm}] Сбой ИИ при анализе изображения</b>\n\n"
     else:
-        alert_title = title or f"🚨 <b>[{platform_norm}] Сбой ИИ в текстовом диалоге</b>\n\n"
+        alert_title = f"🚨 <b>[{platform_norm}] Сбой ИИ в текстовом диалоге</b>\n\n"
 
-    from provider_failures import KNOWN_TECHNICAL_CODES, KNOWN_EXCEPTION_NAMES
     if error_type and (
         error_type.lower() in KNOWN_TECHNICAL_CODES
         or error_type in KNOWN_EXCEPTION_NAMES
@@ -952,7 +963,12 @@ async def send_terminal_ai_failure_alert(
             st = str(att.get("status") or "UNKNOWN").upper()
             mark = "✅" if st in ("SUCCESS", "TRUE", "1") else "❌"
             raw_cls = att.get("classification")
-            cls_info = f" ({raw_cls})" if raw_cls and re.match(r"^[A-Za-z0-9_]{1,32}$", str(raw_cls)) else ""
+            canon_att_cls = canonical_classification(raw_cls) if raw_cls else None
+            cls_info = (
+                f" ({canon_att_cls})"
+                if (canon_att_cls and canon_att_cls in CANONICAL_CLASSES and canon_att_cls != "unknown")
+                else ""
+            )
             lines.append(f"• {html.escape(p)} / {html.escape(m)} {mark}{cls_info}")
         if lines:
             attempts_block = "\nПопытки:\n" + "\n".join(lines) + "\n"
