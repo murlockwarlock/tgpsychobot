@@ -537,13 +537,22 @@ async def check_kie_credit_balance(bot: Bot):
             from sqlalchemy import or_, select
 
             current_inst = detect_current_instance()
-            companion_def = resolve_companion_telegram_instance(current_inst) if current_inst else None
-            origin_names = set()
-            if current_inst:
-                origin_names.update({current_inst.get("pm2_name"), current_inst.get("bot_instance_id")})
-            if companion_def:
-                origin_names.update({companion_def.get("pm2_name"), companion_def.get("bot_instance_id")})
+            if not current_inst:
+                log.warning("Fail-closed: cannot determine current instance identity in check_kie_credit_balance; skipping balance check.")
+                return
+
+            companion_def = resolve_companion_telegram_instance(current_inst)
+            if not companion_def:
+                log.warning("Fail-closed: cannot resolve companion Telegram instance in check_kie_credit_balance; skipping balance check.")
+                return
+
+            origin_names = {current_inst.get("pm2_name"), current_inst.get("bot_instance_id")}
+            origin_names.update({companion_def.get("pm2_name"), companion_def.get("bot_instance_id")})
             origin_names.discard(None)
+
+            if not origin_names:
+                log.warning("Fail-closed: origin_names is empty in check_kie_credit_balance; skipping balance check.")
+                return
 
             current_fp = get_provider_account_fingerprint(api_key, base_url)
             owner_filter = [
@@ -551,7 +560,7 @@ async def check_kie_credit_balance(bot: Bot):
                     AIProviderIncidentModel.origin_instance_id.in_(origin_names),
                     AIProviderIncidentModel.companion_instance_id.in_(origin_names),
                 )
-            ] if origin_names else []
+            ]
 
             stmt_active_warn = select(AIProviderIncidentModel).where(
                 AIProviderIncidentModel.provider == "KIE",

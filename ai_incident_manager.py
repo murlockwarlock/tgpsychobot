@@ -1255,33 +1255,53 @@ async def resolve_low_credit_warning(
                 active_inc.status = "resolved"
                 active_inc.resolved_at = now
 
-                admin_ids = await resolve_target_admin_ids(companion_def, current_instance=current_inst, session=session)
-                msg_text = (
-                    f"✅ <b>Баланс {prov_norm} пополнен</b>\n\n"
-                    f"Текущий остаток: <code>{remaining_credits:.2f}</code> кредитов "
-                    f"(порог: <code>{threshold:.2f}</code>)."
+            # Cancel any pending/processing notifications for all these resolved incidents
+            await session.execute(
+                update(AIIncidentNotificationModel)
+                .where(
+                    AIIncidentNotificationModel.incident_id.in_([inc.id for inc in active_incs]),
+                    AIIncidentNotificationModel.status.in_(["pending", "processing"]),
                 )
-                for admin_id in admin_ids:
-                    if not is_valid_telegram_user_id(admin_id):
-                        continue
-                    notif = AIIncidentNotificationModel(
-                        incident_id=active_inc.id,
-                        event_type="resolved",
-                        cycle_index=0,
-                        recipient_id=admin_id,
-                        authorized_instance_id=auth_instance_id,
-                        message_text=msg_text,
-                        status="pending",
-                        attempts=0,
-                        max_attempts=MAX_OUTBOX_ATTEMPTS,
-                        next_retry_at=now,
-                    )
-                    try:
-                        async with session.begin_nested():
-                            session.add(notif)
-                            await session.flush()
-                    except IntegrityError:
-                        pass
+                .values(
+                    status="cancelled",
+                    last_error="superseded_by_recovery",
+                    updated_at=now,
+                )
+            )
+
+            # Enqueue exactly ONE resolved notification per admin for the shared account replenishment
+            primary_inc = next(
+                (inc for inc in active_incs if inc.origin_instance_id == current_inst.get("pm2_name")),
+                active_incs[0],
+            )
+
+            admin_ids = await resolve_target_admin_ids(companion_def, current_instance=current_inst, session=session)
+            msg_text = (
+                f"✅ <b>Баланс {prov_norm} пополнен</b>\n\n"
+                f"Текущий остаток: <code>{remaining_credits:.2f}</code> кредитов "
+                f"(порог: <code>{threshold:.2f}</code>)."
+            )
+            for admin_id in admin_ids:
+                if not is_valid_telegram_user_id(admin_id):
+                    continue
+                notif = AIIncidentNotificationModel(
+                    incident_id=primary_inc.id,
+                    event_type="resolved",
+                    cycle_index=0,
+                    recipient_id=admin_id,
+                    authorized_instance_id=auth_instance_id,
+                    message_text=msg_text,
+                    status="pending",
+                    attempts=0,
+                    max_attempts=MAX_OUTBOX_ATTEMPTS,
+                    next_retry_at=now,
+                )
+                try:
+                    async with session.begin_nested():
+                        session.add(notif)
+                        await session.flush()
+                except IntegrityError:
+                    pass
 
             await session.commit()
             return True

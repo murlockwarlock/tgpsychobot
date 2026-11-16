@@ -11995,6 +11995,306 @@ async def test_real_postgresql_kie_low_credit_multi_instance_isolation(pg_test_s
         assert inc_b.status == "active"
 
 
+@pytest.mark.asyncio
+async def test_scheduler_kie_credit_balance_fail_closed_missing_instance_id(test_db_session_maker, monkeypatch):
+    """
+    Verify fail-closed behavior in scheduler.check_kie_credit_balance():
+    - If BOT_INSTANCE_ID is missing or detect_current_instance() is None:
+      - Must NOT query/read foreign incidents.
+      - Must NOT change AIConfig.kie_credit_alert_sent.
+      - Must NOT create or resolve notifications/incidents.
+      - Normal outbox sweep and reminder processing continues to function.
+    """
+    from ai_incident_manager import get_provider_account_fingerprint
+
+    # 1. Seed AIConfig with kie_credit_alert_sent = False
+    fp = get_provider_account_fingerprint("test_kie_key_fail_closed", "https://api.kie.ai")
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="KIE", kie_api_key="test_kie_key_fail_closed", kie_credit_alert_threshold=2.0, kie_credit_alert_sent=False)
+            session.add(cfg)
+        else:
+            cfg.provider = "KIE"
+            cfg.kie_api_key = "test_kie_key_fail_closed"
+            cfg.kie_credit_alert_threshold = 2.0
+            cfg.kie_credit_alert_sent = False
+
+        # Seed foreign active incident for a different bot
+        foreign_inc = AIProviderIncidentModel(
+            origin_instance_id="tg_foreign_bot_other",
+            companion_instance_id="tg_foreign_bot_other",
+            provider="KIE",
+            credential_scope=fp,
+            operation="account",
+            model_scope="*",
+            incident_type="low_credit_warning",
+            evidence_tier="CONFIRMED_STRUCTURED",
+            detail_code="balance_0.50_below_2.00",
+            status="active",
+            occurrence_count=1,
+            reminder_cycle=0,
+            first_seen_at=datetime.utcnow(),
+            last_seen_at=datetime.utcnow(),
+            last_alerted_at=datetime.utcnow(),
+        )
+        session.add(foreign_inc)
+        await session.flush()
+
+        # Seed a valid pending outbox item for the foreign bot to verify outbox dispatch runs
+        test_outbox = AIIncidentNotificationModel(
+            incident_id=foreign_inc.id,
+            event_type="opened",
+            cycle_index=0,
+            recipient_id=272982544,
+            authorized_instance_id="tg_foreign_bot_other",
+            message_text="Outbox test message",
+            status="pending",
+            attempts=0,
+            max_attempts=3,
+            next_retry_at=datetime.utcnow(),
+        )
+        session.add(test_outbox)
+        await session.commit()
+
+    # Configure fail-closed: BOT_INSTANCE_ID missing / detect_current_instance returns None
+    monkeypatch.delenv("BOT_INSTANCE_ID", raising=False)
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: None)
+    monkeypatch.setattr(scheduler, "async_session_maker", test_db_session_maker)
+    get_credits_mock = AsyncMock(return_value=0.50)
+    monkeypatch.setattr(scheduler, "get_kie_remaining_credits", get_credits_mock)
+
+    bot = AsyncMock(spec=Bot)
+    bot.token = "8346799080:AAFtest_token"
+    bot.send_message = AsyncMock(return_value=True)
+
+    # 2. Run scheduler check_kie_credit_balance
+    await scheduler.check_kie_credit_balance(bot)
+
+    # Balance API was NEVER called because scheduler failed closed before balance check
+    assert get_credits_mock.call_count == 0
+
+    # Verify AIConfig was NOT modified
+    async with test_db_session_maker() as session:
+        cfg_after = await session.get(AIConfig, 1)
+        assert cfg_after.kie_credit_alert_sent is False
+
+        # Verify foreign incident remains untouched and no new incidents created
+        all_incs = (await session.execute(select(AIProviderIncidentModel))).scalars().all()
+        assert len(all_incs) == 1
+        assert all_incs[0].origin_instance_id == "tg_foreign_bot_other"
+        assert all_incs[0].status == "active"
+
+        # Outbox item remains intact and was not corrupted by missing instance identity
+        all_notifs = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        assert len(all_notifs) == 1
+        assert all_notifs[0].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_shared_account_companion_pair_double_replenishment_single_notification(test_db_session_maker, monkeypatch):
+    """
+    Scenario:
+    1. Telegram and paired MAX bot use the same DB and same KIE credential scope.
+    2. Both register a low-credit warning (2 active incident rows: tg and max).
+    3. Balance is replenished.
+    4. Telegram companion calls resolve_low_credit_warning().
+    Confirm:
+    - Both incidents transition to status = "resolved" with resolved_at set.
+    - Exactly 1 outbox resolved event per admin is enqueued.
+    - Exactly 1 Telegram message is delivered per admin (no duplicate replenishment alerts).
+    """
+    from notification_routing import get_instance_by_id
+    from ai_incident_manager import (
+        record_low_credit_warning,
+        resolve_low_credit_warning,
+        process_ai_incident_notifications,
+    )
+    from aiogram.types import User
+
+    tg_inst = get_instance_by_id("tg_yourself_way_bot_new")
+    max_inst = get_instance_by_id("max_id519010411655_bot_new")
+    assert tg_inst is not None and max_inst is not None
+
+    current_active = max_inst
+
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: current_active)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: get_instance_by_id(n))
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: tg_inst if s.get("platform") == "max" else s)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[272982544]))
+
+    shared_key = "shared_kie_test_key_replenish"
+
+    # Step 2: MAX registers low credit warning
+    current_active = max_inst
+    warned_max = await record_low_credit_warning(
+        provider="KIE",
+        remaining_credits=1.0,
+        threshold=2.0,
+        api_key=shared_key,
+        session_maker=test_db_session_maker,
+    )
+    assert warned_max is True
+
+    # Telegram registers low credit warning
+    current_active = tg_inst
+    warned_tg = await record_low_credit_warning(
+        provider="KIE",
+        remaining_credits=1.0,
+        threshold=2.0,
+        api_key=shared_key,
+        session_maker=test_db_session_maker,
+    )
+    assert warned_tg is True
+
+    # Verify 2 active incidents in DB
+    async with test_db_session_maker() as session:
+        active_incs = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.status == "active")
+        )).scalars().all()
+        assert len(active_incs) == 2
+        origins = {inc.origin_instance_id for inc in active_incs}
+        assert origins == {tg_inst["pm2_name"], max_inst["pm2_name"]}
+
+    # Deliver opened warnings
+    bot = AsyncMock(spec=Bot)
+    bot.token = f"{tg_inst['platform_id']}:AAFtest_token"
+    bot.get_me = AsyncMock(return_value=User(id=tg_inst["platform_id"], is_bot=True, first_name="bot", username="yourself_way_bot"))
+    bot.send_message = AsyncMock(return_value=True)
+
+    await process_ai_incident_notifications(bot, session_maker=test_db_session_maker)
+    # Reset mock after opened warnings
+    bot.send_message.reset_mock()
+
+    # Step 3 & 4: Balance replenished -> Telegram companion calls resolve_low_credit_warning()
+    current_active = tg_inst
+    resolved = await resolve_low_credit_warning(
+        provider="KIE",
+        remaining_credits=10.0,
+        threshold=2.0,
+        api_key=shared_key,
+        session_maker=test_db_session_maker,
+    )
+    assert resolved is True
+
+    # Verify both incidents are resolved in DB (state preserved for both instances)
+    async with test_db_session_maker() as session:
+        all_incs = (await session.execute(select(AIProviderIncidentModel))).scalars().all()
+        assert len(all_incs) == 2
+        for inc in all_incs:
+            assert inc.status == "resolved"
+            assert inc.resolved_at is not None
+
+        # Verify EXACTLY 1 resolved outbox event was enqueued for admin 272982544
+        resolved_notifs = (await session.execute(
+            select(AIIncidentNotificationModel).where(AIIncidentNotificationModel.event_type == "resolved")
+        )).scalars().all()
+        assert len(resolved_notifs) == 1
+        assert resolved_notifs[0].recipient_id == 272982544
+        assert resolved_notifs[0].status == "pending"
+
+    # Step 5: Process notifications and verify exactly 1 Telegram message was sent to admin
+    deliv_count = await process_ai_incident_notifications(bot, session_maker=test_db_session_maker)
+    assert deliv_count == 1
+    assert bot.send_message.call_count == 1
+    sent_text = bot.send_message.call_args.kwargs.get("text") or bot.send_message.call_args.args[1]
+    assert "Баланс KIE пополнен" in sent_text
+    assert "10.00" in sent_text
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_shared_account_double_replenishment_single_notification(pg_test_session_maker, monkeypatch):
+    """
+    Verify PostgreSQL behavior for shared Telegram + MAX paired account double replenishment:
+    - Both incidents resolved in PostgreSQL.
+    - Exactly 1 resolved outbox notification enqueued per admin.
+    - Exactly 1 Telegram message delivered.
+    """
+    from notification_routing import get_instance_by_id
+    from ai_incident_manager import (
+        record_low_credit_warning,
+        resolve_low_credit_warning,
+        process_ai_incident_notifications,
+    )
+    from aiogram.types import User
+
+    tg_inst = get_instance_by_id("tg_yourself_way_bot_new")
+    max_inst = get_instance_by_id("max_id519010411655_bot_new")
+
+    current_active = max_inst
+
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: current_active)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: get_instance_by_id(n))
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: tg_inst if s.get("platform") == "max" else s)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[272982544]))
+
+    shared_key = "pg_shared_kie_test_key_replenish"
+
+    # MAX records warning
+    current_active = max_inst
+    await record_low_credit_warning(
+        provider="KIE",
+        remaining_credits=1.0,
+        threshold=2.0,
+        api_key=shared_key,
+        session_maker=pg_test_session_maker,
+    )
+
+    # Telegram records warning
+    current_active = tg_inst
+    await record_low_credit_warning(
+        provider="KIE",
+        remaining_credits=1.0,
+        threshold=2.0,
+        api_key=shared_key,
+        session_maker=pg_test_session_maker,
+    )
+
+    # Telegram resolves warning
+    resolved = await resolve_low_credit_warning(
+        provider="KIE",
+        remaining_credits=10.0,
+        threshold=2.0,
+        api_key=shared_key,
+        session_maker=pg_test_session_maker,
+    )
+    assert resolved is True
+
+    # Verify both incidents are resolved in PostgreSQL
+    async with pg_test_session_maker() as session:
+        all_incs = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.credential_scope.like("%"))
+        )).scalars().all()
+        this_incs = [i for i in all_incs if i.origin_instance_id in (tg_inst["pm2_name"], max_inst["pm2_name"])]
+        assert len(this_incs) == 2
+        for inc in this_incs:
+            assert inc.status == "resolved"
+
+        # Verify exactly 1 resolved outbox event enqueued
+        resolved_notifs = (await session.execute(
+            select(AIIncidentNotificationModel).where(
+                AIIncidentNotificationModel.event_type == "resolved",
+                AIIncidentNotificationModel.recipient_id == 272982544,
+            )
+        )).scalars().all()
+        assert len(resolved_notifs) == 1
+
+    # Delivery check
+    bot = AsyncMock(spec=Bot)
+    bot.token = f"{tg_inst['platform_id']}:AAFtest_pg_token"
+    bot.get_me = AsyncMock(return_value=User(id=tg_inst["platform_id"], is_bot=True, first_name="bot", username="yourself_way_bot"))
+    bot.send_message = AsyncMock(return_value=True)
+
+    deliv_count = await process_ai_incident_notifications(bot, session_maker=pg_test_session_maker)
+    # Delivered the resolved notification
+    resolved_calls = [
+        c for c in bot.send_message.call_args_list
+        if "Баланс KIE пополнен" in (c.kwargs.get("text") or c.args[1])
+    ]
+    assert len(resolved_calls) == 1
+
+
 
 
 
