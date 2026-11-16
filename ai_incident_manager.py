@@ -124,6 +124,8 @@ def sanitize_technical_code(
     # Check if code has low-credit pattern "balance_X.XX_below_Y.YY"
     if re.match(r"^balance_\d+(\.\d+)?_below_\d+(\.\d+)?$", s):
         return s
+    if re.match(r"^inferred_[a-z0-9_]{1,50}$", s_lower):
+        return s[:64]
     if s in ("superseded_by_key_rotation", "recovered", "persisting"):
         return s
     # Fallback to valid canonical classification if available
@@ -402,19 +404,6 @@ async def _record_ai_provider_failure_impl(
     prov_norm = (provider or failure.provider or "unknown").strip().upper()
     op_norm = (operation or failure.operation or "chat").strip().lower()
     mod_norm = str(model or "*").strip()
-    raw_cls = getattr(failure, "classification", None)
-    canon_cls = canonical_classification(raw_cls)
-    if canon_cls and canon_cls in CANONICAL_CLASSES and canon_cls != "unknown":
-        inc_type = canon_cls
-    elif str(raw_cls) in ("low_credit_warning",):
-        inc_type = str(raw_cls)
-    else:
-        inc_type = "unknown"
-    det_code = sanitize_technical_code(
-        failure.detail_code or failure.provider_error_code,
-        classification=inc_type,
-        default="unspecified",
-    )
     evidence_tier = (
         "CONFIRMED_STRUCTURED"
         if (
@@ -423,6 +412,39 @@ async def _record_ai_provider_failure_impl(
         )
         else "INFERRED_MESSAGE"
     )
+    raw_cls = getattr(failure, "classification", None)
+    canon_cls = canonical_classification(raw_cls)
+    if evidence_tier == "CONFIRMED_STRUCTURED":
+        if canon_cls and canon_cls in CANONICAL_CLASSES and canon_cls != "unknown":
+            inc_type = canon_cls
+        elif str(raw_cls) in ("low_credit_warning",):
+            inc_type = str(raw_cls)
+        else:
+            inc_type = "unknown"
+        det_code = sanitize_technical_code(
+            failure.detail_code or failure.provider_error_code,
+            classification=inc_type,
+            default="unspecified",
+        )
+    else:
+        # Inferred diagnostic text without structured proof:
+        # Prevent unconfirmed provider errors (e.g. unverified provider_5xx or auth)
+        # from falsely polluting database incident metrics in incident_type.
+        if canon_cls in ("application_internal", "unknown"):
+            inc_type = canon_cls
+            det_code = sanitize_technical_code(
+                failure.detail_code or failure.provider_error_code,
+                classification=inc_type,
+                default="unspecified",
+            )
+        else:
+            inc_type = "unknown"
+            inferred_code = f"inferred_{canon_cls}" if canon_cls else "inferred_unspecified"
+            det_code = sanitize_technical_code(
+                inferred_code,
+                classification="unknown",
+                default="inferred_unspecified",
+            )
 
     sm = session_maker or async_session_maker
     now = datetime.utcnow()

@@ -10410,11 +10410,19 @@ async def test_ai_classification_positive_negative_and_edge_scenarios_e2e_sqlite
         assert inc is not None
         assert inc.evidence_tier == "INFERRED_MESSAGE", f"{label} evidence_tier must be INFERRED_MESSAGE"
         assert inc.status == "transient", f"{label} status must be transient (not active)"
+        assert inc.incident_type == "unknown", f"{label} incident_type must be unknown (not unverified provider error)"
 
         # Process outbox: ZERO notifications should be delivered!
         delivered = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
         assert delivered == 0, f"{label} must enqueue 0 notifications"
         assert len(sent_messages) == 0, f"{label} must send 0 Telegram messages"
+
+    # Verify no unconfirmed provider_5xx incidents exist in database
+    async with test_db_session_maker() as session:
+        p5xx_list = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.incident_type == "provider_5xx")
+        )).scalars().all()
+        assert len(p5xx_list) == 0, f"Expected 0 unconfirmed provider_5xx in DB, got {len(p5xx_list)}"
 
     # --------------------------------------------------------------------------
     # 2. Positive Scenarios: Real confirmed failures
@@ -10624,10 +10632,15 @@ async def test_real_postgresql_ai_classification_positive_negative_and_edge_scen
     test_bot = Bot(token="8224473896:AAFtest_token_veraveda", session=MockPgTelegramSession())
 
     # 1. Negative Scenarios on real PostgreSQL
+    LocalAuthErrorPg = type("AuthenticationError", (Exception,), {})
+    adhoc_auth_exc = Exception("Custom untyped error")
+    adhoc_auth_exc.classification = "auth"
     neg_exceptions = [
         ("pg_local_503", Exception("Local error: status code 503 mentioned in diagnostic text")),
         ("pg_unauthorized", Exception("Unexpected content includes unauthorized")),
         ("pg_balance", Exception("Application text contains insufficient balance")),
+        ("pg_local_auth_class", LocalAuthErrorPg("Local authentication fake class")),
+        ("pg_adhoc_auth_attr", adhoc_auth_exc),
     ]
     for label, exc in neg_exceptions:
         sent_messages.clear()
@@ -10647,12 +10660,21 @@ async def test_real_postgresql_ai_classification_positive_negative_and_edge_scen
         )
         assert inc.evidence_tier == "INFERRED_MESSAGE"
         assert inc.status == "transient"
+        assert inc.incident_type == "unknown", f"{label} incident_type must be unknown in DB"
 
         delivered = await process_ai_incident_notifications(test_bot, session_maker=pg_test_session_maker)
         assert delivered == 0
         assert len(sent_messages) == 0
 
+    # Ensure zero unconfirmed provider_5xx in PostgreSQL DB
+    async with pg_test_session_maker() as session:
+        p5xx_pg = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.incident_type == "provider_5xx")
+        )).scalars().all()
+        assert len(p5xx_pg) == 0, f"Expected 0 unconfirmed provider_5xx in PostgreSQL, got {len(p5xx_pg)}"
+
     # 2. Positive Scenarios on real PostgreSQL
+    # 2A: Confirmed 401
     sent_messages.clear()
     pf_401 = parse_provider_failure("OpenAI", "chat", 401, {"error": {"message": "Invalid API key"}})
     inc_401 = await record_ai_provider_failure(
@@ -10667,9 +10689,54 @@ async def test_real_postgresql_ai_classification_positive_negative_and_edge_scen
     )
     assert inc_401.evidence_tier == "CONFIRMED_STRUCTURED"
     assert inc_401.status == "active"
+    assert inc_401.incident_type == "auth"
 
     delivered = await process_ai_incident_notifications(test_bot, session_maker=pg_test_session_maker)
     assert delivered > 0
+    assert len(sent_messages) > 0
+
+    # 2B: Confirmed 404 (NotFoundError) preserves invalid_model_or_resource and delivers alert
+    sent_messages.clear()
+    import httpx, openai
+    req_pg = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    resp_404_pg = httpx.Response(404, request=req_pg, json={"error": {"message": "Model not found", "code": "model_not_found"}}, headers={"x-request-id": "req_pg_404"})
+    exc_404_pg = openai.NotFoundError("Model not found", response=resp_404_pg, body={"error": {"message": "Model not found", "code": "model_not_found"}})
+    inc_404 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_404_pg,
+        operation="chat",
+        model="gpt-missing",
+        credential_scope="scope-pg-pos-404",
+        enqueue_notification=True,
+        session_maker=pg_test_session_maker,
+    )
+    assert inc_404.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_404.status == "active"
+    assert inc_404.incident_type == "invalid_model_or_resource"
+    assert inc_404.http_status == 404
+    deliv_404 = await process_ai_incident_notifications(test_bot, session_maker=pg_test_session_maker)
+    assert deliv_404 > 0
+    assert len(sent_messages) > 0
+
+    # 2C: Confirmed Domain InsufficientBalanceError delivers alert
+    sent_messages.clear()
+    exc_bal_pg = InsufficientBalanceError("Project spend budget exhausted")
+    inc_bal = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_bal_pg,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-pg-pos-bal",
+        enqueue_notification=True,
+        session_maker=pg_test_session_maker,
+    )
+    assert inc_bal.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_bal.status == "active"
+    assert inc_bal.incident_type == "insufficient_balance_quota"
+    deliv_bal = await process_ai_incident_notifications(test_bot, session_maker=pg_test_session_maker)
+    assert deliv_bal > 0
     assert len(sent_messages) > 0
 
 
@@ -10778,6 +10845,347 @@ async def test_real_postgresql_concurrent_workers_simultaneous_network_contentio
         row = await session.get(AIIncidentNotificationModel, notif_id)
         assert row.status == "delivered"
         assert row.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_blocker_priorities_sdk_and_database_classification_e2e(
+    test_db_session_maker,
+    monkeypatch,
+):
+    """
+    Dedicated comprehensive E2E test verifying Blockers 1, 2, and 3:
+    1. Structured HTTP data preservation (OpenAI 404, 401, 403, 429, Anthropic 429 spend limit, 503, SDK typed without response, pre-attached failure).
+    2. False classification suppression in incident_type: unconfirmed diagnostic text with 503/auth/billing/quota records incident_type='unknown'.
+    3. SDK origin verification: local class named AuthenticationError and ad-hoc exception.classification do NOT masquerade as sdk_typed_exception.
+    """
+    import httpx
+    import openai
+    from provider_failures import ProviderFailure, normalize_exception, parse_provider_failure, attach_failure
+    from database import AIConfig, AIIncidentNotificationModel, AIProviderIncidentModel
+    from ai_incident_manager import record_ai_provider_failure, process_ai_incident_notifications
+    from ai_integration import InsufficientBalanceError
+    from aiogram.client.session.base import BaseSession
+    from aiogram.methods.base import TelegramMethod
+    from aiogram.methods import SendMessage
+    from aiogram.types import Message, Chat, User as AiogramUser
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+    monkeypatch.setenv("APP_ENV", "development")
+
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            session.add(AIConfig(id=1, current_provider="OPENAI", openai_api_key="sk-test-blocker-key"))
+            await session.commit()
+
+    sent_messages = []
+
+    class MockTelegramSession(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            if isinstance(method, SendMessage):
+                sent_messages.append(method)
+                return Message(
+                    message_id=7000 + len(sent_messages),
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    test_bot = Bot(token="8224473896:AAFtest_token_veraveda", session=MockTelegramSession())
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+
+    # =========================================================================
+    # PART 1: Priority of Evidence & Structured HTTP Data Preservation
+    # =========================================================================
+
+    # Case 1A: OpenAI NotFoundError with HTTP 404
+    resp_404 = httpx.Response(
+        404,
+        request=req,
+        json={"error": {"message": "Model 'gpt-custom' not found", "code": "model_not_found", "type": "invalid_request_error"}},
+        headers={"x-request-id": "req_blocker_404"},
+    )
+    exc_404 = openai.NotFoundError("Model not found", response=resp_404, body={"error": {"message": "Model not found", "code": "model_not_found"}})
+    pf_404 = normalize_exception(exc_404, "OpenAI", "chat")
+    canon_404 = parse_provider_failure("OpenAI", "chat", 404, exc_404.body, resp_404.headers)
+
+    # Parity check with parse_provider_failure
+    assert pf_404.classification == canon_404.classification == "invalid_model_or_resource"
+    assert pf_404.http_status == canon_404.http_status == 404
+    assert pf_404.request_id == canon_404.request_id == "req_blocker_404"
+    assert pf_404.network_attempted == canon_404.network_attempted is True
+    assert pf_404.operator_action_required == canon_404.operator_action_required is True
+
+    sent_messages.clear()
+    inc_404 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_404,
+        operation="chat",
+        model="gpt-custom",
+        credential_scope="scope-blocker-404",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_404.incident_type == "invalid_model_or_resource"
+    assert inc_404.http_status == 404
+    assert inc_404.status == "active"
+    assert inc_404.evidence_tier == "CONFIRMED_STRUCTURED"
+    deliv_404 = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_404 > 0
+    assert len(sent_messages) > 0
+
+    # Case 1B: OpenAI AuthenticationError with HTTP 401
+    resp_401 = httpx.Response(
+        401,
+        request=req,
+        json={"error": {"message": "Invalid API key", "code": "invalid_api_key"}},
+        headers={"x-request-id": "req_blocker_401"},
+    )
+    exc_401 = openai.AuthenticationError("Invalid API key", response=resp_401, body={"error": {"message": "Invalid API key", "code": "invalid_api_key"}})
+    pf_401 = normalize_exception(exc_401, "OpenAI", "chat")
+    canon_401 = parse_provider_failure("OpenAI", "chat", 401, exc_401.body, resp_401.headers)
+
+    assert pf_401.classification == canon_401.classification == "auth"
+    assert pf_401.http_status == canon_401.http_status == 401
+    assert pf_401.request_id == canon_401.request_id == "req_blocker_401"
+    assert pf_401.operator_action_required is True
+
+    sent_messages.clear()
+    inc_401 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_401,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-blocker-401",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_401.incident_type == "auth"
+    assert inc_401.http_status == 401
+    assert inc_401.status == "active"
+    deliv_401 = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_401 > 0
+    assert len(sent_messages) > 0
+
+    # Case 1C: PermissionDeniedError with HTTP 403
+    resp_403 = httpx.Response(
+        403,
+        request=req,
+        json={"error": {"message": "Country region not supported"}},
+        headers={"x-request-id": "req_blocker_403"},
+    )
+    exc_403 = openai.PermissionDeniedError("Forbidden region", response=resp_403, body={"error": {"message": "Country region not supported"}})
+    pf_403 = normalize_exception(exc_403, "OpenAI", "chat")
+    assert pf_403.classification in ("permission", "forbidden_geo")
+    assert pf_403.http_status == 403
+    assert pf_403.operator_action_required is True
+
+    # Case 1D: RateLimitError with HTTP 429
+    resp_429 = httpx.Response(
+        429,
+        request=req,
+        json={"error": {"message": "Rate limit reached", "code": "rate_limit_exceeded"}},
+        headers={"x-request-id": "req_blocker_429"},
+    )
+    exc_429 = openai.RateLimitError("Rate limit", response=resp_429, body={"error": {"message": "Rate limit reached", "code": "rate_limit_exceeded"}})
+    pf_429 = normalize_exception(exc_429, "OpenAI", "chat")
+    assert pf_429.classification == "rate_limit"
+    assert pf_429.http_status == 429
+    assert pf_429.retryable is True
+    assert pf_429.operator_action_required is False
+
+    sent_messages.clear()
+    inc_429 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_429,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-blocker-429",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_429.incident_type == "rate_limit"
+    assert inc_429.http_status == 429
+    assert inc_429.status == "transient"
+    deliv_429 = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_429 == 0
+    assert len(sent_messages) == 0
+
+    # Case 1E: Anthropic HTTP 429 with spend limit marker
+    resp_anthropic = httpx.Response(
+        429,
+        request=req,
+        json={"type": "error", "error": {"type": "rate_limit_error", "message": "You have exceeded your monthly spend limit"}},
+    )
+    exc_anthropic = httpx.HTTPStatusError("429 Spend limit", request=req, response=resp_anthropic)
+    pf_anthropic = normalize_exception(exc_anthropic, "anthropic", "chat")
+    assert pf_anthropic.classification == "insufficient_balance_quota"
+    assert pf_anthropic.http_status == 429
+    assert pf_anthropic.operator_action_required is True
+
+    # Case 1F: InternalServerError with HTTP 503
+    resp_503 = httpx.Response(
+        503,
+        request=req,
+        json={"error": {"message": "OpenAI engine overloaded"}},
+        headers={"x-request-id": "req_blocker_503"},
+    )
+    exc_503 = openai.InternalServerError("Server error", response=resp_503, body={"error": {"message": "OpenAI engine overloaded"}})
+    pf_503 = normalize_exception(exc_503, "OpenAI", "chat")
+    assert pf_503.classification in ("provider_5xx", "provider_overloaded")
+    assert pf_503.http_status == 503
+    assert pf_503.retryable is True
+    assert pf_503.operator_action_required is False
+
+    # Case 1G: Typed SDK exception without response/status
+    SDKAuthError = type("AuthenticationError", (Exception,), {"__module__": "openai"})
+    exc_sdk_no_resp = SDKAuthError("Client validation error")
+    pf_sdk_no_resp = normalize_exception(exc_sdk_no_resp, "OpenAI", "chat")
+    assert pf_sdk_no_resp.classification == "auth"
+    assert pf_sdk_no_resp.classification_source == "sdk_typed_exception"
+    assert pf_sdk_no_resp.operator_action_required is True
+
+    # Case 1H: Exception with already attached ProviderFailure
+    pf_pre_attached = ProviderFailure("OpenAI", "chat", "auth", "attached_test", operator_action_required=True, classification_source="provider_structured")
+    exc_wrapped = attach_failure(Exception("wrapper around failure"), pf_pre_attached)
+    pf_unwrapped = normalize_exception(exc_wrapped, "OpenAI", "chat")
+    assert pf_unwrapped is pf_pre_attached
+
+    # =========================================================================
+    # PART 2: False Classification Suppression in incident_type
+    # =========================================================================
+
+    unconfirmed_cases = [
+        ("str_503", Exception("Local error: status code 503 mentioned in diagnostic text")),
+        ("str_unauthorized", Exception("Unexpected content includes unauthorized")),
+        ("str_billing", Exception("Application text mentions billing exhausted")),
+        ("str_quota", Exception("Diagnostic log: insufficient quota for request")),
+    ]
+    for label, exc in unconfirmed_cases:
+        sent_messages.clear()
+        pf_unconf = normalize_exception(exc, provider="OpenAI", operation="chat")
+        assert pf_unconf.classification_source == "message_fallback"
+        assert pf_unconf.operator_action_required is False
+
+        inc_unconf = await record_ai_provider_failure(
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            provider="OpenAI",
+            error=exc,
+            operation="chat",
+            model=f"model-{label}",
+            credential_scope=f"scope-{label}",
+            enqueue_notification=True,
+            session_maker=test_db_session_maker,
+        )
+        assert inc_unconf.evidence_tier == "INFERRED_MESSAGE"
+        assert inc_unconf.status == "transient"
+        # CRITICAL: Database incident_type must be 'unknown', NOT unconfirmed provider_5xx or auth!
+        assert inc_unconf.incident_type == "unknown", f"{label} incident_type must be 'unknown'"
+        assert inc_unconf.detail_code.startswith("inferred_"), f"{label} detail_code must preserve diagnostic prefix"
+
+        delivered = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+        assert delivered == 0
+        assert len(sent_messages) == 0
+
+    # Ensure zero unconfirmed provider_5xx in the SQLite database
+    async with test_db_session_maker() as session:
+        p5xx_recs = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.incident_type == "provider_5xx")
+        )).scalars().all()
+        assert len(p5xx_recs) == 0, f"Expected 0 provider_5xx in DB, found {len(p5xx_recs)}"
+
+    # =========================================================================
+    # PART 3: SDK Origin Verification
+    # =========================================================================
+
+    # Case 3A: Local class named AuthenticationError
+    LocalAuthError = type("AuthenticationError", (Exception,), {})
+    exc_fake_auth = LocalAuthError("Fake auth local error")
+    pf_fake_auth = normalize_exception(exc_fake_auth, "OpenAI", "chat")
+    assert pf_fake_auth.classification_source == "message_fallback"
+    assert pf_fake_auth.operator_action_required is False
+
+    sent_messages.clear()
+    inc_fake = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_fake_auth,
+        operation="chat",
+        model="gpt-fake",
+        credential_scope="scope-fake-auth",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_fake.evidence_tier == "INFERRED_MESSAGE"
+    assert inc_fake.status == "transient"
+    assert inc_fake.incident_type == "unknown"
+    deliv_fake = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_fake == 0
+    assert len(sent_messages) == 0
+
+    # Case 3B: Arbitrary Exception with .classification = "auth"
+    exc_ad_hoc_auth = Exception("Plain exception with ad-hoc classification")
+    exc_ad_hoc_auth.classification = "auth"
+    pf_ad_hoc = normalize_exception(exc_ad_hoc_auth, "OpenAI", "chat")
+    assert pf_ad_hoc.classification_source == "message_fallback"
+    assert pf_ad_hoc.operator_action_required is False
+
+    sent_messages.clear()
+    inc_adhoc = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_ad_hoc_auth,
+        operation="chat",
+        model="gpt-adhoc",
+        credential_scope="scope-adhoc-auth",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_adhoc.evidence_tier == "INFERRED_MESSAGE"
+    assert inc_adhoc.status == "transient"
+    assert inc_adhoc.incident_type == "unknown"
+    deliv_adhoc = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_adhoc == 0
+    assert len(sent_messages) == 0
+
+    # Case 3C: Real domain InsufficientBalanceError
+    exc_domain_bal = InsufficientBalanceError("Actual domain balance exhausted")
+    pf_domain_bal = normalize_exception(exc_domain_bal, "OpenAI", "chat")
+    assert pf_domain_bal.classification == "insufficient_balance_quota"
+    assert pf_domain_bal.classification_source == "sdk_typed_exception"
+    assert pf_domain_bal.operator_action_required is True
+
+    sent_messages.clear()
+    inc_domain = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_domain_bal,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-domain-bal",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_domain.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_domain.status == "active"
+    assert inc_domain.incident_type == "insufficient_balance_quota"
+    deliv_domain = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_domain > 0
+    assert len(sent_messages) > 0
 
 
 

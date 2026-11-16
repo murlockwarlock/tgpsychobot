@@ -197,6 +197,8 @@ KNOWN_TECHNICAL_CODES: frozenset[str] = frozenset(
         "unsupported_region",
         "superseded_by_key_rotation",
     }
+    | {f"inferred_{cls}" for cls in CANONICAL_CLASSES}
+    | {"inferred_unspecified"}
 )
 OPENROUTER_TYPES = frozenset("context_length_exceeded max_tokens_exceeded token_limit_exceeded string_too_long authentication permission_denied payment_required rate_limit_exceeded provider_overloaded provider_unavailable invalid_request invalid_prompt not_found precondition_failed payload_too_large unprocessable content_policy_violation refusal invalid_image image_too_large image_too_small unsupported_image_format image_not_found image_download_failed server timeout unmapped".split())
 _OPENROUTER_HTTP_LIKE_CODES = frozenset({400, 401, 402, 403, 404, 408, 409, 413, 422, 429, 500, 501, 502, 503, 504})
@@ -466,7 +468,25 @@ def is_openai_image_size_incompatibility(failure: ProviderFailure | None) -> boo
     )
 
 
+_TRUSTED_SDK_MODULE_PREFIXES: tuple[str, ...] = (
+    "openai",
+    "anthropic",
+    "google.genai",
+    "google.api_core",
+    "google.generativeai",
+    "google.cloud",
+)
+_TRUSTED_DOMAIN_MODULE_PREFIXES: tuple[str, ...] = (
+    "ai_integration",
+    "background_worker",
+    "max_messenger_bot",
+    "provider_adapters",
+    "ai_cache",
+)
+
+
 def normalize_exception(exception: Exception, provider: str = "", operation: str = "chat") -> ProviderFailure:
+    # 1. Pre-attached or already normalized ProviderFailure
     if isinstance(exception, ProviderFailure):
         return exception
     chain, seen = [], set()
@@ -479,21 +499,79 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
         existing = getattr(item, "failure", None)
         if isinstance(existing, ProviderFailure):
             return existing
+
+    # 2. Structured HTTP Response & status code (Highest priority for remote API errors)
+    for item in chain:
+        response = getattr(item, "response", None)
+        body = getattr(item, "body", None)
+        headers = getattr(response, "headers", None)
+        raw_status = (
+            getattr(response, "status_code", None)
+            or getattr(item, "http_status", None)
+            or getattr(item, "status_code", None)
+            or (getattr(item, "status", None) if isinstance(getattr(item, "status", None), int) else None)
+        )
+        if response is not None and body is None:
+            try:
+                body = response.json()
+            except (ValueError, TypeError, AttributeError):
+                pass
+        if body is not None or raw_status is not None:
+            if isinstance(body, dict) and "error" not in body and any(k in body for k in ("type", "message")):
+                body = {"error": body}
+            failure = parse_provider_failure(provider, operation, raw_status, body, headers)
+            if failure:
+                if failure.classification_source == "http_status_fallback":
+                    response_headers = getattr(getattr(item, "response", None), "headers", None)
+                    enriched = parse_provider_failure(
+                        provider,
+                        operation,
+                        raw_status,
+                        {"error": {"message": safe_message(item)}},
+                        response_headers,
+                    )
+                    if enriched is not None and enriched.classification_source != "http_status_fallback":
+                        return enriched
+                return failure
+
+    # 3. Transport-level exceptions (failed before/during TCP/TLS connection)
     for item in chain:
         cls = None
         if isinstance(item, (TimeoutError, httpx.TimeoutException)) or type(item).__name__ == "APITimeoutError":
             cls = "timeout"
-        elif isinstance(item, ssl.SSLError) or "sslerror" in type(item).__name__.lower() or "ssl" in str(item).lower() and "unexpected_eof" in str(item).lower():
+        elif (
+            isinstance(item, ssl.SSLError)
+            or "sslerror" in type(item).__name__.lower()
+            or ("ssl" in str(item).lower() and "unexpected_eof" in str(item).lower())
+        ):
             cls = "network_ssl"
         elif isinstance(item, httpx.ProxyError):
             cls = "proxy_error"
         elif isinstance(item, (httpx.TransportError, ConnectionError)) or type(item).__name__ == "APIConnectionError":
             cls = "network_connection"
         if cls:
-            return ProviderFailure(provider, operation, cls, cls, provider_error_message=safe_message(item), retryable=True, transient=True, classification_source="transport")
+            return ProviderFailure(
+                provider,
+                operation,
+                cls,
+                cls,
+                provider_error_message=safe_message(item),
+                retryable=True,
+                transient=True,
+                network_attempted=True,
+                classification_source="transport",
+            )
+
+    # 4. Trusted Domain & SDK exceptions WITHOUT HTTP response
     for item in chain:
         t_name = type(item).__name__
-        if t_name == "InsufficientBalanceError":
+        mod = getattr(type(item), "__module__", "") or ""
+
+        # 4a. Domain InsufficientBalanceError (verified origin)
+        if t_name == "InsufficientBalanceError" and (
+            mod.startswith(_TRUSTED_DOMAIN_MODULE_PREFIXES)
+            or "InsufficientBalanceError" in str(type(item).__mro__)
+        ):
             return ProviderFailure(
                 provider=provider,
                 operation=operation,
@@ -506,98 +584,76 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
                 operator_action_required=True,
                 classification_source="sdk_typed_exception",
             )
-        elif t_name == "AuthenticationError":
-            return ProviderFailure(
-                provider=provider,
-                operation=operation,
-                classification="auth",
-                detail_code="authentication_error",
-                provider_error_message=safe_message(item),
-                retryable=False,
-                transient=False,
-                network_attempted=True,
-                operator_action_required=True,
-                classification_source="sdk_typed_exception",
-            )
-        elif t_name == "PermissionDeniedError":
-            return ProviderFailure(
-                provider=provider,
-                operation=operation,
-                classification="permission",
-                detail_code="permission_denied",
-                provider_error_message=safe_message(item),
-                retryable=False,
-                transient=False,
-                network_attempted=True,
-                operator_action_required=True,
-                classification_source="sdk_typed_exception",
-            )
-        elif t_name == "RateLimitError":
-            return ProviderFailure(
-                provider=provider,
-                operation=operation,
-                classification="rate_limit",
-                detail_code="rate_limit_error",
-                provider_error_message=safe_message(item),
-                retryable=True,
-                transient=True,
-                network_attempted=True,
-                operator_action_required=False,
-                classification_source="sdk_typed_exception",
-            )
-        elif t_name == "InternalServerError":
-            return ProviderFailure(
-                provider=provider,
-                operation=operation,
-                classification="provider_5xx",
-                detail_code="internal_server_error",
-                provider_error_message=safe_message(item),
-                retryable=True,
-                transient=True,
-                network_attempted=True,
-                operator_action_required=False,
-                classification_source="sdk_typed_exception",
-            )
-        elif t_name == "NotFoundError":
-            return ProviderFailure(
-                provider=provider,
-                operation=operation,
-                classification="configuration",
-                detail_code="not_found",
-                provider_error_message=safe_message(item),
-                retryable=False,
-                transient=False,
-                network_attempted=False,
-                operator_action_required=True,
-                classification_source="sdk_typed_exception",
-            )
-    for item in chain:
-        response = getattr(item, "response", None)
-        body = getattr(item, "body", None)
-        headers = getattr(response, "headers", None)
-        status = getattr(response, "status_code", None) or getattr(item, "http_status", None) or getattr(item, "status_code", None)
-        if response is not None and body is None:
-            try:
-                body = response.json()
-            except (ValueError, TypeError, AttributeError):
-                pass
-        if body is not None or status is not None:
-            if isinstance(body, dict) and "error" not in body and any(k in body for k in ("type", "message")):
-                body = {"error": body}
-            failure = parse_provider_failure(provider, operation, status, body, headers)
-            if failure:
-                if failure.classification_source == "http_status_fallback":
-                    response_headers = getattr(getattr(item, "response", None), "headers", None)
-                    enriched = parse_provider_failure(
-                        provider,
-                        operation,
-                        status,
-                        {"error": {"message": safe_message(item)}},
-                        response_headers,
-                    )
-                    if enriched is not None and enriched.classification_source != "http_status_fallback":
-                        return enriched
-                return failure
+
+        # 4b. Verified Provider SDK exceptions (only from real SDK modules)
+        if mod.startswith(_TRUSTED_SDK_MODULE_PREFIXES):
+            if t_name in ("AuthenticationError", "Unauthenticated"):
+                return ProviderFailure(
+                    provider=provider,
+                    operation=operation,
+                    classification="auth",
+                    detail_code="authentication_error",
+                    provider_error_message=safe_message(item),
+                    retryable=False,
+                    transient=False,
+                    network_attempted=True,
+                    operator_action_required=True,
+                    classification_source="sdk_typed_exception",
+                )
+            elif t_name in ("PermissionDeniedError", "PermissionDenied"):
+                return ProviderFailure(
+                    provider=provider,
+                    operation=operation,
+                    classification="permission",
+                    detail_code="permission_denied",
+                    provider_error_message=safe_message(item),
+                    retryable=False,
+                    transient=False,
+                    network_attempted=True,
+                    operator_action_required=True,
+                    classification_source="sdk_typed_exception",
+                )
+            elif t_name in ("RateLimitError", "ResourceExhausted"):
+                return ProviderFailure(
+                    provider=provider,
+                    operation=operation,
+                    classification="rate_limit",
+                    detail_code="rate_limit_error",
+                    provider_error_message=safe_message(item),
+                    retryable=True,
+                    transient=True,
+                    network_attempted=True,
+                    operator_action_required=False,
+                    classification_source="sdk_typed_exception",
+                )
+            elif t_name in ("InternalServerError", "ServiceUnavailable"):
+                return ProviderFailure(
+                    provider=provider,
+                    operation=operation,
+                    classification="provider_5xx",
+                    detail_code="internal_server_error",
+                    provider_error_message=safe_message(item),
+                    retryable=True,
+                    transient=True,
+                    network_attempted=True,
+                    operator_action_required=False,
+                    classification_source="sdk_typed_exception",
+                )
+            elif t_name in ("NotFoundError", "NotFound"):
+                return ProviderFailure(
+                    provider=provider,
+                    operation=operation,
+                    classification="invalid_model_or_resource",
+                    detail_code="model_not_found",
+                    provider_error_message=safe_message(item),
+                    retryable=False,
+                    transient=False,
+                    network_attempted=True,
+                    operator_action_required=True,
+                    classification_source="sdk_typed_exception",
+                )
+
+    # 5. Application internal exceptions
     if any(isinstance(item, (TypeError, AttributeError, AssertionError, KeyError)) for item in chain):
         item = chain[-1]
         return ProviderFailure(
@@ -612,15 +668,37 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
             operator_action_required=False,
             classification_source="message_fallback",
         )
+
+    # 6. Explicit classification attribute
     for item in chain:
         explicit = getattr(item, "classification", None)
         if explicit:
             cls = canonical_classification(explicit)
-            network = getattr(item, "network_attempted", cls != "configuration")
-            if cls == "configuration":
+            mod = getattr(type(item), "__module__", "") or ""
+            is_trusted = (
+                mod.startswith(_TRUSTED_SDK_MODULE_PREFIXES)
+                or mod.startswith(_TRUSTED_DOMAIN_MODULE_PREFIXES)
+            )
+            network = getattr(item, "network_attempted", cls not in ("configuration", "application_internal"))
+            if cls in ("configuration", "application_internal"):
                 network = False
             retryable = bool(getattr(item, "retryable", cls in RETRYABLE_CLASSES)) and network
-            return ProviderFailure(provider, operation, cls, str(explicit), provider_error_message=safe_message(item), retryable=retryable, transient=retryable, network_attempted=network, operator_action_required=cls in OPERATOR_CLASSES, classification_source="sdk_typed_exception")
+            operator = (cls in OPERATOR_CLASSES) and is_trusted
+            source = "sdk_typed_exception" if is_trusted else "message_fallback"
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification=cls,
+                detail_code=str(explicit),
+                provider_error_message=safe_message(item),
+                retryable=retryable,
+                transient=retryable,
+                network_attempted=network,
+                operator_action_required=operator,
+                classification_source=source,
+            )
+
+    # 7. Fallback text diagnostic matching
     fallback_text = " ".join(str(item) for item in chain).lower()
     if any(marker in fallback_text for marker in ("timed out", "timeout", "status code 408")):
         cls = "timeout"
@@ -642,7 +720,7 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
     else:
         cls = "unknown"
     retryable = cls in RETRYABLE_CLASSES
-    network_attempted = cls != "configuration"
+    network_attempted = cls not in ("configuration", "application_internal")
     return ProviderFailure(
         provider,
         operation,
