@@ -154,7 +154,13 @@ fi
 
 tar czf - -- "${TRACKED_FILES[@]}" | \
 "${SSH_CMD[@]}" "${USER_NAME}@${HOST}" \
-    "cd '${REMOTE_DIR}' && tar xzf -"
+    "cd '${REMOTE_DIR}' && \
+     mkdir -p /root/telegram_bots/backups && \
+     PREV_REV=\$(cat REVISION 2>/dev/null || echo 'unknown') && \
+     BACKUP_FILE=\"/root/telegram_bots/backups/newbots_pre_\${PREV_REV}_\$(date +%Y%m%d_%H%M%S).tar.gz\" && \
+     tar -czf \"\$BACKUP_FILE\" --exclude='*.db' --exclude='*.sqlite*' --exclude='chroma_db_*' --exclude='logs' --exclude='media' -C '${REMOTE_DIR}' . && \
+     echo \"\$BACKUP_FILE\" > /root/telegram_bots/backups/LATEST_PRE_DEPLOY_ARCHIVE && \
+     tar xzf -"
 
 if [[ "$DEPLOY_MODE" == "rename" ]]; then
     "${SSH_CMD[@]}" "${USER_NAME}@${HOST}" \
