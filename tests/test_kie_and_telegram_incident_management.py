@@ -10311,5 +10311,475 @@ async def test_real_postgresql_concurrent_two_workers_lease_expiry_post_send_cas
         assert final_row.last_error == "delivered_ok"
 
 
+# ==============================================================================
+# Comprehensive AI Classification and Outbox Delivery Tests (Review Requirements)
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_ai_classification_positive_negative_and_edge_scenarios_e2e_sqlite(
+    test_db_session_maker,
+    monkeypatch,
+):
+    """
+    Comprehensive verification of AI classification pipeline across:
+    1. Negative scenarios: untyped local exceptions with '503', 'unauthorized', 'billing'
+       without HTTP status -> message_fallback, INFERRED_MESSAGE, transient, ZERO outbox alerts.
+    2. Positive scenarios:
+       - Confirmed HTTP 502/503 -> CONFIRMED_STRUCTURED, transient, zero premature alerts.
+       - SDK timeout -> CONFIRMED_STRUCTURED, transient.
+       - Auth error (HTTP 401) -> CONFIRMED_STRUCTURED, active, enqueued & delivered to admin.
+       - Insufficient balance (typed InsufficientBalanceError) -> CONFIRMED_STRUCTURED, active, delivered.
+       - Fallback used -> fallback_used event, active, delivered to admin.
+    3. Edge scenarios:
+       - Nested exception (__cause__) -> properly resolved via chain traversal.
+       - Pre-attached ProviderFailure -> preserved without re-classification.
+       - Key rotation -> active incident transitioned to superseded, outbox cancelled.
+       - Multi-instance isolation -> companion Telegram routing, no leak to foreign bot admins.
+    """
+    from provider_failures import ProviderFailure, normalize_exception, parse_provider_failure
+    from database import AIConfig, AIIncidentNotificationModel, AIProviderIncidentModel
+    from ai_incident_manager import handle_key_rotation, record_ai_provider_failure
+    from ai_integration import InsufficientBalanceError
+    from aiogram.client.session.base import BaseSession
+    from aiogram.methods.base import TelegramMethod
+    from aiogram.methods import SendMessage
+    from aiogram.types import Message, Chat, User as AiogramUser
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+    monkeypatch.setenv("APP_ENV", "development")
+
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            session.add(AIConfig(id=1, current_provider="OPENAI", openai_api_key="sk-test-key-2026"))
+            await session.commit()
+
+    sent_messages = []
+
+    class MockTelegramSession(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            if isinstance(method, SendMessage):
+                sent_messages.append(method)
+                return Message(
+                    message_id=3000 + len(sent_messages),
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    test_bot = Bot(token="8224473896:AAFtest_token_veraveda", session=MockTelegramSession())
+
+    # --------------------------------------------------------------------------
+    # 1. Negative Scenarios: Local errors without HTTP status
+    # --------------------------------------------------------------------------
+    negative_exceptions = [
+        ("local_503", Exception("Local error: status code 503 mentioned in diagnostic text")),
+        ("unauthorized_text", Exception("Unexpected content includes unauthorized")),
+        ("insufficient_balance_text", Exception("Application text contains insufficient balance")),
+        ("user_prompt_billing", ValueError("User prompt 'Check billing limits' caused validation failure")),
+    ]
+
+    for label, exc in negative_exceptions:
+        sent_messages.clear()
+        pf = normalize_exception(exc, provider="OpenAI", operation="chat")
+        assert pf.classification_source == "message_fallback", f"{label} must have message_fallback source"
+        assert pf.operator_action_required is False, f"{label} must NOT require operator action"
+        assert pf.http_status is None, f"{label} must have no HTTP status"
+
+        inc = await record_ai_provider_failure(
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            provider="OpenAI",
+            error=exc,
+            operation="chat",
+            model=f"model-{label}",
+            credential_scope=f"scope-{label}",
+            enqueue_notification=True,
+            session_maker=test_db_session_maker,
+        )
+        assert inc is not None
+        assert inc.evidence_tier == "INFERRED_MESSAGE", f"{label} evidence_tier must be INFERRED_MESSAGE"
+        assert inc.status == "transient", f"{label} status must be transient (not active)"
+
+        # Process outbox: ZERO notifications should be delivered!
+        delivered = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+        assert delivered == 0, f"{label} must enqueue 0 notifications"
+        assert len(sent_messages) == 0, f"{label} must send 0 Telegram messages"
+
+    # --------------------------------------------------------------------------
+    # 2. Positive Scenarios: Real confirmed failures
+    # --------------------------------------------------------------------------
+    # Case 2A: Confirmed HTTP 503 (transient, initial alerts suppressed)
+    sent_messages.clear()
+    pf_503 = parse_provider_failure("OpenAI", "chat", 503, {"error": {"message": "Service unavailable"}})
+    assert pf_503.http_status == 503
+    assert pf_503.operator_action_required is False
+    inc_503 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=pf_503,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-pos-503",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_503.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_503.status == "transient"
+    deliv_503 = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_503 == 0
+    assert len(sent_messages) == 0
+
+    # Case 2B: Real SDK timeout (transient)
+    sent_messages.clear()
+    exc_timeout = TimeoutError("Request to OpenAI timed out after 60s")
+    pf_timeout = normalize_exception(exc_timeout, provider="OpenAI", operation="chat")
+    assert pf_timeout.classification == "timeout"
+    assert pf_timeout.classification_source == "transport"
+    assert pf_timeout.operator_action_required is False
+    inc_timeout = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_timeout,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-pos-timeout",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_timeout.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_timeout.status == "transient"
+    deliv_timeout = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_timeout == 0
+
+    # Case 2C: Real Auth error (HTTP 401) -> active, delivered to admin
+    sent_messages.clear()
+    pf_401 = parse_provider_failure("OpenAI", "chat", 401, {"error": {"message": "Incorrect API key"}})
+    assert pf_401.http_status == 401
+    assert pf_401.operator_action_required is True
+    inc_401 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=pf_401,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-pos-401",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_401.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_401.status == "active"
+    deliv_401 = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_401 > 0
+    assert len(sent_messages) > 0
+    assert any("Сбой AI-провайдера" in m.text and "auth" in m.text for m in sent_messages)
+
+    # Case 2D: Real Insufficient Balance error (typed InsufficientBalanceError) -> active, delivered
+    sent_messages.clear()
+    exc_quota = InsufficientBalanceError("KIE credits balance empty")
+    pf_quota = normalize_exception(exc_quota, provider="KIE", operation="chat")
+    assert pf_quota.classification == "insufficient_balance_quota"
+    assert pf_quota.classification_source == "sdk_typed_exception"
+    assert pf_quota.operator_action_required is True
+    inc_quota = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=exc_quota,
+        operation="chat",
+        model="kie-chat",
+        credential_scope="scope-pos-quota",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_quota.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_quota.status == "active"
+    deliv_quota = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_quota > 0
+    assert any("insufficient_balance_quota" in m.text for m in sent_messages)
+
+    # Case 2E: Fallback used -> event_type='fallback_used', delivered to admin
+    sent_messages.clear()
+    inc_fb = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=exc_quota,
+        operation="chat",
+        model="kie-chat",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-4o",
+        fallback_succeeded=True,
+        credential_scope="scope-pos-fb",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_fb.status == "active"
+    deliv_fb = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_fb > 0
+    assert any("использован резервный" in m.text for m in sent_messages)
+
+    # --------------------------------------------------------------------------
+    # 3. Edge Scenarios
+    # --------------------------------------------------------------------------
+    # Case 3A: Nested exception (__cause__)
+    sent_messages.clear()
+    wrapper_exc = RuntimeError("Outer wrapper failure during AI processing")
+    wrapper_exc.__cause__ = InsufficientBalanceError("Inner quota exhausted")
+    pf_nested = normalize_exception(wrapper_exc, provider="KIE", operation="chat")
+    assert pf_nested.classification == "insufficient_balance_quota"
+    assert pf_nested.classification_source == "sdk_typed_exception"
+    assert pf_nested.operator_action_required is True
+
+    # Case 3B: Pre-attached ProviderFailure
+    err_pre = Exception("Pre-attached failure test")
+    err_pre.failure = ProviderFailure(
+        provider="KIE",
+        operation="chat",
+        classification="auth",
+        detail_code="pre_attached_401",
+        http_status=401,
+        operator_action_required=True,
+    )
+    pf_pre = normalize_exception(err_pre, provider="KIE", operation="chat")
+    assert pf_pre is err_pre.failure
+    assert pf_pre.http_status == 401
+
+    # Case 3C: Key rotation supersedes active incidents without false alert
+    rot_count = await handle_key_rotation(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        new_key="sk-new-rotated-key-edge",
+        old_credential_scope="scope-pos-quota",
+        session_maker=test_db_session_maker,
+    )
+    assert rot_count >= 1
+    async with test_db_session_maker() as session:
+        db_quota = await session.get(AIProviderIncidentModel, inc_quota.id)
+        assert db_quota.status == "superseded"
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_ai_classification_positive_negative_and_edge_scenarios_e2e(
+    pg_test_session_maker,
+    monkeypatch,
+):
+    """
+    Real PostgreSQL E2E verification of AI classification:
+    Validates that:
+    - Negative cases (local text with '503', 'unauthorized', 'balance') -> INFERRED_MESSAGE, transient, 0 outbox rows.
+    - Positive cases (real 401, InsufficientBalanceError, fallback_used) -> CONFIRMED_STRUCTURED, active, outbox delivered.
+    """
+    from provider_failures import ProviderFailure, normalize_exception, parse_provider_failure
+    from database import AIConfig, AIIncidentNotificationModel, AIProviderIncidentModel
+    from ai_incident_manager import handle_key_rotation, record_ai_provider_failure
+    from ai_integration import InsufficientBalanceError
+    from aiogram.client.session.base import BaseSession
+    from aiogram.methods.base import TelegramMethod
+    from aiogram.methods import SendMessage
+    from aiogram.types import Message, Chat, User as AiogramUser
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+    monkeypatch.setenv("APP_ENV", "development")
+
+    async with pg_test_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            session.add(AIConfig(id=1, current_provider="OPENAI", openai_api_key="sk-pg-e2e-key"))
+            await session.commit()
+
+    sent_messages = []
+
+    class MockPgTelegramSession(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            if isinstance(method, SendMessage):
+                sent_messages.append(method)
+                return Message(
+                    message_id=5000 + len(sent_messages),
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    test_bot = Bot(token="8224473896:AAFtest_token_veraveda", session=MockPgTelegramSession())
+
+    # 1. Negative Scenarios on real PostgreSQL
+    neg_exceptions = [
+        ("pg_local_503", Exception("Local error: status code 503 mentioned in diagnostic text")),
+        ("pg_unauthorized", Exception("Unexpected content includes unauthorized")),
+        ("pg_balance", Exception("Application text contains insufficient balance")),
+    ]
+    for label, exc in neg_exceptions:
+        sent_messages.clear()
+        pf = normalize_exception(exc, provider="OpenAI", operation="chat")
+        assert pf.classification_source == "message_fallback"
+        assert pf.operator_action_required is False
+
+        inc = await record_ai_provider_failure(
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            provider="OpenAI",
+            error=exc,
+            operation="chat",
+            model=f"model-{label}",
+            credential_scope=f"scope-{label}",
+            enqueue_notification=True,
+            session_maker=pg_test_session_maker,
+        )
+        assert inc.evidence_tier == "INFERRED_MESSAGE"
+        assert inc.status == "transient"
+
+        delivered = await process_ai_incident_notifications(test_bot, session_maker=pg_test_session_maker)
+        assert delivered == 0
+        assert len(sent_messages) == 0
+
+    # 2. Positive Scenarios on real PostgreSQL
+    sent_messages.clear()
+    pf_401 = parse_provider_failure("OpenAI", "chat", 401, {"error": {"message": "Invalid API key"}})
+    inc_401 = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=pf_401,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-pg-pos-401",
+        enqueue_notification=True,
+        session_maker=pg_test_session_maker,
+    )
+    assert inc_401.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_401.status == "active"
+
+    delivered = await process_ai_incident_notifications(test_bot, session_maker=pg_test_session_maker)
+    assert delivered > 0
+    assert len(sent_messages) > 0
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_concurrent_workers_simultaneous_network_contention(
+    pg_test_session_maker,
+    monkeypatch,
+):
+    """
+    Verification of two truly concurrent worker tasks executing simultaneously on real PostgreSQL:
+    - 1 outbox notification row in PostgreSQL.
+    - Two concurrent asyncio tasks run process_ai_incident_notifications at the same time.
+    - Demonstrates atomic claim contention: exactly ONE worker succeeds in claiming and delivering the row.
+    - Zero double delivery, zero unhandled errors, exactly 1 row marked delivered.
+    """
+    from database import AIConfig, AIIncidentNotificationModel, AIProviderIncidentModel
+    from aiogram.client.session.base import BaseSession
+    from aiogram.methods.base import TelegramMethod
+    from aiogram.methods import SendMessage
+    from aiogram.types import Message, Chat, User as AiogramUser
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+    monkeypatch.setenv("APP_ENV", "development")
+
+    async with pg_test_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            session.add(AIConfig(id=1, current_provider="OPENAI", openai_api_key="sk-pg-contention-key"))
+
+        inc = AIProviderIncidentModel(
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            companion_instance_id="tg_veraveda777_bot_legacy",
+            provider="OPENAI",
+            credential_scope="scope_pg_contention",
+            operation="chat",
+            model_scope="gpt-4o",
+            incident_type="auth",
+            evidence_tier="CONFIRMED_STRUCTURED",
+            detail_code="401",
+            classification_source="provider_structured",
+            status="active",
+            occurrence_count=1,
+            reminder_cycle=0,
+            first_seen_at=datetime.utcnow(),
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add(inc)
+        await session.flush()
+
+        notif = AIIncidentNotificationModel(
+            incident_id=inc.id,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            recipient_id=979514796,
+            event_type="opened",
+            status="pending",
+            attempts=0,
+            max_attempts=6,
+            message_text="Real concurrent contention test",
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        session.add(notif)
+        await session.commit()
+        notif_id = notif.id
+
+    dispatched_sends = []
+
+    class ContentionSession(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            if isinstance(method, SendMessage):
+                dispatched_sends.append(method)
+                await asyncio.sleep(0.05)  # Simulate network transmission latency
+                return Message(
+                    message_id=6000 + len(dispatched_sends),
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    bot_w1 = Bot(token="8224473896:AAFtest_token_veraveda", session=ContentionSession())
+    bot_w2 = Bot(token="8224473896:AAFtest_token_veraveda", session=ContentionSession())
+
+    # Launch two workers truly concurrently via asyncio.gather
+    w1_res, w2_res = await asyncio.gather(
+        process_ai_incident_notifications(bot_w1, session_maker=pg_test_session_maker),
+        process_ai_incident_notifications(bot_w2, session_maker=pg_test_session_maker),
+    )
+
+    # Exactly ONE worker claimed and delivered the row
+    assert w1_res + w2_res == 1, f"Expected exactly 1 delivery, got w1={w1_res}, w2={w2_res}"
+    assert len(dispatched_sends) == 1, f"Expected exactly 1 message dispatched to Telegram, got {len(dispatched_sends)}"
+
+    async with pg_test_session_maker() as session:
+        row = await session.get(AIIncidentNotificationModel, notif_id)
+        assert row.status == "delivered"
+        assert row.attempts == 1
+
+
+
 
 

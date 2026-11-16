@@ -492,6 +492,86 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
         if cls:
             return ProviderFailure(provider, operation, cls, cls, provider_error_message=safe_message(item), retryable=True, transient=True, classification_source="transport")
     for item in chain:
+        t_name = type(item).__name__
+        if t_name == "InsufficientBalanceError":
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="insufficient_balance_quota",
+                detail_code="insufficient_balance",
+                provider_error_message=safe_message(item),
+                retryable=False,
+                transient=False,
+                network_attempted=True,
+                operator_action_required=True,
+                classification_source="sdk_typed_exception",
+            )
+        elif t_name == "AuthenticationError":
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="auth",
+                detail_code="authentication_error",
+                provider_error_message=safe_message(item),
+                retryable=False,
+                transient=False,
+                network_attempted=True,
+                operator_action_required=True,
+                classification_source="sdk_typed_exception",
+            )
+        elif t_name == "PermissionDeniedError":
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="permission",
+                detail_code="permission_denied",
+                provider_error_message=safe_message(item),
+                retryable=False,
+                transient=False,
+                network_attempted=True,
+                operator_action_required=True,
+                classification_source="sdk_typed_exception",
+            )
+        elif t_name == "RateLimitError":
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="rate_limit",
+                detail_code="rate_limit_error",
+                provider_error_message=safe_message(item),
+                retryable=True,
+                transient=True,
+                network_attempted=True,
+                operator_action_required=False,
+                classification_source="sdk_typed_exception",
+            )
+        elif t_name == "InternalServerError":
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="provider_5xx",
+                detail_code="internal_server_error",
+                provider_error_message=safe_message(item),
+                retryable=True,
+                transient=True,
+                network_attempted=True,
+                operator_action_required=False,
+                classification_source="sdk_typed_exception",
+            )
+        elif t_name == "NotFoundError":
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="configuration",
+                detail_code="not_found",
+                provider_error_message=safe_message(item),
+                retryable=False,
+                transient=False,
+                network_attempted=False,
+                operator_action_required=True,
+                classification_source="sdk_typed_exception",
+            )
+    for item in chain:
         response = getattr(item, "response", None)
         body = getattr(item, "body", None)
         headers = getattr(response, "headers", None)
@@ -563,7 +643,18 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
         cls = "unknown"
     retryable = cls in RETRYABLE_CLASSES
     network_attempted = cls != "configuration"
-    return ProviderFailure(provider, operation, cls, type(chain[-1]).__name__, provider_error_message=safe_message(chain[-1]), retryable=retryable, transient=retryable, network_attempted=network_attempted, operator_action_required=cls in OPERATOR_CLASSES, classification_source="message_fallback")
+    return ProviderFailure(
+        provider,
+        operation,
+        cls,
+        type(chain[-1]).__name__,
+        provider_error_message=safe_message(chain[-1]),
+        retryable=retryable,
+        transient=retryable,
+        network_attempted=network_attempted,
+        operator_action_required=False,
+        classification_source="message_fallback",
+    )
 
 
 def attach_failure(exception: Exception, failure: ProviderFailure) -> Exception:

@@ -417,7 +417,10 @@ async def _record_ai_provider_failure_impl(
     )
     evidence_tier = (
         "CONFIRMED_STRUCTURED"
-        if failure.classification_source in ("provider_structured", "http_status_fallback", "transport", "sdk_typed_exception")
+        if (
+            failure.classification_source in ("provider_structured", "http_status_fallback", "transport", "sdk_typed_exception")
+            or failure.http_status is not None
+        )
         else "INFERRED_MESSAGE"
     )
 
@@ -490,10 +493,11 @@ async def _record_ai_provider_failure_impl(
                         existing_superseded.resolved_at,
                     )
 
+        is_operator_incident = bool(failure.operator_action_required) and evidence_tier == "CONFIRMED_STRUCTURED"
         if is_retired:
             target_status = "superseded"
             enqueue_notification = False
-        elif failure.operator_action_required:
+        elif is_operator_incident:
             target_status = "active"
         else:
             target_status = "transient"
