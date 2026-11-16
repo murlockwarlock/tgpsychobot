@@ -1896,9 +1896,16 @@ async def process_ai_incident_notifications(
                         updated_at=ts_post,
                     )
                 )
-                await session.execute(stmt)
+                res = await session.execute(stmt)
                 await session.commit()
-                return True
+                if (res.rowcount or 0) > 0:
+                    return True
+                logger.warning(
+                    "[AI Outbox] Post-send delivery CAS missed row %s with token %s (lease expired or stolen). Not marking as delivered.",
+                    row_id,
+                    token,
+                )
+                return False
             else:
                 new_status = "failed_terminal" if is_terminal or attempts >= effective_max_attempts else "pending"
                 next_retry = None if new_status == "failed_terminal" else (ts_post + retry_delay)
@@ -1916,8 +1923,14 @@ async def process_ai_incident_notifications(
                         updated_at=ts_post,
                     )
                 )
-                await session.execute(stmt)
+                res = await session.execute(stmt)
                 await session.commit()
+                if (res.rowcount or 0) == 0:
+                    logger.warning(
+                        "[AI Outbox] Post-send failure CAS missed row %s with token %s (claim superseded).",
+                        row_id,
+                        token,
+                    )
                 return False
 
     for cand_id in candidates:

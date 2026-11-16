@@ -92,6 +92,8 @@ class ProviderFailure:
                 if not self.retryable and safe_c in RETRYABLE_CLASSES:
                     object.__setattr__(self, "retryable", True)
                     object.__setattr__(self, "transient", True)
+                if not self.operator_action_required and safe_c in OPERATOR_CLASSES:
+                    object.__setattr__(self, "operator_action_required", True)
         if safe_c != self.classification:
             object.__setattr__(self, "classification", safe_c)
 

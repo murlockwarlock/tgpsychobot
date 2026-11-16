@@ -9352,5 +9352,288 @@ async def test_genuine_instance_registry_and_telegram_method_boundary(test_db_se
         assert "Gemini / gemini-2.0-flash" in req.text
 
 
+@pytest.mark.asyncio
+async def test_fallback_alert_pii_exception_sanitization(
+    test_db_session_maker,
+    monkeypatch,
+):
+    import error_reporting
+    from aiogram.client.session.base import BaseSession
+    from aiogram.methods.base import TelegramMethod
+    from aiogram.methods import SendMessage
+    from aiogram.types import Message, Chat, User as AiogramUser
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+    monkeypatch.setenv("APP_ENV", "development")
+
+    from database import AIConfig
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            session.add(AIConfig(id=1, current_provider="DEEPSEEK", deepseek_api_key="sk-test-key"))
+            await session.commit()
+
+    class Patient_123456789_Error(Exception):
+        pass
+
+    class User_987654_Secret_Exception(Exception):
+        pass
+
+    sent_messages = []
+
+    class MockSession(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            if isinstance(method, SendMessage):
+                sent_messages.append(method)
+                return Message(
+                    message_id=1001,
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    mock_bot = Bot(token="8224473896:AAFtest_token_veraveda", session=MockSession())
+
+    # 1. Test with custom exception class containing patient ID
+    res1 = await error_reporting.send_ai_fallback_used_alert(
+        bot=mock_bot,
+        primary_provider="Deepseek",
+        primary_model="deepseek-chat",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-4o",
+        primary_error=Patient_123456789_Error("Sensitive patient medical diagnostic"),
+        session_maker=test_db_session_maker,
+    )
+    assert res1 is True
+    assert len(sent_messages) > 0
+    for msg in sent_messages:
+        assert "Patient_123456789_Error" not in msg.text
+        assert "Sensitive patient medical diagnostic" not in msg.text
+        assert "ProviderFailure" in msg.text
+
+    sent_messages.clear()
+
+    # 2. Test with string containing secret ID
+    res2 = await error_reporting.send_ai_fallback_used_alert(
+        bot=mock_bot,
+        primary_provider="Deepseek",
+        primary_model="deepseek-reasoner",
+        fallback_provider="OpenAI",
+        fallback_model="gpt-4o-mini",
+        primary_error="User_987654_Secret_Exception",
+        session_maker=test_db_session_maker,
+    )
+    assert res2 is True
+    assert len(sent_messages) > 0
+    for msg in sent_messages:
+        assert "User_987654_Secret_Exception" not in msg.text
+        assert "ProviderFailure" in msg.text
+
+    sent_messages.clear()
+
+    # 3. Test with canonical exception name (e.g. TimeoutError) -> preserved
+    res3 = await error_reporting.send_ai_fallback_used_alert(
+        bot=mock_bot,
+        primary_provider="OpenAI",
+        primary_model="gpt-4o",
+        fallback_provider="Deepseek",
+        fallback_model="deepseek-chat",
+        primary_error=TimeoutError("Request timed out after 30s"),
+        session_maker=test_db_session_maker,
+    )
+    assert res3 is True
+    assert len(sent_messages) > 0
+    for msg in sent_messages:
+        assert "TimeoutError" in msg.text
+
+
+@pytest.mark.asyncio
+async def test_outbox_post_send_cas_lost_claim_handling(
+    test_db_session_maker,
+    monkeypatch,
+):
+    from aiogram.client.session.base import BaseSession
+    from aiogram.methods.base import TelegramMethod
+    from aiogram.methods import SendMessage
+    from aiogram.types import Message, Chat, User as AiogramUser
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+    monkeypatch.setenv("APP_ENV", "development")
+
+    from database import AIConfig
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            session.add(AIConfig(id=1, current_provider="DEEPSEEK", deepseek_api_key="sk-test-key"))
+            await session.commit()
+
+    # Create parent incident and outbox row
+    async with test_db_session_maker() as session:
+        inc = AIProviderIncidentModel(
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            companion_instance_id="tg_veraveda777_bot_legacy",
+            provider="DEEPSEEK",
+            credential_scope="test_scope",
+            operation="chat",
+            model_scope="deepseek-chat",
+            incident_type="provider_5xx",
+            evidence_tier="CONFIRMED_STRUCTURED",
+            detail_code="500",
+            classification_source="provider_structured",
+            status="active",
+            occurrence_count=1,
+            reminder_cycle=0,
+            first_seen_at=datetime.utcnow(),
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add(inc)
+        await session.flush()
+
+        notif = AIIncidentNotificationModel(
+            incident_id=inc.id,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            recipient_id=979514796,  # Valid admin from bot_instances.json
+            event_type="opened",
+            status="pending",
+            attempts=0,
+            max_attempts=6,
+            message_text="Test incident notification",
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        session.add(notif)
+        await session.commit()
+        notif_id = notif.id
+
+    # Session where make_request simulates a concurrent worker stealing or modifying the claim during Telegram send
+    class ConcurrentInterferingSession(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            if isinstance(method, SendMessage):
+                # Another worker took over the row while worker A was waiting for Telegram
+                async with test_db_session_maker() as s:
+                    row = await s.get(AIIncidentNotificationModel, notif_id)
+                    assert row is not None
+                    # Overwrite claim_token to simulate lease expiration and reassignment
+                    row.claim_token = "stolen_by_worker_b"
+                    row.status = "processing"
+                    row.lease_until = datetime.utcnow() + timedelta(seconds=60)
+                    await s.commit()
+
+                return Message(
+                    message_id=9999,
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    test_bot = Bot(token="8224473896:AAFtest_token_veraveda", session=ConcurrentInterferingSession())
+
+    # Worker A runs process_ai_incident_notifications
+    delivered_count = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    # Since worker A's CAS update had rowcount == 0, it must NOT be counted as delivered!
+    assert delivered_count == 0, f"Expected delivered_count == 0 due to lost CAS claim, got {delivered_count}"
+
+    # Verify that the row in DB was NOT modified by Worker A to 'delivered'
+    async with test_db_session_maker() as session:
+        row = await session.get(AIIncidentNotificationModel, notif_id)
+        assert row.claim_token == "stolen_by_worker_b"
+        assert row.status == "processing"
+
+
+def test_provider_failure_http_status_operator_action_required_sync():
+    from provider_failures import ProviderFailure, parse_provider_failure
+
+    # 1. 401 Unauthorized -> auth (operator action required)
+    pf_401 = ProviderFailure(
+        provider="deepseek",
+        operation="chat",
+        classification="unknown",
+        detail_code="",
+        http_status=401,
+    )
+    assert pf_401.classification == "auth"
+    assert pf_401.classification_source == "http_status_fallback"
+    assert pf_401.operator_action_required is True
+    assert pf_401.retryable is False
+    assert pf_401.transient is False
+
+    # 2. 402 Payment Required -> insufficient_balance_quota (operator action required)
+    pf_402 = ProviderFailure(
+        provider="deepseek",
+        operation="chat",
+        classification="unknown",
+        detail_code="",
+        http_status=402,
+    )
+    assert pf_402.classification == "insufficient_balance_quota"
+    assert pf_402.operator_action_required is True
+    assert pf_402.retryable is False
+
+    # 3. 403 Forbidden -> permission (operator action required)
+    pf_403 = ProviderFailure(
+        provider="deepseek",
+        operation="chat",
+        classification="unknown",
+        detail_code="",
+        http_status=403,
+    )
+    assert pf_403.classification == "permission"
+    assert pf_403.operator_action_required is True
+
+    # 4. 404 Not Found -> invalid_model_or_resource (operator action required)
+    pf_404 = ProviderFailure(
+        provider="deepseek",
+        operation="chat",
+        classification="unknown",
+        detail_code="",
+        http_status=404,
+    )
+    assert pf_404.classification == "invalid_model_or_resource"
+    assert pf_404.operator_action_required is True
+
+    # 5. 500 Internal Server Error -> provider_5xx (retryable, NOT operator action)
+    pf_500 = ProviderFailure(
+        provider="deepseek",
+        operation="chat",
+        classification="unknown",
+        detail_code="",
+        http_status=500,
+    )
+    assert pf_500.classification == "provider_5xx"
+    assert pf_500.operator_action_required is False
+    assert pf_500.retryable is True
+    assert pf_500.transient is True
+
+    # 6. Verify parity with parse_provider_failure
+    parsed_401 = parse_provider_failure("deepseek", "chat", 401)
+    assert parsed_401 is not None
+    assert parsed_401.classification == "auth"
+    assert parsed_401.operator_action_required is True
+    assert parsed_401.classification == pf_401.classification
+    assert parsed_401.operator_action_required == pf_401.operator_action_required
+
+
 
 

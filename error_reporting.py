@@ -942,7 +942,15 @@ async def send_terminal_ai_failure_alert(
         err_type_str = error_type
     elif exception is not None:
         t_name = type(exception).__name__
-        err_type_str = t_name if (t_name in KNOWN_EXCEPTION_NAMES or t_name.lower() in KNOWN_TECHNICAL_CODES) else "AIServiceError"
+        err_type_str = (
+            t_name
+            if (
+                t_name in KNOWN_EXCEPTION_NAMES
+                or t_name.lower() in KNOWN_TECHNICAL_CODES
+                or t_name in _ERROR_CLASS_DESCRIPTIONS
+            )
+            else "AIServiceError"
+        )
     else:
         err_type_str = "AIServiceError"
 
@@ -1220,7 +1228,13 @@ async def send_ai_fallback_used_alert(
     session_maker: Any = None,
 ) -> bool:
     """Send realtime notification via durable outbox that reserve AI provider was used successfully."""
-    from provider_failures import ProviderFailure, CANONICAL_CLASSES, KNOWN_TECHNICAL_CODES, canonical_classification
+    from provider_failures import (
+        CANONICAL_CLASSES,
+        KNOWN_EXCEPTION_NAMES,
+        KNOWN_TECHNICAL_CODES,
+        ProviderFailure,
+        canonical_classification,
+    )
 
     clean_primary_prov = re.sub(r"[^A-Za-z0-9_\-\.]", "", str(primary_provider or failed_provider or "Unknown"))[:32] or "Unknown"
     clean_primary_mod = re.sub(r"[^A-Za-z0-9_\-\./:]", "", str(primary_model or failed_model or "—"))[:64] or "—"
@@ -1239,7 +1253,11 @@ async def send_ai_fallback_used_alert(
         cls_candidate = err_target.classification
         code = err_target.detail_code or err_target.provider_error_type or ""
         code_norm = code.strip().lower()
-        if code_norm in KNOWN_TECHNICAL_CODES or code_norm in _ERROR_CLASS_DESCRIPTIONS:
+        if (
+            code.strip() in KNOWN_EXCEPTION_NAMES
+            or code_norm in KNOWN_TECHNICAL_CODES
+            or code_norm in _ERROR_CLASS_DESCRIPTIONS
+        ):
             err_type_str = code.strip()
         elif err_target.classification in CANONICAL_CLASSES and err_target.classification != "unknown":
             err_type_str = err_target.classification
@@ -1247,14 +1265,24 @@ async def send_ai_fallback_used_alert(
             err_type_str = "ProviderFailure"
     elif isinstance(err_target, Exception):
         t_name = type(err_target).__name__
-        if re.match(r"^[A-Za-z0-9_]{1,64}$", t_name):
+        if (
+            t_name in KNOWN_EXCEPTION_NAMES
+            or t_name.lower() in KNOWN_TECHNICAL_CODES
+            or t_name in _ERROR_CLASS_DESCRIPTIONS
+        ):
             err_type_str = t_name
+        else:
+            err_type_str = "ProviderFailure"
         cls_candidate = getattr(err_target, "classification", None)
     elif isinstance(err_target, str):
         # Strictly accept only verified canonical technical codes; NEVER use regex or accept arbitrary free text
         s_code = err_target.strip()
         s_norm = s_code.lower()
-        if s_norm in KNOWN_TECHNICAL_CODES or s_norm in _ERROR_CLASS_DESCRIPTIONS:
+        if (
+            s_code in KNOWN_EXCEPTION_NAMES
+            or s_norm in KNOWN_TECHNICAL_CODES
+            or s_norm in _ERROR_CLASS_DESCRIPTIONS
+        ):
             err_type_str = s_code
             cls_candidate = s_norm
         else:
