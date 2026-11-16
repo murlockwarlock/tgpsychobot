@@ -1229,11 +1229,16 @@ async def resolve_low_credit_warning(
         fp = get_provider_account_fingerprint(api_key, base_url)
         auth_instance_id = companion_def["pm2_name"]
 
+        origin_names = {current_inst.get("pm2_name"), current_inst.get("bot_instance_id")}
+        if companion_def:
+            origin_names.update({companion_def.get("pm2_name"), companion_def.get("bot_instance_id")})
+        origin_names.discard(None)
+
         async with sm() as session:
             stmt = select(AIProviderIncidentModel).where(
                 or_(
-                    AIProviderIncidentModel.origin_instance_id == current_inst["pm2_name"],
-                    AIProviderIncidentModel.companion_instance_id == current_inst["pm2_name"],
+                    AIProviderIncidentModel.origin_instance_id.in_(origin_names),
+                    AIProviderIncidentModel.companion_instance_id.in_(origin_names),
                 ),
                 AIProviderIncidentModel.provider == prov_norm,
                 AIProviderIncidentModel.credential_scope == fp,
@@ -1242,40 +1247,41 @@ async def resolve_low_credit_warning(
                 AIProviderIncidentModel.incident_type == "low_credit_warning",
                 AIProviderIncidentModel.status == "active",
             )
-            active_inc = await session.scalar(stmt)
-            if not active_inc:
+            active_incs = (await session.execute(stmt)).scalars().all()
+            if not active_incs:
                 return False
 
-            active_inc.status = "resolved"
-            active_inc.resolved_at = now
+            for active_inc in active_incs:
+                active_inc.status = "resolved"
+                active_inc.resolved_at = now
 
-            admin_ids = await resolve_target_admin_ids(companion_def, current_instance=current_inst, session=session)
-            msg_text = (
-                f"✅ <b>Баланс {prov_norm} пополнен</b>\n\n"
-                f"Текущий остаток: <code>{remaining_credits:.2f}</code> кредитов "
-                f"(порог: <code>{threshold:.2f}</code>)."
-            )
-            for admin_id in admin_ids:
-                if not is_valid_telegram_user_id(admin_id):
-                    continue
-                notif = AIIncidentNotificationModel(
-                    incident_id=active_inc.id,
-                    event_type="resolved",
-                    cycle_index=0,
-                    recipient_id=admin_id,
-                    authorized_instance_id=auth_instance_id,
-                    message_text=msg_text,
-                    status="pending",
-                    attempts=0,
-                    max_attempts=MAX_OUTBOX_ATTEMPTS,
-                    next_retry_at=now,
+                admin_ids = await resolve_target_admin_ids(companion_def, current_instance=current_inst, session=session)
+                msg_text = (
+                    f"✅ <b>Баланс {prov_norm} пополнен</b>\n\n"
+                    f"Текущий остаток: <code>{remaining_credits:.2f}</code> кредитов "
+                    f"(порог: <code>{threshold:.2f}</code>)."
                 )
-                try:
-                    async with session.begin_nested():
-                        session.add(notif)
-                        await session.flush()
-                except IntegrityError:
-                    pass
+                for admin_id in admin_ids:
+                    if not is_valid_telegram_user_id(admin_id):
+                        continue
+                    notif = AIIncidentNotificationModel(
+                        incident_id=active_inc.id,
+                        event_type="resolved",
+                        cycle_index=0,
+                        recipient_id=admin_id,
+                        authorized_instance_id=auth_instance_id,
+                        message_text=msg_text,
+                        status="pending",
+                        attempts=0,
+                        max_attempts=MAX_OUTBOX_ATTEMPTS,
+                        next_retry_at=now,
+                    )
+                    try:
+                        async with session.begin_nested():
+                            session.add(notif)
+                            await session.flush()
+                    except IntegrityError:
+                        pass
 
             await session.commit()
             return True

@@ -3462,6 +3462,216 @@ async def test_invalid_proxy_config_fails_cleanly_without_direct_telegram_connec
     assert "issue" in state["pending_notifications"]
 
 
+# ============================================================================
+# Monitor Incident Deduplication and Stable Identity Tests
+# ============================================================================
+
+def test_monitor_normalize_issue_segment_dynamic_tokens():
+    # 1. Timestamps
+    s_ts = monitor._normalize_issue_segment("2026-03-30 14:15:00,123 error occurred at 12:30:45")
+    assert "TIMESTAMP" in s_ts
+    assert "TIME" in s_ts
+
+    # 2. Update IDs
+    assert monitor._normalize_issue_segment("Error while processing update 1001:") == "Error while processing update_id=N:"
+    assert monitor._normalize_issue_segment("update_id=1002 failed") == "update_id=N failed"
+    assert monitor._normalize_issue_segment("update id 1003 error") == "update_id=N error"
+    assert monitor._normalize_issue_segment("update #1004") == "update_id=N"
+    assert monitor._normalize_issue_segment("update_id: 1005") == "update_id=N"
+
+    # 3. Bot IDs & names
+    assert monitor._normalize_issue_segment("bot_id=123456 failed") == "bot_id=N failed"
+    assert monitor._normalize_issue_segment("bot 12345678: failed") == "bot bot_id=N: failed"
+    # Bot name like psychobot_1 or bot1 must not be stripped
+    assert monitor._normalize_issue_segment("psychobot_1: status online") == "psychobot_1: status online"
+    assert monitor._normalize_issue_segment("bot1: status online") == "bot1: status online"
+
+    # 4. User / Chat / Message IDs
+    assert monitor._normalize_issue_segment("user_id=98765 chat_id=54321 message_id=111") == "user_id=N chat_id=N message_id=N"
+
+    # 5. Counts, retries, pointers
+    assert monitor._normalize_issue_segment("5 polling fetch errors prompt_len=450 tryings=2 retry in 5 seconds at 0x7fff5fbff8c0") == (
+        "N polling fetch errors prompt_len=N tryings=N retry in N seconds at 0xADDR"
+    )
+
+
+def test_monitor_signature_deduplication_update_ids_and_repeated_tail():
+    state = {}
+    issue_update1 = "psychobot_1: Logs: 2026-03-30 14:15:00 [ERROR] telegram.ext.Application: Error while processing update 1001: TelegramBadRequest: Bad Request: message is not modified"
+    issue_update2 = "psychobot_1: Logs: 2026-03-30 14:20:00 [ERROR] telegram.ext.Application: Error while processing update 1002: TelegramBadRequest: Bad Request: message is not modified"
+
+    # Different update IDs must produce identical normalized strings and signatures
+    norm1 = monitor._normalize_issue_for_signature(issue_update1)
+    norm2 = monitor._normalize_issue_for_signature(issue_update2)
+    assert norm1 == norm2
+
+    # Initial check: should alert
+    assert monitor.should_alert([issue_update1], state) is True
+
+    # Record delivery
+    monitor.record_alert_delivered([issue_update1], state)
+
+    # Subsequent check with update 1002 within 6 hours must be suppressed (cooldown)
+    assert monitor.should_alert([issue_update2], state) is False
+
+    # Repeated error lines in tail: 1 line vs 2 lines with different update IDs
+    issue_repeated = (
+        "psychobot_1: Logs: 2026-03-30 14:15:00 [ERROR] telegram.ext.Application: Error while processing update 1001: TelegramBadRequest: Bad Request: message is not modified | "
+        "2026-03-30 14:20:00 [ERROR] telegram.ext.Application: Error while processing update 1002: TelegramBadRequest: Bad Request: message is not modified"
+    )
+    norm_repeated = monitor._normalize_issue_for_signature(issue_repeated)
+    assert norm_repeated == norm1
+    assert monitor.should_alert([issue_repeated], state) is False
+
+    # After 6 hours (REPEAT_ALERT_SECONDS + 1), should alert again
+    # Simulate time jump
+    for sig in state.get("alerts", {}):
+        state["alerts"][sig] -= (monitor.REPEAT_ALERT_SECONDS + 1)
+    assert monitor.should_alert([issue_update2], state) is True
+
+
+def test_monitor_signature_distinct_errors_alert_independently():
+    state = {}
+    # Telegram error 1: message is not modified
+    err1 = "psychobot_1: Logs: 2026-03-30 14:15:00 [ERROR] update 1001: TelegramBadRequest: Bad Request: message is not modified"
+    # Telegram error 2: chat not found
+    err2 = "psychobot_1: Logs: 2026-03-30 14:15:00 [ERROR] update 1001: TelegramBadRequest: Bad Request: chat not found"
+    # PM2 error
+    err_pm2 = "psychobot_1: PM2: status is stopped"
+    # DB error
+    err_db = "psychobot_1: DB: table users is missing"
+    # Auth error
+    err_auth = "psychobot_1: Logs: HTTP 401 Unauthorized: token invalid"
+
+    norm1 = monitor._normalize_issue_for_signature(err1)
+    norm2 = monitor._normalize_issue_for_signature(err2)
+    norm_pm2 = monitor._normalize_issue_for_signature(err_pm2)
+    norm_db = monitor._normalize_issue_for_signature(err_db)
+    norm_auth = monitor._normalize_issue_for_signature(err_auth)
+
+    # All normalized signatures must be mutually distinct
+    all_norms = [norm1, norm2, norm_pm2, norm_db, norm_auth]
+    assert len(set(all_norms)) == len(all_norms)
+
+    # Delivering err1 must NOT suppress err2, PM2, DB, or auth
+    monitor.record_alert_delivered([err1], state)
+    assert monitor.should_alert([err1], state) is False
+    assert monitor.should_alert([err2], state) is True
+    assert monitor.should_alert([err_pm2], state) is True
+    assert monitor.should_alert([err_db], state) is True
+    assert monitor.should_alert([err_auth], state) is True
+
+
+@pytest.mark.asyncio
+async def test_monitor_run_check_deduplication_and_partial_delivery_e2e(tmp_path, monkeypatch):
+    lock_file = str(tmp_path / "lock.lock")
+    state_file = str(tmp_path / "state.json")
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_LOCK_FILE", lock_file)
+    monkeypatch.setenv("PSYCHOBOTS_MONITOR_STATE", state_file)
+
+    apps = [
+        {
+            "name": "psychobot_1",
+            "token": "tok_1",
+            "status": "online",
+            "owner_ids": [1001, 1002],
+        }
+    ]
+    monkeypatch.setattr(monitor, "get_bot_apps", lambda: apps)
+
+    async def fake_empty_async(*args, **kwargs): return []
+    monkeypatch.setattr(monitor, "check_db_schema", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_payment_webhooks", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_nl_infrastructure", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_stuck_dialogues", fake_empty_async)
+    monkeypatch.setattr(monitor, "check_telegram", fake_empty_async)
+
+    # Track send_alert calls
+    alerts_sent_calls = []
+
+    # Check 1: Return log error with update 1001
+    log_err_1 = ["2026-03-30 14:15:00 [ERROR] telegram.ext.Application: Error while processing update 1001: TelegramBadRequest: Bad Request: message is not modified"]
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *a, **k: ["Logs: " + log_err_1[0]])
+
+    async def fake_send_alert(apps, text, recipients=None, delivered_recipients=None):
+        alerts_sent_calls.append({"text": text, "recipients": list(recipients or [])})
+        if delivered_recipients is not None:
+            for r in (recipients or []):
+                delivered_recipients.add(r)
+        return True
+
+    monkeypatch.setattr(monitor, "send_alert", fake_send_alert)
+
+    # Run check 1 -> issue alerted
+    exit_code_1 = await monitor.run_check(False)
+    assert exit_code_1 == 1
+    assert len(alerts_sent_calls) == 1
+    assert "update 1001" in alerts_sent_calls[0]["text"]
+
+    # Verify state saved alert delivered
+    state = monitor.load_state(state_file)
+    assert len(state.get("alerts", {})) == 1
+
+    # Check 2: Same error with update 1002 -> suppressed by cooldown!
+    log_err_2 = ["2026-03-30 14:20:00 [ERROR] telegram.ext.Application: Error while processing update 1002: TelegramBadRequest: Bad Request: message is not modified"]
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *a, **k: ["Logs: " + log_err_2[0]])
+
+    exit_code_2 = await monitor.run_check(False)
+    # exit_code is still 1 because issue was detected in logs, but NO alert was sent to Telegram
+    assert exit_code_2 == 1
+    assert len(alerts_sent_calls) == 1  # No new alert call!
+
+    # Check 3: Truly different error -> alert IS sent!
+    log_err_3 = ["2026-03-30 14:25:00 [ERROR] telegram.ext.Application: Error while processing update 1003: TelegramBadRequest: Bad Request: chat not found"]
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *a, **k: ["Logs: " + log_err_3[0]])
+
+    exit_code_3 = await monitor.run_check(False)
+    assert exit_code_3 == 1
+    assert len(alerts_sent_calls) == 2  # New alert sent!
+    assert "chat not found" in alerts_sent_calls[1]["text"]
+
+    # Check 4: Partial delivery recovery test
+    # Configure fake_send_alert to fail for recipient 1002 on first try
+    partial_calls = []
+
+    async def fake_partial_send_alert(apps, text, recipients=None, delivered_recipients=None):
+        partial_calls.append({"text": text, "recipients": list(recipients or []), "already": list(delivered_recipients or [])})
+        if delivered_recipients is not None:
+            # Deliver to 1001 only, simulate failure for 1002
+            delivered_recipients.add(1001)
+        return False  # Not all delivered
+
+    monkeypatch.setattr(monitor, "send_alert", fake_partial_send_alert)
+    # A new error
+    log_err_4 = ["2026-03-30 14:30:00 [ERROR] Telegram server error 502"]
+    monkeypatch.setattr(monitor, "read_new_log_errors", lambda *a, **k: ["Logs: " + log_err_4[0]])
+
+    exit_code_4 = await monitor.run_check(False)
+    assert exit_code_4 == 1
+    state_after_partial = monitor.load_state(state_file)
+    assert "issue" in state_after_partial["pending_notifications"]
+    assert state_after_partial["pending_notifications"]["issue"]["delivered_recipients"] == [1001]
+
+    # Next check: recovery delivery succeeds for 1002 without duplicating to 1001
+    recovery_calls = []
+
+    async def fake_recovery_send_alert(apps, text, recipients=None, delivered_recipients=None):
+        recovery_calls.append({"text": text, "recipients": list(recipients or []), "already": list(delivered_recipients or [])})
+        if delivered_recipients is not None:
+            delivered_recipients.add(1002)
+        return True
+
+    monkeypatch.setattr(monitor, "send_alert", fake_recovery_send_alert)
+    exit_code_5 = await monitor.run_check(False)
+    assert exit_code_5 == 1
+
+    # Verify that in recovery call, delivered_recipients already had 1001
+    assert 1001 in recovery_calls[0]["already"]
+    # Pending notification is cleared
+    state_recovered = monitor.load_state(state_file)
+    assert "issue" not in state_recovered.get("pending_notifications", {})
+
+
 
 
 

@@ -1057,12 +1057,42 @@ def read_new_log_errors(app: dict, state: dict, include_existing: bool) -> list[
     return issues
 
 
-def _normalize_issue_for_signature(issue: str) -> str:
-    text = re.sub(r"\b\d+ polling fetch errors\b", "N polling fetch errors", issue)
-    text = re.sub(r"prompt_len=\d+", "prompt_len=N", text)
-    text = re.sub(r"\btryings\s*=\s*\d+\b", "tryings=N", text)
+def _normalize_issue_segment(s: str) -> str:
+    text = s
+    # Timestamps (ISO date-time or time only)
     text = re.sub(r"\b\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,\.]\d+)?\b", "TIMESTAMP", text)
+    text = re.sub(r"\b\d{2}:\d{2}:\d{2}(?:[,\.]\d+)?\b", "TIME", text)
+    # Memory addresses / pointers
+    text = re.sub(r"\b0x[0-9a-fA-F]+\b", "0xADDR", text)
+    # Update IDs: update_id=123, update id 123, update 123, update #123
+    text = re.sub(r"(?i)\bupdate(?:_id|\s*id)?\s*[=:\s]\s*#?\d+\b", "update_id=N", text)
+    text = re.sub(r"(?i)\bupdate\s*#?\d+\b", "update_id=N", text)
+    # Bot IDs: bot_id=123, bot id: 123, bot 12345678 (numeric ID)
+    text = re.sub(r"(?i)\bbot(?:_id|\s*id)\s*[=:\s]\s*#?\d+\b", "bot_id=N", text)
+    text = re.sub(r"(?i)\bbot\s+(\d{6,})\b", "bot bot_id=N", text)
+    # User / Chat / Message / Peer / Channel / Sender IDs
+    text = re.sub(r"(?i)\b(user|chat|message|peer|channel|sender)(?:_id|\s*id)?\s*[=:\s]\s*#?\d+\b", r"\1_id=N", text)
+    # Counts & retries
+    text = re.sub(r"\b\d+\s+polling fetch errors\b", "N polling fetch errors", text)
+    text = re.sub(r"\bprompt_len=\d+\b", "prompt_len=N", text)
+    text = re.sub(r"\btryings\s*=\s*\d+\b", "tryings=N", text)
+    text = re.sub(r"(?i)\bretry(?:\s+in)?\s+\d+(?:\.\d+)?\s*(?:s|sec|seconds?)\b", "retry in N seconds", text)
+    # Collapse multiple whitespaces
+    text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def _normalize_issue_for_signature(issue: str) -> str:
+    if not issue:
+        return ""
+    if "Logs: " in issue:
+        prefix, _, log_content = issue.partition("Logs: ")
+        segments = [seg.strip() for seg in log_content.split(" | ") if seg.strip()]
+        if not segments:
+            return f"{prefix}Logs:"
+        normalized_segments = sorted(set(_normalize_issue_segment(seg) for seg in segments))
+        return f"{prefix}Logs: " + " | ".join(normalized_segments)
+    return _normalize_issue_segment(issue)
 
 
 def should_alert(issues: list[str], state: dict) -> bool:

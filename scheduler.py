@@ -528,16 +528,37 @@ async def check_kie_credit_balance(bot: Bot):
             if not api_key or threshold <= 0:
                 return
 
-            from ai_incident_manager import get_provider_account_fingerprint
+            from ai_incident_manager import (
+                detect_current_instance,
+                get_provider_account_fingerprint,
+                resolve_companion_telegram_instance,
+            )
             from database import AIProviderIncidentModel
-            from sqlalchemy import select
+            from sqlalchemy import or_, select
+
+            current_inst = detect_current_instance()
+            companion_def = resolve_companion_telegram_instance(current_inst) if current_inst else None
+            origin_names = set()
+            if current_inst:
+                origin_names.update({current_inst.get("pm2_name"), current_inst.get("bot_instance_id")})
+            if companion_def:
+                origin_names.update({companion_def.get("pm2_name"), companion_def.get("bot_instance_id")})
+            origin_names.discard(None)
 
             current_fp = get_provider_account_fingerprint(api_key, base_url)
+            owner_filter = [
+                or_(
+                    AIProviderIncidentModel.origin_instance_id.in_(origin_names),
+                    AIProviderIncidentModel.companion_instance_id.in_(origin_names),
+                )
+            ] if origin_names else []
+
             stmt_active_warn = select(AIProviderIncidentModel).where(
                 AIProviderIncidentModel.provider == "KIE",
                 AIProviderIncidentModel.credential_scope == current_fp,
                 AIProviderIncidentModel.incident_type == "low_credit_warning",
                 AIProviderIncidentModel.status == "active",
+                *owner_filter,
             )
             has_active_warn = (await session.scalar(stmt_active_warn)) is not None
             if config.kie_credit_alert_sent != has_active_warn:

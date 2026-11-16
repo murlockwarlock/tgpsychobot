@@ -11683,6 +11683,318 @@ async def test_isolated_domain_subsystem_verification_no_unwanted_imports_and_al
     assert len(sent_messages) > 0
 
 
+# ============================================================================
+# KIE Low-Credit Warning Multi-Instance Isolation Tests
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_kie_low_credit_multi_instance_isolation_sqlite(test_db_session_maker, monkeypatch):
+    """
+    Verify multi-instance isolation for KIE low-credit warnings in a shared database (SQLite):
+    - Instance A triggers a low-credit warning -> incident recorded, alert sent to Instance A admins.
+    - Instance B checks balance -> Instance B owner filter prevents seeing Instance A's active incident.
+      config.kie_credit_alert_sent reconciles correctly, allowing Instance B to warn its own admins.
+    - Instance A replenishes -> resolves ONLY Instance A's incident; Instance B remains active.
+    - Key rotation on Instance A does NOT affect Instance B's incidents.
+    """
+    from aiogram.types import User
+    from notification_routing import get_instance_by_id
+
+    inst_a = get_instance_by_id("tg_autobusbusbot_new")
+    inst_b = get_instance_by_id("tg_alena322bot_new")
+    assert inst_a is not None and inst_b is not None
+
+    current_active_inst = inst_a
+
+    def fake_detect():
+        return current_active_inst
+
+    def fake_get_instance(name):
+        if name == inst_a["pm2_name"]:
+            return inst_a
+        if name == inst_b["pm2_name"]:
+            return inst_b
+        return get_instance_by_id(name)
+
+    def fake_companion(s):
+        return s
+
+    async def fake_target_admins(comp, current_instance=None, session=None):
+        target = current_instance or comp
+        if target.get("pm2_name") == inst_a["pm2_name"]:
+            return [272982544]
+        return [979514796]
+
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", fake_detect)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", fake_get_instance)
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", fake_companion)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", fake_target_admins)
+
+    monkeypatch.setattr(scheduler, "async_session_maker", test_db_session_maker)
+    monkeypatch.setattr(scheduler, "get_kie_remaining_credits", AsyncMock(return_value=1.50))
+
+    bot_a = AsyncMock(spec=Bot)
+    bot_a.token = f"{inst_a['platform_id']}:AAFtest_token_a"
+    bot_a.get_me = AsyncMock(return_value=User(id=inst_a["platform_id"], is_bot=True, first_name="bot_a", username="autobusbusbot"))
+    bot_a.send_message = AsyncMock(return_value=True)
+
+    bot_b = AsyncMock(spec=Bot)
+    bot_b.token = f"{inst_b['platform_id']}:AAFtest_token_b"
+    bot_b.get_me = AsyncMock(return_value=User(id=inst_b["platform_id"], is_bot=True, first_name="bot_b", username="alena322bot"))
+    bot_b.send_message = AsyncMock(return_value=True)
+
+    # Seed AIConfig with low threshold=2.0
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="KIE", kie_api_key="shared_kie_key_1", kie_credit_alert_threshold=2.0, kie_credit_alert_sent=False)
+            session.add(cfg)
+        else:
+            cfg.provider = "KIE"
+            cfg.kie_api_key = "shared_kie_key_1"
+            cfg.kie_credit_alert_threshold = 2.0
+            cfg.kie_credit_alert_sent = False
+        await session.commit()
+
+    # 1. Instance A runs balance check: balance 1.50 < threshold 2.00
+    current_active_inst = inst_a
+    monkeypatch.setenv("BOT_INSTANCE_ID", inst_a["pm2_name"])
+    await scheduler.check_kie_credit_balance(bot_a)
+
+    # Instance A alert sent
+    assert bot_a.send_message.call_count == 1
+    call_args_a = bot_a.send_message.call_args
+    recipient_a = call_args_a.kwargs.get("chat_id") or (call_args_a.args[0] if call_args_a.args else None)
+    assert recipient_a == 272982544
+
+    # Verify Instance A incident in DB
+    async with test_db_session_maker() as session:
+        incs = (await session.execute(select(AIProviderIncidentModel))).scalars().all()
+        assert len(incs) == 1
+        assert incs[0].origin_instance_id == inst_a["pm2_name"]
+        assert incs[0].status == "active"
+        cfg_db = await session.get(AIConfig, 1)
+        assert cfg_db.kie_credit_alert_sent is True
+
+    # 2. Instance B runs balance check: must NOT be suppressed by Instance A's incident!
+    current_active_inst = inst_b
+    monkeypatch.setenv("BOT_INSTANCE_ID", inst_b["pm2_name"])
+    await scheduler.check_kie_credit_balance(bot_b)
+
+    # Instance B alert sent to Instance B admins!
+    assert bot_b.send_message.call_count == 1
+    call_args_b = bot_b.send_message.call_args
+    recipient_b = call_args_b.kwargs.get("chat_id") or (call_args_b.args[0] if call_args_b.args else None)
+    assert recipient_b == 979514796
+
+    # Verify both incidents active simultaneously in DB under distinct origin_instance_ids
+    async with test_db_session_maker() as session:
+        active_incs = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.status == "active")
+        )).scalars().all()
+        assert len(active_incs) == 2
+        origin_set = {inc.origin_instance_id for inc in active_incs}
+        assert origin_set == {inst_a["pm2_name"], inst_b["pm2_name"]}
+
+    # 3. Instance B runs again: deduped, no second alert sent
+    bot_b.send_message.reset_mock()
+    await scheduler.check_kie_credit_balance(bot_b)
+    assert bot_b.send_message.call_count == 0
+
+    # 4. Instance A replenishes balance (5.00 >= 2.00)
+    current_active_inst = inst_a
+    monkeypatch.setenv("BOT_INSTANCE_ID", inst_a["pm2_name"])
+    monkeypatch.setattr(scheduler, "get_kie_remaining_credits", AsyncMock(return_value=5.00))
+    bot_a.send_message.reset_mock()
+    await scheduler.check_kie_credit_balance(bot_a)
+
+    # Instance A receives replenishment notification
+    assert bot_a.send_message.call_count == 1
+    text_replenish = bot_a.send_message.call_args.kwargs.get("text") or (bot_a.send_message.call_args.args[1] if len(bot_a.send_message.call_args.args) > 1 else "")
+    assert "Баланс KIE пополнен" in text_replenish
+
+    # In DB: Instance A's incident is resolved, but Instance B's incident REMAINS ACTIVE!
+    async with test_db_session_maker() as session:
+        inc_a = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.origin_instance_id == inst_a["pm2_name"])
+        )).scalar_one()
+        assert inc_a.status == "resolved"
+
+        inc_b = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.origin_instance_id == inst_b["pm2_name"])
+        )).scalar_one()
+        assert inc_b.status == "active"
+
+    # 5. Key rotation on Instance A does not supersede Instance B's incident
+    from ai_incident_manager import handle_key_rotation
+    current_active_inst = inst_a
+    monkeypatch.setenv("BOT_INSTANCE_ID", inst_a["pm2_name"])
+    await handle_key_rotation(
+        origin_instance_id=inst_a["pm2_name"],
+        provider="KIE",
+        new_key="kie_rotated_new_key_a",
+        old_key="shared_kie_key_1",
+        session_maker=test_db_session_maker,
+    )
+
+    async with test_db_session_maker() as session:
+        inc_b_after = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.origin_instance_id == inst_b["pm2_name"])
+        )).scalar_one()
+        # Instance B remains active!
+        assert inc_b_after.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_kie_low_credit_companion_isolation_telegram_and_max(test_db_session_maker, monkeypatch):
+    """
+    Verify companion linkage and foreign bot isolation:
+    - MAX bot and its companion Telegram bot share ownership of incidents.
+    - An unrelated foreign bot sharing the DB is isolated from both.
+    """
+    from notification_routing import get_instance_by_id
+    from ai_incident_manager import record_low_credit_warning, resolve_low_credit_warning
+
+    max_inst = get_instance_by_id("max_id519010411655_bot_new")
+    tg_comp_inst = get_instance_by_id("tg_yourself_way_bot_new")
+    foreign_inst = get_instance_by_id("tg_autobusbusbot_new")
+    assert max_inst is not None and tg_comp_inst is not None and foreign_inst is not None
+
+    current_active = max_inst
+
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: current_active)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: get_instance_by_id(n))
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: tg_comp_inst if s.get("platform") == "max" else s)
+    monkeypatch.setattr("ai_incident_manager.resolve_target_admin_ids", AsyncMock(return_value=[806750628]))
+
+    # MAX bot records low credit warning
+    warned = await record_low_credit_warning(
+        provider="KIE",
+        remaining_credits=1.0,
+        threshold=2.0,
+        api_key="max_test_kie_key",
+        session_maker=test_db_session_maker,
+    )
+    assert warned is True
+
+    # Companion Telegram bot resolves the incident
+    current_active = tg_comp_inst
+    resolved = await resolve_low_credit_warning(
+        provider="KIE",
+        remaining_credits=10.0,
+        threshold=2.0,
+        api_key="max_test_kie_key",
+        session_maker=test_db_session_maker,
+    )
+    assert resolved is True
+
+    # Foreign bot attempts to resolve MAX's incident -> returns False (isolated!)
+    # Re-open incident first
+    current_active = max_inst
+    await record_low_credit_warning(
+        provider="KIE",
+        remaining_credits=1.0,
+        threshold=2.0,
+        api_key="max_test_kie_key",
+        session_maker=test_db_session_maker,
+    )
+    current_active = foreign_inst
+    resolved_foreign = await resolve_low_credit_warning(
+        provider="KIE",
+        remaining_credits=10.0,
+        threshold=2.0,
+        api_key="max_test_kie_key",
+        session_maker=test_db_session_maker,
+    )
+    assert resolved_foreign is False  # Refuses to touch foreign bot incident!
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_kie_low_credit_multi_instance_isolation(pg_test_session_maker, monkeypatch):
+    """
+    Verify multi-instance isolation for KIE low-credit warnings in real PostgreSQL:
+    Ensures partial unique index and multi-worker isolation work concurrently without cross-instance leakage.
+    """
+    from aiogram.types import User
+    from notification_routing import get_instance_by_id
+
+    inst_a = get_instance_by_id("tg_autobusbusbot_new")
+    inst_b = get_instance_by_id("tg_alena322bot_new")
+
+    current_active_inst = inst_a
+
+    monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: current_active_inst)
+    monkeypatch.setattr("ai_incident_manager.get_instance_by_pm2_name", lambda n: get_instance_by_id(n))
+    monkeypatch.setattr("ai_incident_manager.resolve_companion_telegram_instance", lambda s: s)
+    monkeypatch.setattr(
+        "ai_incident_manager.resolve_target_admin_ids",
+        AsyncMock(side_effect=lambda comp, current_instance=None, session=None: [272982544] if (current_instance or comp).get("pm2_name") == inst_a["pm2_name"] else [979514796]),
+    )
+
+    monkeypatch.setattr(scheduler, "async_session_maker", pg_test_session_maker)
+    monkeypatch.setattr(scheduler, "get_kie_remaining_credits", AsyncMock(return_value=1.50))
+
+    bot_a = AsyncMock(spec=Bot)
+    bot_a.token = f"{inst_a['platform_id']}:AAFtest_pg_a"
+    bot_a.get_me = AsyncMock(return_value=User(id=inst_a["platform_id"], is_bot=True, first_name="bot_a", username="autobusbusbot"))
+    bot_a.send_message = AsyncMock(return_value=True)
+
+    bot_b = AsyncMock(spec=Bot)
+    bot_b.token = f"{inst_b['platform_id']}:AAFtest_pg_b"
+    bot_b.get_me = AsyncMock(return_value=User(id=inst_b["platform_id"], is_bot=True, first_name="bot_b", username="alena322bot"))
+    bot_b.send_message = AsyncMock(return_value=True)
+
+    # Seed AIConfig in PostgreSQL
+    async with pg_test_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            cfg = AIConfig(id=1, provider="KIE", kie_api_key="pg_kie_key_1", kie_credit_alert_threshold=2.0, kie_credit_alert_sent=False)
+            session.add(cfg)
+        else:
+            cfg.provider = "KIE"
+            cfg.kie_api_key = "pg_kie_key_1"
+            cfg.kie_credit_alert_threshold = 2.0
+            cfg.kie_credit_alert_sent = False
+        await session.commit()
+
+    # 1. Instance A triggers warning in PostgreSQL
+    current_active_inst = inst_a
+    monkeypatch.setenv("BOT_INSTANCE_ID", inst_a["pm2_name"])
+    await scheduler.check_kie_credit_balance(bot_a)
+    assert bot_a.send_message.call_count == 1
+
+    # 2. Instance B runs in same PostgreSQL DB: isolated via owner_filter!
+    current_active_inst = inst_b
+    monkeypatch.setenv("BOT_INSTANCE_ID", inst_b["pm2_name"])
+    await scheduler.check_kie_credit_balance(bot_b)
+    assert bot_b.send_message.call_count == 1
+
+    # Verify both active incidents coexist in PostgreSQL
+    async with pg_test_session_maker() as session:
+        active_incs = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.status == "active")
+        )).scalars().all()
+        assert len(active_incs) == 2
+
+    # 3. Instance A replenishment resolves ONLY Instance A
+    current_active_inst = inst_a
+    monkeypatch.setenv("BOT_INSTANCE_ID", inst_a["pm2_name"])
+    monkeypatch.setattr(scheduler, "get_kie_remaining_credits", AsyncMock(return_value=5.00))
+    await scheduler.check_kie_credit_balance(bot_a)
+
+    async with pg_test_session_maker() as session:
+        inc_a = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.origin_instance_id == inst_a["pm2_name"])
+        )).scalar_one()
+        assert inc_a.status == "resolved"
+
+        inc_b = (await session.execute(
+            select(AIProviderIncidentModel).where(AIProviderIncidentModel.origin_instance_id == inst_b["pm2_name"])
+        )).scalar_one()
+        assert inc_b.status == "active"
+
+
 
 
 
