@@ -8425,17 +8425,22 @@ async def test_no_fictitious_provider_5xx_classification(test_db_session_maker, 
     assert inc_2.incident_type == "unknown"
     assert inc_2.http_status is None
 
-    # 3. Authentic HTTP 503 Service Unavailable
+    # 3. Authentic HTTP 503 Service Unavailable:
+    # Test case 3a: ProviderFailure created with classification="unknown" and http_status=503.
+    # The canonical parser/post_init MUST normalize it to 'provider_5xx' without incident manager heuristics.
     err_503 = Exception("Service Unavailable")
     err_503.failure = ProviderFailure(
         provider="KIE",
         operation="chat",
-        classification="provider_5xx",
+        classification="unknown",  # Unclassified by caller, but authentic http_status=503
         detail_code="503",
-        retryable=True,
+        retryable=False,  # Should become True via RETRYABLE_CLASSES
         http_status=503,
-        classification_source="http_status_fallback",
+        classification_source="provider_structured",
     )
+    assert err_503.failure.classification == "provider_5xx"
+    assert err_503.failure.classification_source == "http_status_fallback"
+    assert err_503.failure.retryable is True
     inc_3 = await record_ai_provider_failure(
         origin_instance_id="tg_veraveda777_bot_legacy",
         provider="KIE",
@@ -8450,6 +8455,30 @@ async def test_no_fictitious_provider_5xx_classification(test_db_session_maker, 
     assert inc_3.incident_type == "provider_5xx", "Authentic HTTP 503 must be classified as provider_5xx"
     assert inc_3.http_status == 503
     assert inc_3.classification_source == "http_status_fallback"
+
+    # Test case 3b: OpenAI with HTTP 503 resolves to canonical 'provider_overloaded'
+    err_503_openai = Exception("OpenAI 503 Overloaded")
+    err_503_openai.failure = ProviderFailure(
+        provider="OpenAI",
+        operation="chat",
+        classification="unknown",
+        detail_code="503",
+        http_status=503,
+    )
+    assert err_503_openai.failure.classification == "provider_overloaded"
+    inc_3b = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=err_503_openai,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope_503_openai",
+        enqueue_notification=False,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_3b is not None
+    assert inc_3b.incident_type == "provider_overloaded"
+    assert inc_3b.http_status == 503
 
     # 4. Authentic TimeoutError
     inc_4 = await record_ai_provider_failure(
@@ -8832,6 +8861,239 @@ async def _run_lease_recovery_max_attempts_lifecycle_verification(session_maker,
         assert r5.status == "delivered"
         assert r5.attempts == 2
 
+    # 6. pending, attempts < max_attempts (0 < 3): normal delivery
+    past_retry = datetime.utcnow() - timedelta(minutes=5)
+    async with session_maker() as session:
+        notif6 = AIIncidentNotificationModel(
+            incident_id=inc_id,
+            event_type="opened",
+            cycle_index=5,
+            recipient_id=272982544,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            message_text="Alert pending 6",
+            status="pending",
+            attempts=0,
+            max_attempts=3,
+            next_retry_at=past_retry,
+        )
+        session.add(notif6)
+        await session.commit()
+        await session.refresh(notif6)
+        notif6_id = notif6.id
+
+    tg_calls.clear()
+    await process_ai_incident_notifications(bot, session_maker=session_maker)
+    assert len(tg_calls) == 1
+    async with session_maker() as session:
+        r6 = await session.get(AIIncidentNotificationModel, notif6_id)
+        assert r6.status == "delivered"
+        assert r6.attempts == 1
+
+    # 7. pending, attempts == max_attempts (3 == 3):
+    # Must be finalized to 'failed_terminal' WITHOUT calling Telegram and WITHOUT incrementing attempts!
+    async with session_maker() as session:
+        notif7 = AIIncidentNotificationModel(
+            incident_id=inc_id,
+            event_type="opened",
+            cycle_index=6,
+            recipient_id=272982544,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            message_text="Alert pending 7",
+            status="pending",
+            attempts=3,
+            max_attempts=3,
+            next_retry_at=past_retry,
+        )
+        session.add(notif7)
+        await session.commit()
+        await session.refresh(notif7)
+        notif7_id = notif7.id
+
+    tg_calls.clear()
+    await process_ai_incident_notifications(bot, session_maker=session_maker)
+    assert len(tg_calls) == 0, "Pending row with attempts == max_attempts must NOT trigger Telegram call"
+    async with session_maker() as session:
+        r7 = await session.get(AIIncidentNotificationModel, notif7_id)
+        assert r7.status == "failed_terminal"
+        assert r7.attempts == 3, "Attempts must stay at max_attempts without increment"
+        assert r7.next_retry_at is None
+        assert r7.last_error == "max_attempts_exhausted"
+
+    # 8. pending, attempts > max_attempts (5 > 3):
+    # Must be finalized to 'failed_terminal' without Telegram call
+    async with session_maker() as session:
+        notif8 = AIIncidentNotificationModel(
+            incident_id=inc_id,
+            event_type="opened",
+            cycle_index=7,
+            recipient_id=272982544,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            message_text="Alert pending 8",
+            status="pending",
+            attempts=5,
+            max_attempts=3,
+            next_retry_at=past_retry,
+        )
+        session.add(notif8)
+        await session.commit()
+        await session.refresh(notif8)
+        notif8_id = notif8.id
+
+    tg_calls.clear()
+    await process_ai_incident_notifications(bot, session_maker=session_maker)
+    assert len(tg_calls) == 0
+    async with session_maker() as session:
+        r8 = await session.get(AIIncidentNotificationModel, notif8_id)
+        assert r8.status == "failed_terminal"
+        assert r8.attempts == 5
+        assert r8.next_retry_at is None
+        assert r8.last_error == "max_attempts_exhausted"
+
+    # 9. Corrupt/fallback limit: max_attempts is None, 0, or -1
+    # Fallback limit is MAX_OUTBOX_ATTEMPTS (6).
+    # 9a. attempts = 5 with max_attempts = None -> allowed to claim and send (attempt 6)
+    async with session_maker() as session:
+        notif9a = AIIncidentNotificationModel(
+            incident_id=inc_id,
+            event_type="opened",
+            cycle_index=8,
+            recipient_id=272982544,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            message_text="Alert pending 9a",
+            status="pending",
+            attempts=5,
+            max_attempts=None,
+            next_retry_at=past_retry,
+        )
+        session.add(notif9a)
+        await session.commit()
+        await session.refresh(notif9a)
+        notif9a_id = notif9a.id
+
+    tg_calls.clear()
+    await process_ai_incident_notifications(bot, session_maker=session_maker)
+    assert len(tg_calls) == 1
+    async with session_maker() as session:
+        r9a = await session.get(AIIncidentNotificationModel, notif9a_id)
+        assert r9a.status == "delivered"
+        assert r9a.attempts == 6
+
+    # 9b. attempts = 6 with max_attempts = None -> exhausted (6 >= 6) -> failed_terminal, no Telegram call
+    async with session_maker() as session:
+        notif9b = AIIncidentNotificationModel(
+            incident_id=inc_id,
+            event_type="opened",
+            cycle_index=9,
+            recipient_id=272982544,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            message_text="Alert pending 9b",
+            status="pending",
+            attempts=6,
+            max_attempts=None,
+            next_retry_at=past_retry,
+        )
+        session.add(notif9b)
+        await session.commit()
+        await session.refresh(notif9b)
+        notif9b_id = notif9b.id
+
+    tg_calls.clear()
+    await process_ai_incident_notifications(bot, session_maker=session_maker)
+    assert len(tg_calls) == 0
+    async with session_maker() as session:
+        r9b = await session.get(AIIncidentNotificationModel, notif9b_id)
+        assert r9b.status == "failed_terminal"
+        assert r9b.attempts == 6
+        assert r9b.next_retry_at is None
+        assert r9b.last_error == "max_attempts_exhausted"
+
+    # 9c. attempts = 6 with max_attempts = 0 -> exhausted (fallback 6 >= 6) -> failed_terminal, no Telegram call
+    async with session_maker() as session:
+        notif9c = AIIncidentNotificationModel(
+            incident_id=inc_id,
+            event_type="opened",
+            cycle_index=10,
+            recipient_id=272982544,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            message_text="Alert pending 9c",
+            status="pending",
+            attempts=6,
+            max_attempts=0,
+            next_retry_at=past_retry,
+        )
+        session.add(notif9c)
+        await session.commit()
+        await session.refresh(notif9c)
+        notif9c_id = notif9c.id
+
+    tg_calls.clear()
+    await process_ai_incident_notifications(bot, session_maker=session_maker)
+    assert len(tg_calls) == 0
+    async with session_maker() as session:
+        r9c = await session.get(AIIncidentNotificationModel, notif9c_id)
+        assert r9c.status == "failed_terminal"
+        assert r9c.attempts == 6
+
+    # 9d. attempts = 6 with max_attempts = -1 -> exhausted (fallback 6 >= 6) -> failed_terminal, no Telegram call
+    async with session_maker() as session:
+        notif9d = AIIncidentNotificationModel(
+            incident_id=inc_id,
+            event_type="opened",
+            cycle_index=11,
+            recipient_id=272982544,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            message_text="Alert pending 9d",
+            status="pending",
+            attempts=6,
+            max_attempts=-1,
+            next_retry_at=past_retry,
+        )
+        session.add(notif9d)
+        await session.commit()
+        await session.refresh(notif9d)
+        notif9d_id = notif9d.id
+
+    tg_calls.clear()
+    await process_ai_incident_notifications(bot, session_maker=session_maker)
+    assert len(tg_calls) == 0
+    async with session_maker() as session:
+        r9d = await session.get(AIIncidentNotificationModel, notif9d_id)
+        assert r9d.status == "failed_terminal"
+        assert r9d.attempts == 6
+
+    # 10. Concurrent workers competing on the same pending row: CAS ensures exactly 1 winner
+    async with session_maker() as session:
+        notif10 = AIIncidentNotificationModel(
+            incident_id=inc_id,
+            event_type="opened",
+            cycle_index=12,
+            recipient_id=272982544,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            message_text="Alert pending concurrent",
+            status="pending",
+            attempts=0,
+            max_attempts=3,
+            next_retry_at=past_retry,
+        )
+        session.add(notif10)
+        await session.commit()
+        await session.refresh(notif10)
+        notif10_id = notif10.id
+
+    tg_calls.clear()
+    await asyncio.gather(
+        process_ai_incident_notifications(bot, session_maker=session_maker),
+        process_ai_incident_notifications(bot, session_maker=session_maker),
+        process_ai_incident_notifications(bot, session_maker=session_maker),
+        process_ai_incident_notifications(bot, session_maker=session_maker),
+        process_ai_incident_notifications(bot, session_maker=session_maker),
+    )
+    assert len(tg_calls) == 1, "Concurrent pending processing must result in exactly 1 claim and delivery"
+    async with session_maker() as session:
+        r10 = await session.get(AIIncidentNotificationModel, notif10_id)
+        assert r10.status == "delivered"
+        assert r10.attempts == 1
+
 
 @pytest.mark.asyncio
 async def test_ai_outbox_lease_recovery_strictly_respects_max_attempts_sqlite(test_db_session_maker, monkeypatch):
@@ -8855,6 +9117,8 @@ async def test_send_terminal_alert_title_and_diagnostic_sanitization(test_db_ses
     - Static Russian titles (e.g. 'Терминальный сбой анализа изображения') are preserved with bold header.
     - Secrets in diagnostics are masked by sanitize_secret_values.
     """
+    import html
+    import re
     import error_reporting
     inst_def = {"pm2_name": "tg_veraveda777_bot_legacy", "platform": "telegram", "platform_id": 8281390498, "admins": [272982544], "username": "veraveda777_bot"}
     monkeypatch.setattr("ai_incident_manager.detect_current_instance", lambda: inst_def)
@@ -8910,8 +9174,8 @@ async def test_send_terminal_alert_title_and_diagnostic_sanitization(test_db_ses
     secret_details = "Authorization: Bearer sk-ant-api03-secret123456789012345678901234567890"
     await error_reporting.send_terminal_ai_failure_alert(
         title="Valid Title",
-        primary_provider="OpenAI",
-        primary_model="gpt-4o",
+        primary_provider="DeepSeek",
+        primary_model="deepseek-chat",
         request_type="chat",
         details=secret_details,
         session_maker=test_db_session_maker,
@@ -8923,6 +9187,170 @@ async def test_send_terminal_alert_title_and_diagnostic_sanitization(test_db_ses
         )).scalars().all()
         msg3 = notifs3[0].message_text
         assert "sk-ant-api03-secret123456789012345678901234567890" not in msg3
+
+    # 4. Unclosed <b>, malicious links, user names, medical/financial IDs, and ampersands
+    malicious_title = "<b>Unclosed bold & <a href='https://evil.org'>click</a> Patient_99999 client_77777 user_88888 customer_66666"
+    await error_reporting.send_terminal_ai_failure_alert(
+        title=malicious_title,
+        primary_provider="Anthropic",
+        primary_model="claude-3-5-sonnet",
+        request_type="chat",
+        details="Detail test",
+        session_maker=test_db_session_maker,
+    )
+
+    async with test_db_session_maker() as session:
+        notifs4 = (await session.execute(
+            select(AIIncidentNotificationModel).order_by(AIIncidentNotificationModel.id.desc())
+        )).scalars().all()
+        msg4 = notifs4[0].message_text
+        # PII must be completely sanitized
+        assert "Patient_99999" not in msg4
+        assert "client_77777" not in msg4
+        assert "user_88888" not in msg4
+        assert "customer_66666" not in msg4
+        assert "[REDACTED]" in msg4
+        # HTML tag injection must be prevented: angle brackets and quotes escaped
+        assert "&lt;b&gt;" in msg4
+        assert "&lt;a href=" in msg4 or "&lt;a href=&#x27;" in msg4
+        assert "&amp;" in msg4
+        # Ensure header tags are strictly balanced
+        header_line = msg4.split("\n\n")[0]
+        header_tags = re.findall(r"</?[a-zA-Z0-9]+>", header_line)
+        assert header_tags == ["<b>", "</b>"], f"Header tags must be strictly balanced: {header_tags}"
+
+    # 5. Unicode and special symbols
+    unicode_title = "🚨 🏥 Привет мир! Сбой AI & Анализ: <test> — ok"
+    await error_reporting.send_terminal_ai_failure_alert(
+        title=unicode_title,
+        primary_provider="Perplexity",
+        primary_model="sonar-pro",
+        request_type="chat",
+        details="Detail test",
+        session_maker=test_db_session_maker,
+    )
+
+    async with test_db_session_maker() as session:
+        notifs5 = (await session.execute(
+            select(AIIncidentNotificationModel).order_by(AIIncidentNotificationModel.id.desc())
+        )).scalars().all()
+        msg5 = notifs5[0].message_text
+        assert "Привет мир!" in msg5
+        assert "🏥" in msg5
+        assert "&amp;" in msg5
+        assert "&lt;test&gt;" in msg5
+
+    # 6. Trusted pre-formatted static header from real runtime
+    runtime_header = "🚨 <b>[Telegram] Сбой ИИ в текстовом диалоге</b>\n\n"
+    await error_reporting.send_terminal_ai_failure_alert(
+        title=runtime_header,
+        primary_provider="Groq",
+        primary_model="llama-3.3-70b-versatile",
+        request_type="chat",
+        details="Detail test",
+        session_maker=test_db_session_maker,
+    )
+
+    async with test_db_session_maker() as session:
+        notifs6 = (await session.execute(
+            select(AIIncidentNotificationModel).order_by(AIIncidentNotificationModel.id.desc())
+        )).scalars().all()
+        msg6 = notifs6[0].message_text
+        assert "🚨 <b>[Telegram] Сбой ИИ в текстовом диалоге</b>" in msg6
+        assert "🚨 <b>[Telegram] 🚨" not in msg6, "Must not double-wrap canonical bold header"
+
+
+@pytest.mark.asyncio
+async def test_genuine_instance_registry_and_telegram_method_boundary(test_db_session_maker, monkeypatch):
+    """
+    Item 4: Verify authentic instance registry from config/bot_instances.json and real Telegram method boundary.
+    - Uses real BOT_INSTANCE_ID="tg_veraveda777_bot_legacy" with NO mock for detect_current_instance.
+    - Validates target admins against authentic registry: [979514796, 272982544, 806750628].
+    - Uses aiogram Bot with validating transport session to guarantee HTML parseability and method validity.
+    """
+    import re
+    import error_reporting
+    from ai_incident_manager import process_ai_incident_notifications
+    from aiogram import Bot
+    from aiogram.client.session.base import BaseSession
+    from aiogram.methods import TelegramMethod, SendMessage
+    from aiogram.types import Message, Chat, User as AiogramUser
+
+    # 1. Authentic environment matching config/bot_instances.json:
+    # tg_veraveda777_bot_legacy has platform_id 8224473896 and owners [979514796, 272982544, 806750628]
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_genuine_registry_token")
+    monkeypatch.setenv("PM2_APP_NAME", "tg_veraveda777_bot_legacy")
+
+    sent_requests: list[SendMessage] = []
+
+    from html.parser import HTMLParser
+
+    class TagChecker(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.stack = []
+        def handle_starttag(self, tag, attrs):
+            self.stack.append(tag)
+        def handle_endtag(self, tag):
+            assert self.stack, f"Unexpected closing tag </{tag}>"
+            opened = self.stack.pop()
+            assert opened == tag, f"Mismatched tag: expected </{opened}>, got </{tag}>"
+
+    class ValidatingTelegramSession(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            if isinstance(method, SendMessage):
+                sent_requests.append(method)
+                # Verify that parse_mode is HTML
+                assert method.parse_mode == "HTML"
+                # Verify that HTML tags in text are properly matched via standard HTMLParser
+                checker = TagChecker()
+                checker.feed(method.text)
+                assert not checker.stack, f"Unclosed tags remaining in message: {checker.stack}"
+
+                return Message(
+                    message_id=999,
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="veraveda_bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    test_session = ValidatingTelegramSession()
+    real_bot = Bot(token="8224473896:AAFtest_genuine_registry_token", session=test_session)
+
+    # 2. Enqueue terminal AI failure alert with bot=None (enqueues into outbox without dispatch)
+    delivered_enqueue = await error_reporting.send_terminal_ai_failure_alert(
+        bot=None,
+        title="Сбой ИИ при анализе изображения",
+        primary_provider="Gemini",
+        primary_model="gemini-2.0-flash",
+        request_type="vision",
+        details="Authentic registry integration test",
+        session_maker=test_db_session_maker,
+    )
+    assert delivered_enqueue is True
+
+    # 3. Process outbox notifications via real_bot
+    delivered_count = await process_ai_incident_notifications(real_bot, session_maker=test_db_session_maker)
+    assert delivered_count == 3, f"Must deliver to all 3 registered admins in bot_instances.json, got {delivered_count}"
+
+    assert len(sent_requests) == 3
+    recipients = {req.chat_id for req in sent_requests}
+    assert recipients == {979514796, 272982544, 806750628}, f"Recipients must strictly match registry, got {recipients}"
+    for req in sent_requests:
+        assert "🚨 <b>[Telegram] Сбой ИИ при анализе изображения</b>" in req.text
+        assert "Gemini / gemini-2.0-flash" in req.text
+
 
 
 

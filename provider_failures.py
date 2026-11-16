@@ -83,6 +83,15 @@ class ProviderFailure:
             safe_c = raw_c
         else:
             safe_c = "unknown"
+        if safe_c == "unknown" and self.http_status is not None:
+            inferred = _status_class(self.http_status, str(self.provider).lower())
+            if inferred and inferred != "unknown":
+                safe_c = inferred
+                if self.classification_source in ("provider_structured", "unknown"):
+                    object.__setattr__(self, "classification_source", "http_status_fallback")
+                if not self.retryable and safe_c in RETRYABLE_CLASSES:
+                    object.__setattr__(self, "retryable", True)
+                    object.__setattr__(self, "transient", True)
         if safe_c != self.classification:
             object.__setattr__(self, "classification", safe_c)
 

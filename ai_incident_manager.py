@@ -34,7 +34,7 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramUnauthorizedError,
 )
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1688,21 +1688,51 @@ async def process_ai_incident_notifications(
         ts_now = datetime.utcnow()
 
         async with sm() as session:
-            # 1. Check for expired lease rows that have already exhausted max_attempts (attempts >= max_attempts).
-            # Finalize immediately to 'failed_terminal' without making any further attempt or calling Telegram.
+            # Canonical SQL expression for effective max attempts (falls back to MAX_OUTBOX_ATTEMPTS if NULL or <= 0)
+            effective_max_attempts_sql = case(
+                (
+                    and_(
+                        AIIncidentNotificationModel.max_attempts.isnot(None),
+                        AIIncidentNotificationModel.max_attempts > 0,
+                    ),
+                    AIIncidentNotificationModel.max_attempts,
+                ),
+                else_=MAX_OUTBOX_ATTEMPTS,
+            )
+
+            # 1. Finalize exhausted rows: whether in 'processing' (with expired lease) or 'pending' (due for retry),
+            # if attempts >= effective_max_attempts, immediately transition to 'failed_terminal' WITHOUT calling Telegram.
             finalize_exhausted_stmt = (
                 update(AIIncidentNotificationModel)
                 .where(
                     AIIncidentNotificationModel.id == row_id,
                     AIIncidentNotificationModel.authorized_instance_id == current_bot_instance_id,
-                    AIIncidentNotificationModel.status == "processing",
-                    AIIncidentNotificationModel.lease_until < ts_now,
-                    AIIncidentNotificationModel.attempts >= AIIncidentNotificationModel.max_attempts,
+                    AIIncidentNotificationModel.attempts >= effective_max_attempts_sql,
+                    or_(
+                        and_(
+                            AIIncidentNotificationModel.status == "processing",
+                            AIIncidentNotificationModel.lease_until < ts_now,
+                        ),
+                        and_(
+                            AIIncidentNotificationModel.status == "pending",
+                            or_(
+                                AIIncidentNotificationModel.next_retry_at <= ts_now,
+                                AIIncidentNotificationModel.next_retry_at.is_(None),
+                            ),
+                        ),
+                    ),
                 )
                 .values(
                     status="failed_terminal",
                     next_retry_at=None,
-                    last_error="lease_expired_max_attempts_exhausted",
+                    lease_until=None,
+                    last_error=case(
+                        (
+                            AIIncidentNotificationModel.status == "processing",
+                            "lease_expired_max_attempts_exhausted",
+                        ),
+                        else_="max_attempts_exhausted",
+                    ),
                     updated_at=ts_now,
                 )
             )
@@ -1712,13 +1742,14 @@ async def process_ai_incident_notifications(
                 return False
 
             # 2. Atomic claim statement:
-            # - For 'pending' rows: allowed as long as status == 'pending' (and next_retry_at <= ts_now or None)
-            # - For 'processing' rows with expired lease: allowed ONLY if attempts < max_attempts
+            # - For 'pending' rows: allowed ONLY if attempts < effective_max_attempts
+            # - For 'processing' rows with expired lease: allowed ONLY if attempts < effective_max_attempts
             claim_stmt = (
                 update(AIIncidentNotificationModel)
                 .where(
                     AIIncidentNotificationModel.id == row_id,
                     AIIncidentNotificationModel.authorized_instance_id == current_bot_instance_id,
+                    AIIncidentNotificationModel.attempts < effective_max_attempts_sql,
                     or_(
                         and_(
                             AIIncidentNotificationModel.status == "pending",
@@ -1730,7 +1761,6 @@ async def process_ai_incident_notifications(
                         and_(
                             AIIncidentNotificationModel.status == "processing",
                             AIIncidentNotificationModel.lease_until < ts_now,
-                            AIIncidentNotificationModel.attempts < AIIncidentNotificationModel.max_attempts,
                         ),
                     ),
                 )
@@ -1745,7 +1775,7 @@ async def process_ai_incident_notifications(
             res = await session.execute(claim_stmt)
             await session.commit()
             if res.rowcount == 0:
-                return False  # Lost race or lease taken
+                return False  # Lost race, lease taken, or already exhausted
 
             # Fetch claimed row
             row = await session.get(AIIncidentNotificationModel, row_id)
