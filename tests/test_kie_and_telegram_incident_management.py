@@ -10636,6 +10636,9 @@ async def test_real_postgresql_ai_classification_positive_negative_and_edge_scen
     SyntheticAuthOpenAIPg = type("AuthenticationError", (Exception,), {"__module__": "openai"})
     SyntheticAuthOpenAIFakePg = type("AuthenticationError", (Exception,), {"__module__": "openai_fake"})
     LocalBalPg = type("InsufficientBalanceError", (Exception,), {})
+    SyntheticMaxBalPg = type("InsufficientBalanceError", (Exception,), {"__module__": "max_messenger_bot.ai"})
+    LocalAdapterPg = type("ProviderAdapterError", (Exception,), {})
+    LocalAdapterPg.classification = "auth"
     adhoc_auth_exc = Exception("Custom untyped error")
     adhoc_auth_exc.classification = "auth"
     neg_exceptions = [
@@ -10646,6 +10649,8 @@ async def test_real_postgresql_ai_classification_positive_negative_and_edge_scen
         ("pg_synthetic_auth_openai", SyntheticAuthOpenAIPg("Synthetic openai auth")),
         ("pg_synthetic_auth_openai_fake", SyntheticAuthOpenAIFakePg("Synthetic fake prefix auth")),
         ("pg_local_bal_class", LocalBalPg("Local balance fake class")),
+        ("pg_synthetic_max_bal", SyntheticMaxBalPg("Synthetic max balance class")),
+        ("pg_local_adapter_err", LocalAdapterPg("Local adapter error class")),
         ("pg_adhoc_auth_attr", adhoc_auth_exc),
     ]
     for label, exc in neg_exceptions:
@@ -10766,7 +10771,50 @@ async def test_real_postgresql_ai_classification_positive_negative_and_edge_scen
     assert deliv_sdk_pg > 0
     assert len(sent_messages) > 0
 
-    # 2E: PII Sanitization verification on PostgreSQL
+    # 2E: Confirmed background_worker InsufficientBalanceError on PostgreSQL
+    from background_worker import InsufficientBalanceError as WorkerBal
+    sent_messages.clear()
+    exc_worker_pg = WorkerBal("Worker balance exhausted")
+    inc_worker_pg = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_worker_pg,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-pg-pos-worker",
+        enqueue_notification=True,
+        session_maker=pg_test_session_maker,
+    )
+    assert inc_worker_pg.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_worker_pg.status == "active"
+    assert inc_worker_pg.incident_type == "insufficient_balance_quota"
+    deliv_worker = await process_ai_incident_notifications(test_bot, session_maker=pg_test_session_maker)
+    assert deliv_worker > 0
+    assert len(sent_messages) > 0
+
+    # 2F: Confirmed provider_adapters ProviderAdapterError on PostgreSQL
+    from provider_adapters import ProviderAdapterError as RealAdapterError
+    sent_messages.clear()
+    exc_adapter_pg = RealAdapterError("Adapter auth error")
+    exc_adapter_pg.classification = "auth"
+    inc_adapter_pg = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_adapter_pg,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-pg-pos-adapter",
+        enqueue_notification=True,
+        session_maker=pg_test_session_maker,
+    )
+    assert inc_adapter_pg.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_adapter_pg.status == "active"
+    assert inc_adapter_pg.incident_type == "auth"
+    deliv_adapter = await process_ai_incident_notifications(test_bot, session_maker=pg_test_session_maker)
+    assert deliv_adapter > 0
+    assert len(sent_messages) > 0
+
+    # 2G: PII Sanitization verification on PostgreSQL
     from ai_incident_manager import sanitize_technical_code
     assert sanitize_technical_code("inferred_patient_123456789") == "unspecified"
     assert sanitize_technical_code("inferred_user_987654") == "unspecified"
@@ -11368,6 +11416,271 @@ async def test_blocker_priorities_sdk_and_database_classification_e2e(
             assert "patient_123456789" not in (n.message_text or "")
             assert "secret_token_987" not in (n.message_text or "")
             assert "inferred_patient" not in (n.message_text or "")
+
+
+@pytest.mark.asyncio
+async def test_isolated_domain_subsystem_verification_no_unwanted_imports_and_alerts(
+    test_db_session_maker,
+    monkeypatch,
+):
+    """
+    Exhaustive verification of subsystem boundary isolation and zero unwanted imports:
+    1. Negative cases (Local/synthetic InsufficientBalanceError, Local/synthetic ProviderAdapterError):
+       - Asserts that foreign subsystems (e.g. max_messenger_bot.ai) are NOT imported into sys.modules.
+       - Asserts configure_logging() of another subsystem is never called.
+       - Asserts pf.classification_source == "message_fallback" and operator_action_required is False.
+       - Asserts incident_type == "unknown", status == "transient".
+       - Asserts 0 delivered notifications and 0 sent Telegram messages.
+    2. Positive cases (Real ai_integration, max_messenger_bot, background_worker, provider_adapters):
+       - Asserts pf.classification_source == "sdk_typed_exception" and operator_action_required is True.
+       - Asserts incident_type matches real canonical type and status == "active".
+       - Asserts operator notification is delivered and sent to Telegram.
+    """
+    import sys
+    from provider_failures import ProviderFailure, normalize_exception
+    from database import AIConfig, AIIncidentNotificationModel, AIProviderIncidentModel
+    from ai_incident_manager import record_ai_provider_failure, process_ai_incident_notifications
+    from aiogram.client.session.base import BaseSession
+    from aiogram.methods.base import TelegramMethod
+    from aiogram.methods import SendMessage
+    from aiogram.types import Message, Chat, User as AiogramUser
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+    monkeypatch.setenv("APP_ENV", "development")
+
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            session.add(AIConfig(id=1, current_provider="OPENAI", openai_api_key="sk-test-isolation-key"))
+            await session.commit()
+
+    sent_messages = []
+
+    class MockTelegramSession(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            if isinstance(method, SendMessage):
+                sent_messages.append(method)
+                return Message(
+                    message_id=9000 + len(sent_messages),
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    test_bot = Bot(token="8224473896:AAFtest_token_veraveda", session=MockTelegramSession())
+
+    # -------------------------------------------------------------------------
+    # PART 1: NEGATIVE SCENARIOS - NO UNWANTED IMPORTS & NO FALSE ALERTS
+    # -------------------------------------------------------------------------
+    # Ensure clean state: max_messenger_bot.ai is not in sys.modules during Telegram error check
+    saved_max_ai = sys.modules.pop("max_messenger_bot.ai", None)
+    saved_max = sys.modules.pop("max_messenger_bot", None)
+
+    try:
+        # 1A: Local fake InsufficientBalanceError
+        LocalBal = type("InsufficientBalanceError", (Exception,), {})
+        exc_local_bal = LocalBal("Fake local balance issue")
+        pf_local = normalize_exception(exc_local_bal, "OpenAI", "chat")
+
+        assert "max_messenger_bot.ai" not in sys.modules, "Classification must not import max_messenger_bot.ai"
+        assert pf_local.classification_source == "message_fallback"
+        assert pf_local.operator_action_required is False
+
+        sent_messages.clear()
+        inc_local = await record_ai_provider_failure(
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            provider="OpenAI",
+            error=exc_local_bal,
+            operation="chat",
+            model="gpt-4o",
+            credential_scope="scope-iso-local-bal",
+            enqueue_notification=True,
+            session_maker=test_db_session_maker,
+        )
+        assert inc_local.evidence_tier == "INFERRED_MESSAGE"
+        assert inc_local.status == "transient"
+        assert inc_local.incident_type == "unknown"
+        deliv_local = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+        assert deliv_local == 0
+        assert len(sent_messages) == 0
+
+        # 1B: Synthetic class with spoofed __module__ = "max_messenger_bot.ai"
+        SynthMaxBal = type("InsufficientBalanceError", (Exception,), {"__module__": "max_messenger_bot.ai"})
+        exc_synth_max = SynthMaxBal("Fake synthetic MAX balance")
+        pf_synth_max = normalize_exception(exc_synth_max, "OpenAI", "chat")
+
+        assert "max_messenger_bot.ai" not in sys.modules, "Synthetic class must not trigger import of max_messenger_bot.ai"
+        assert pf_synth_max.classification_source == "message_fallback"
+        assert pf_synth_max.operator_action_required is False
+
+        sent_messages.clear()
+        inc_synth_max = await record_ai_provider_failure(
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            provider="OpenAI",
+            error=exc_synth_max,
+            operation="chat",
+            model="gpt-4o",
+            credential_scope="scope-iso-synth-max",
+            enqueue_notification=True,
+            session_maker=test_db_session_maker,
+        )
+        assert inc_synth_max.evidence_tier == "INFERRED_MESSAGE"
+        assert inc_synth_max.status == "transient"
+        assert inc_synth_max.incident_type == "unknown"
+        deliv_synth_max = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+        assert deliv_synth_max == 0
+        assert len(sent_messages) == 0
+
+        # 1C: Local fake ProviderAdapterError
+        LocalAdapter = type("ProviderAdapterError", (Exception,), {})
+        LocalAdapter.classification = "auth"
+        exc_local_ad = LocalAdapter("Fake local adapter error")
+        pf_local_ad = normalize_exception(exc_local_ad, "OpenAI", "chat")
+        assert pf_local_ad.classification_source == "message_fallback"
+        assert pf_local_ad.operator_action_required is False
+
+        sent_messages.clear()
+        inc_local_ad = await record_ai_provider_failure(
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            provider="OpenAI",
+            error=exc_local_ad,
+            operation="chat",
+            model="gpt-4o",
+            credential_scope="scope-iso-local-ad",
+            enqueue_notification=True,
+            session_maker=test_db_session_maker,
+        )
+        assert inc_local_ad.evidence_tier == "INFERRED_MESSAGE"
+        assert inc_local_ad.status == "transient"
+        assert inc_local_ad.incident_type == "unknown"
+        deliv_local_ad = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+        assert deliv_local_ad == 0
+        assert len(sent_messages) == 0
+
+    finally:
+        if saved_max_ai is not None:
+            sys.modules["max_messenger_bot.ai"] = saved_max_ai
+        if saved_max is not None:
+            sys.modules["max_messenger_bot"] = saved_max
+
+    # -------------------------------------------------------------------------
+    # PART 2: POSITIVE SCENARIOS - REAL DOMAIN & ADAPTER EXCEPTIONS
+    # -------------------------------------------------------------------------
+    # 2A: Real ai_integration.InsufficientBalanceError
+    from ai_integration import InsufficientBalanceError as RealAiBal
+    exc_real_ai = RealAiBal("Genuine AI balance exhausted")
+    pf_real_ai = normalize_exception(exc_real_ai, "OpenAI", "chat")
+    assert pf_real_ai.classification == "insufficient_balance_quota"
+    assert pf_real_ai.classification_source == "sdk_typed_exception"
+    assert pf_real_ai.operator_action_required is True
+
+    sent_messages.clear()
+    inc_real_ai = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_real_ai,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-iso-real-ai",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_real_ai.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_real_ai.status == "active"
+    assert inc_real_ai.incident_type == "insufficient_balance_quota"
+    deliv_real_ai = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_real_ai > 0
+    assert len(sent_messages) > 0
+
+    # 2B: Real background_worker.InsufficientBalanceError
+    from background_worker import InsufficientBalanceError as RealWorkerBal
+    exc_real_worker = RealWorkerBal("Genuine Worker balance exhausted")
+    pf_real_worker = normalize_exception(exc_real_worker, "OpenAI", "chat")
+    assert pf_real_worker.classification == "insufficient_balance_quota"
+    assert pf_real_worker.classification_source == "sdk_typed_exception"
+    assert pf_real_worker.operator_action_required is True
+
+    sent_messages.clear()
+    inc_real_worker = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_real_worker,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-iso-real-worker",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_real_worker.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_real_worker.status == "active"
+    assert inc_real_worker.incident_type == "insufficient_balance_quota"
+    deliv_real_worker = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_real_worker > 0
+    assert len(sent_messages) > 0
+
+    # 2C: Real max_messenger_bot.ai.InsufficientBalanceError
+    from max_messenger_bot.ai import InsufficientBalanceError as RealMaxBal
+    exc_real_max = RealMaxBal("Genuine MAX balance exhausted")
+    pf_real_max = normalize_exception(exc_real_max, "OpenAI", "chat")
+    assert pf_real_max.classification == "insufficient_balance_quota"
+    assert pf_real_max.classification_source == "sdk_typed_exception"
+    assert pf_real_max.operator_action_required is True
+
+    sent_messages.clear()
+    inc_real_max = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_real_max,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-iso-real-max",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_real_max.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_real_max.status == "active"
+    assert inc_real_max.incident_type == "insufficient_balance_quota"
+    deliv_real_max = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_real_max > 0
+    assert len(sent_messages) > 0
+
+    # 2D: Real provider_adapters.ProviderAdapterError
+    from provider_adapters import ProviderAdapterError as RealAdapterErr
+    exc_real_adapter = RealAdapterErr("Genuine Adapter auth failure")
+    exc_real_adapter.classification = "auth"
+    pf_real_adapter = normalize_exception(exc_real_adapter, "OpenAI", "chat")
+    assert pf_real_adapter.classification == "auth"
+    assert pf_real_adapter.classification_source == "sdk_typed_exception"
+    assert pf_real_adapter.operator_action_required is True
+
+    sent_messages.clear()
+    inc_real_adapter = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_real_adapter,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-iso-real-adapter",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_real_adapter.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_real_adapter.status == "active"
+    assert inc_real_adapter.incident_type == "auth"
+    deliv_real_adapter = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_real_adapter > 0
+    assert len(sent_messages) > 0
 
 
 

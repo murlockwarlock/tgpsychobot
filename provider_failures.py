@@ -547,39 +547,28 @@ _DOMAIN_BALANCE_MODULES: tuple[str, ...] = (
 def _is_domain_insufficient_balance_error(item: BaseException) -> bool:
     if type(item).__name__ != "InsufficientBalanceError":
         return False
+    # Check strictly within domain modules ALREADY loaded in sys.modules.
+    # An error classifier must never import or initialize foreign subsystems
+    # just to inspect an exception type (avoids side-effects such as MAX configure_logging).
+    item_class = type(item)
     for mod_name in _DOMAIN_BALANCE_MODULES:
         mod = sys.modules.get(mod_name)
         if mod is not None:
             cls = getattr(mod, "InsufficientBalanceError", None)
-            if isinstance(cls, type) and isinstance(item, cls):
+            if isinstance(cls, type) and (item_class is cls or issubclass(item_class, cls)):
                 return True
-    for mod_name in _DOMAIN_BALANCE_MODULES:
-        if mod_name not in sys.modules:
-            try:
-                mod = __import__(mod_name, fromlist=["InsufficientBalanceError"])
-                cls = getattr(mod, "InsufficientBalanceError", None)
-                if isinstance(cls, type) and isinstance(item, cls):
-                    return True
-            except Exception:
-                pass
     return False
 
 
 def _is_trusted_adapter_error(item: BaseException) -> bool:
     if type(item).__name__ != "ProviderAdapterError":
         return False
+    # Check strictly within provider_adapters if ALREADY loaded in sys.modules.
     mod = sys.modules.get("provider_adapters")
     if mod is not None:
         cls = getattr(mod, "ProviderAdapterError", None)
-        if isinstance(cls, type) and isinstance(item, cls):
+        if isinstance(cls, type) and (type(item) is cls or isinstance(item, cls)):
             return True
-    try:
-        import provider_adapters
-        cls = getattr(provider_adapters, "ProviderAdapterError", None)
-        if isinstance(cls, type) and isinstance(item, cls):
-            return True
-    except Exception:
-        pass
     return False
 
 
