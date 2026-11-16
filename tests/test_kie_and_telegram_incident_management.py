@@ -8434,13 +8434,25 @@ async def test_no_fictitious_provider_5xx_classification(test_db_session_maker, 
         operation="chat",
         classification="unknown",  # Unclassified by caller, but authentic http_status=503
         detail_code="503",
-        retryable=False,  # Should become True via RETRYABLE_CLASSES
         http_status=503,
         classification_source="provider_structured",
     )
     assert err_503.failure.classification == "provider_5xx"
     assert err_503.failure.classification_source == "http_status_fallback"
     assert err_503.failure.retryable is True
+
+    # Explicit override: conscious retryable=False is strictly respected
+    pf_override = ProviderFailure(
+        provider="KIE",
+        operation="chat",
+        classification="unknown",
+        detail_code="503",
+        http_status=503,
+        retryable=False,
+    )
+    assert pf_override.classification == "provider_5xx"
+    assert pf_override.retryable is False
+    assert pf_override.transient is False
     inc_3 = await record_ai_provider_failure(
         origin_instance_id="tg_veraveda777_bot_legacy",
         provider="KIE",
@@ -9633,6 +9645,670 @@ def test_provider_failure_http_status_operator_action_required_sync():
     assert parsed_401.operator_action_required is True
     assert parsed_401.classification == pf_401.classification
     assert parsed_401.operator_action_required == pf_401.operator_action_required
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_canonical_matrix_and_db_lifecycle(
+    test_db_session_maker,
+    monkeypatch,
+):
+    """
+    Comprehensive verification of ProviderFailure canonical matrix and DB lifecycle across all 8 classes:
+    - auth (401)
+    - permission (403)
+    - insufficient_balance_quota (402)
+    - configuration (404)
+    - timeout (408 / TimeoutError)
+    - rate_limit (429)
+    - provider_5xx (500)
+    - unknown (unmapped)
+
+    Verifies:
+    1. Direct ProviderFailure default flag deduction.
+    2. Direct ProviderFailure conscious explicit overrides.
+    3. Parity with parse_provider_failure and normalize_exception.
+    4. Incident DB status (active vs transient).
+    5. Incident manager notification decision (enqueued vs suppressed).
+    6. Telegram delivery via outbox worker.
+    """
+    from provider_failures import ProviderFailure, parse_provider_failure
+    from database import AIConfig
+    from aiogram.client.session.base import BaseSession
+    from aiogram.methods.base import TelegramMethod
+    from aiogram.methods import SendMessage
+    from aiogram.types import Message, Chat, User as AiogramUser
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+    monkeypatch.setenv("APP_ENV", "development")
+
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            session.add(AIConfig(id=1, current_provider="DEEPSEEK", deepseek_api_key="sk-matrix-test"))
+            await session.commit()
+
+    sent_messages = []
+
+    class MockSession(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            if isinstance(method, SendMessage):
+                sent_messages.append(method)
+                return Message(
+                    message_id=2000 + len(sent_messages),
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    test_bot = Bot(token="8224473896:AAFtest_token_veraveda", session=MockSession())
+
+    test_cases = [
+        # (cls_name, http_status, is_operator, is_retryable, is_transient)
+        ("auth", 401, True, False, False),
+        ("permission", 403, True, False, False),
+        ("insufficient_balance_quota", 402, True, False, False),
+        ("configuration", 404, True, False, False),
+        ("timeout", 408, False, True, True),
+        ("rate_limit", 429, False, True, True),
+        ("provider_5xx", 500, False, True, True),
+        ("unknown", None, False, False, False),
+    ]
+
+    for cls_name, status, exp_operator, exp_retryable, exp_transient in test_cases:
+        # A. Direct ProviderFailure with default flags
+        pf_direct = ProviderFailure(
+            provider="KIE",
+            operation="chat",
+            classification=cls_name,
+            detail_code=str(status or "code"),
+            http_status=status,
+        )
+        assert pf_direct.classification == cls_name
+        assert pf_direct.operator_action_required is exp_operator
+        assert pf_direct.retryable is exp_retryable
+        assert pf_direct.transient is exp_transient
+
+        # B. Parity with parse_provider_failure
+        if status is not None:
+            pf_parsed = parse_provider_failure("KIE", "chat", status)
+            if pf_parsed:
+                assert pf_parsed.operator_action_required is exp_operator
+                assert pf_parsed.retryable is exp_retryable
+
+        # C. Incident DB Status and notification decision
+        err = Exception(f"Test failure {cls_name}")
+        err.failure = pf_direct
+        sent_messages.clear()
+
+        inc = await record_ai_provider_failure(
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            provider="KIE",
+            error=err,
+            operation="chat",
+            model=f"model-{cls_name}",
+            credential_scope=f"scope-{cls_name}",
+            enqueue_notification=True,
+            session_maker=test_db_session_maker,
+        )
+        assert inc is not None
+        expected_status = "active" if exp_operator else "transient"
+        assert inc.status == expected_status, f"Class {cls_name} expected {expected_status}, got {inc.status}"
+
+        # D. Check outbox
+        delivered = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+        if exp_operator:
+            assert delivered > 0, f"Class {cls_name} must enqueue and deliver notification"
+            assert len(sent_messages) > 0
+        else:
+            assert delivered == 0, f"Class {cls_name} must not deliver notification for transient error"
+            assert len(sent_messages) == 0
+
+    # E. Conscious explicit overrides
+    # Override 1: Timeout with retryable=False
+    pf_no_retry_timeout = ProviderFailure(
+        provider="KIE",
+        operation="chat",
+        classification="timeout",
+        detail_code="timeout",
+        retryable=False,
+    )
+    assert pf_no_retry_timeout.retryable is False
+    assert pf_no_retry_timeout.transient is False
+
+    # Override 2: Quota with operator_action_required=False (OpenRouter in-flight budget)
+    pf_in_flight = ProviderFailure(
+        provider="openrouter",
+        operation="chat",
+        classification="insufficient_balance_quota",
+        detail_code="openrouter_in_flight_budget",
+        retryable=True,
+        operator_action_required=False,
+    )
+    assert pf_in_flight.retryable is True
+    assert pf_in_flight.operator_action_required is False
+
+    # Record failure with in-flight override -> should be transient, not active!
+    err_in_flight = Exception("Openrouter in-flight budget")
+    err_in_flight.failure = pf_in_flight
+    inc_in_flight = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="openrouter",
+        error=err_in_flight,
+        operation="chat",
+        model="openrouter-test",
+        credential_scope="scope-in-flight",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_in_flight is not None
+    assert inc_in_flight.status == "transient", "Override operator_action_required=False must result in transient incident"
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_provider_failure_canonical_matrix_and_db_lifecycle(
+    pg_test_session_maker,
+    monkeypatch,
+):
+    """
+    PostgreSQL integration test for ProviderFailure canonical matrix and DB lifecycle:
+    Validates active vs transient status, notification decision, and durable outbox delivery.
+    """
+    from provider_failures import ProviderFailure
+    from database import AIConfig
+    from aiogram.client.session.base import BaseSession
+    from aiogram.methods.base import TelegramMethod
+    from aiogram.methods import SendMessage
+    from aiogram.types import Message, Chat, User as AiogramUser
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+    monkeypatch.setenv("APP_ENV", "development")
+
+    async with pg_test_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            session.add(AIConfig(id=1, current_provider="DEEPSEEK", deepseek_api_key="sk-matrix-pg"))
+            await session.commit()
+
+    sent_messages = []
+
+    class MockSession(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            if isinstance(method, SendMessage):
+                sent_messages.append(method)
+                return Message(
+                    message_id=3000 + len(sent_messages),
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    test_bot = Bot(token="8224473896:AAFtest_token_veraveda", session=MockSession())
+
+    # 1. Operator class: auth -> active incident and outbox notification
+    pf_auth = ProviderFailure(
+        provider="KIE",
+        operation="chat",
+        classification="auth",
+        detail_code="401",
+        http_status=401,
+    )
+    assert pf_auth.operator_action_required is True
+    err_auth = Exception("401 Unauthorized")
+    err_auth.failure = pf_auth
+    inc_auth = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=err_auth,
+        operation="chat",
+        model="pg-kie-auth",
+        credential_scope="scope-pg-auth",
+        enqueue_notification=True,
+        session_maker=pg_test_session_maker,
+    )
+    assert inc_auth is not None
+    assert inc_auth.status == "active"
+    delivered = await process_ai_incident_notifications(test_bot, session_maker=pg_test_session_maker)
+    assert delivered > 0
+    assert len(sent_messages) > 0
+
+    # 2. Retryable class: timeout -> transient incident and no notification
+    sent_messages.clear()
+    pf_timeout = ProviderFailure(
+        provider="KIE",
+        operation="chat",
+        classification="timeout",
+        detail_code="408",
+        http_status=408,
+    )
+    assert pf_timeout.retryable is True
+    assert pf_timeout.operator_action_required is False
+    err_timeout = Exception("408 Timeout")
+    err_timeout.failure = pf_timeout
+    inc_timeout = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=err_timeout,
+        operation="chat",
+        model="pg-kie-timeout",
+        credential_scope="scope-pg-timeout",
+        enqueue_notification=True,
+        session_maker=pg_test_session_maker,
+    )
+    assert inc_timeout is not None
+    assert inc_timeout.status == "transient"
+    delivered_transient = await process_ai_incident_notifications(test_bot, session_maker=pg_test_session_maker)
+    assert delivered_transient == 0
+    assert len(sent_messages) == 0
+
+
+@pytest.mark.asyncio
+async def test_bot_instance_identity_fail_closed_and_companion_isolation(
+    test_db_session_maker,
+    monkeypatch,
+):
+    """
+    Verification of fail-closed behavior for BOT_INSTANCE_ID and cross-companion isolation:
+    1. Missing BOT_INSTANCE_ID -> detect_current_instance() returns None.
+    2. Unknown / bogus BOT_INSTANCE_ID -> detect_current_instance() returns None.
+    3. Valid Telegram instance -> returns correct instance definition.
+    4. Valid MAX instance -> returns correct instance and resolves companion Telegram instance.
+    5. Foreign Telegram token -> verify_origin_bot_token_consistency returns False / fails closed.
+    6. Foreign admins -> resolve_target_admin_ids resolves strictly to designated admins.
+    7. Incident recording fails closed when BOT_INSTANCE_ID is missing or foreign.
+    """
+    from notification_routing import (
+        detect_current_instance,
+        extract_telegram_bot_id,
+        get_instance_by_pm2_name,
+        resolve_companion_telegram_instance,
+        resolve_target_admin_ids,
+    )
+
+    # 1. Missing BOT_INSTANCE_ID
+    monkeypatch.delenv("BOT_INSTANCE_ID", raising=False)
+    assert detect_current_instance() is None, "Missing BOT_INSTANCE_ID must fail closed"
+
+    # 2. Unknown BOT_INSTANCE_ID
+    monkeypatch.setenv("BOT_INSTANCE_ID", "unregistered_bot_xyz")
+    assert detect_current_instance() is None, "Unregistered BOT_INSTANCE_ID must fail closed"
+
+    # 3. Valid Telegram instance
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    tg_inst = detect_current_instance()
+    assert tg_inst is not None
+    assert tg_inst["platform"] == "telegram"
+    assert tg_inst["pm2_name"] == "tg_veraveda777_bot_legacy"
+
+    # 4. Valid MAX instance
+    monkeypatch.setenv("BOT_INSTANCE_ID", "max_se13639182_bot_legacy")
+    max_inst = detect_current_instance()
+    assert max_inst is not None
+    assert max_inst["platform"] == "max"
+    comp_inst = resolve_companion_telegram_instance(max_inst)
+    assert comp_inst is not None
+    assert comp_inst["platform"] == "telegram"
+    assert comp_inst["pm2_name"] == "tg_veraveda777_bot_legacy"
+
+    # 5. Foreign Telegram token verification: extract_telegram_bot_id matches platform_id
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+    assert extract_telegram_bot_id(os.environ["BOT_TOKEN"]) == tg_inst["platform_id"]
+
+    monkeypatch.setenv("BOT_TOKEN", "1234567890:AAFforeign_token_different_bot_id")
+    assert extract_telegram_bot_id(os.environ["BOT_TOKEN"]) != tg_inst["platform_id"]
+
+    # In incident manager, token mismatch strictly causes record_ai_provider_failure to fail closed (returns None)
+    foreign_token_inc = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="KIE",
+        error=Exception("Token mismatch test"),
+        operation="chat",
+        session_maker=test_db_session_maker,
+    )
+    assert foreign_token_inc is None, "record_ai_provider_failure must fail closed on token ID mismatch"
+
+    # 6. Admin isolation
+    async with test_db_session_maker() as session:
+        vv_admins = await resolve_target_admin_ids(tg_inst, current_instance=tg_inst, session=session)
+        assert 979514796 in vv_admins
+        assert 272982544 in vv_admins
+
+        swy02_inst = get_instance_by_pm2_name("tg_someonewithyou02_bot_new")
+        swy02_admins = await resolve_target_admin_ids(swy02_inst, current_instance=swy02_inst, session=session)
+        assert 979514796 not in swy02_admins
+
+    # 7. Incident recording fails closed when BOT_INSTANCE_ID is missing
+    monkeypatch.delenv("BOT_INSTANCE_ID", raising=False)
+    fail_inc = await record_ai_provider_failure(
+        origin_instance_id=None,
+        provider="KIE",
+        error=Exception("Fail-closed test"),
+        operation="chat",
+        session_maker=test_db_session_maker,
+    )
+    assert fail_inc is None, "record_ai_provider_failure must fail closed when BOT_INSTANCE_ID is missing"
+
+
+@pytest.mark.asyncio
+async def test_real_concurrent_two_workers_lease_expiry_post_send_cas(
+    test_db_session_maker,
+    monkeypatch,
+):
+    """
+    Verification of two concurrent outbox workers with lease expiry:
+    1. Worker 1 claims outbox row (status -> 'processing', token -> token_1, lease -> +60s).
+    2. Worker 1 enters Telegram send_message.
+    3. While Worker 1 is in send_message, time advances past lease_until (simulated lease expiry).
+    4. Worker 2 runs process_ai_incident_notifications:
+       - Sees expired lease on 'processing' row.
+       - Worker 2 successfully reclaims row (token -> token_2, lease -> +60s, attempts -> attempts + 1).
+       - Worker 2 completes send_message.
+       - Worker 2 executes Post-Send CAS: res.rowcount == 1.
+       - Worker 2 commits: status -> 'delivered', delivered_count == 1.
+    5. Worker 1's send_message completes and Worker 1 executes Post-Send CAS:
+       - Since claim_token == token_1 matches 0 rows in DB, res.rowcount == 0.
+       - Worker 1 commits, logs warning, and returns delivered_count == 0 (NO false success!).
+    6. Verification:
+       - SendMessage was dispatched by both workers (at-least-once Telegram transport).
+       - Worker 1 delivered_count == 0.
+       - Worker 2 delivered_count == 1.
+       - In DB: status == 'delivered', claim_token == token_2, attempts == 2.
+    """
+    from database import AIConfig, AIProviderIncidentModel, AIIncidentNotificationModel
+    from aiogram.client.session.base import BaseSession
+    from aiogram.methods.base import TelegramMethod
+    from aiogram.methods import SendMessage
+    from aiogram.types import Message, Chat, User as AiogramUser
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+    monkeypatch.setenv("APP_ENV", "development")
+
+    async with test_db_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            session.add(AIConfig(id=1, current_provider="DEEPSEEK", deepseek_api_key="sk-test-key"))
+            await session.commit()
+
+        inc = AIProviderIncidentModel(
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            companion_instance_id="tg_veraveda777_bot_legacy",
+            provider="DEEPSEEK",
+            credential_scope="scope_concurrent_cas",
+            operation="chat",
+            model_scope="deepseek-chat",
+            incident_type="provider_5xx",
+            evidence_tier="CONFIRMED_STRUCTURED",
+            detail_code="500",
+            classification_source="provider_structured",
+            status="active",
+            occurrence_count=1,
+            reminder_cycle=0,
+            first_seen_at=datetime.utcnow(),
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add(inc)
+        await session.flush()
+
+        notif = AIIncidentNotificationModel(
+            incident_id=inc.id,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            recipient_id=979514796,
+            event_type="opened",
+            status="pending",
+            attempts=0,
+            max_attempts=6,
+            message_text="Real concurrent CAS test notification",
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        session.add(notif)
+        await session.commit()
+        notif_id = notif.id
+
+    worker_1_sends = []
+    worker_2_sends = []
+
+    # Worker 2 Bot and Session
+    class Worker2Session(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            if isinstance(method, SendMessage):
+                worker_2_sends.append(method)
+                return Message(
+                    message_id=2002,
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    bot_worker_2 = Bot(token="8224473896:AAFtest_token_veraveda", session=Worker2Session())
+    worker_2_delivered = None
+
+    # Worker 1 Session: when make_request is called, it triggers lease expiry and runs Worker 2 to completion
+    class Worker1Session(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            nonlocal worker_2_delivered
+            if isinstance(method, SendMessage):
+                worker_1_sends.append(method)
+
+                # 1. Simulate lease expiry by setting lease_until in the past
+                async with test_db_session_maker() as s:
+                    row = await s.get(AIIncidentNotificationModel, notif_id)
+                    assert row.status == "processing"
+                    row.lease_until = datetime.utcnow() - timedelta(seconds=10)
+                    await s.commit()
+
+                # 2. Worker 2 runs concurrently while Worker 1 is still in send_message
+                worker_2_delivered = await process_ai_incident_notifications(bot_worker_2, session_maker=test_db_session_maker)
+
+                # 3. Now Worker 1 finishes send_message
+                return Message(
+                    message_id=2001,
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    bot_worker_1 = Bot(token="8224473896:AAFtest_token_veraveda", session=Worker1Session())
+
+    # Run Worker 1
+    worker_1_delivered = await process_ai_incident_notifications(bot_worker_1, session_maker=test_db_session_maker)
+
+    # Assertions
+    # 1. Both workers called Telegram (at-least-once delivery)
+    assert len(worker_1_sends) == 1
+    assert len(worker_2_sends) == 1
+
+    # 2. Worker 2 succeeded post-send CAS and counted 1 delivery
+    assert worker_2_delivered == 1
+
+    # 3. Worker 1 missed post-send CAS (rowcount == 0) and counted 0 delivery
+    assert worker_1_delivered == 0
+
+    # 4. DB state is clean: status == 'delivered', attempts == 2
+    async with test_db_session_maker() as session:
+        final_row = await session.get(AIIncidentNotificationModel, notif_id)
+        assert final_row.status == "delivered"
+        assert final_row.attempts == 2
+        assert final_row.last_error == "delivered_ok"
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.asyncio
+async def test_real_postgresql_concurrent_two_workers_lease_expiry_post_send_cas(
+    pg_test_session_maker,
+    monkeypatch,
+):
+    """
+    PostgreSQL integration test for two concurrent outbox workers with lease expiry:
+    Proves atomic CAS rowcount detection and exact single confirmation on real PostgreSQL.
+    """
+    from database import AIConfig, AIProviderIncidentModel, AIIncidentNotificationModel
+    from aiogram.client.session.base import BaseSession
+    from aiogram.methods.base import TelegramMethod
+    from aiogram.methods import SendMessage
+    from aiogram.types import Message, Chat, User as AiogramUser
+
+    monkeypatch.setenv("BOT_INSTANCE_ID", "tg_veraveda777_bot_legacy")
+    monkeypatch.setenv("BOT_TOKEN", "8224473896:AAFtest_token_veraveda")
+    monkeypatch.setenv("APP_ENV", "development")
+
+    async with pg_test_session_maker() as session:
+        cfg = await session.get(AIConfig, 1)
+        if not cfg:
+            session.add(AIConfig(id=1, current_provider="DEEPSEEK", deepseek_api_key="sk-test-key-pg"))
+            await session.commit()
+
+        inc = AIProviderIncidentModel(
+            origin_instance_id="tg_veraveda777_bot_legacy",
+            companion_instance_id="tg_veraveda777_bot_legacy",
+            provider="DEEPSEEK",
+            credential_scope="scope_pg_concurrent_cas",
+            operation="chat",
+            model_scope="deepseek-chat",
+            incident_type="provider_5xx",
+            evidence_tier="CONFIRMED_STRUCTURED",
+            detail_code="500",
+            classification_source="provider_structured",
+            status="active",
+            occurrence_count=1,
+            reminder_cycle=0,
+            first_seen_at=datetime.utcnow(),
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add(inc)
+        await session.flush()
+
+        notif = AIIncidentNotificationModel(
+            incident_id=inc.id,
+            authorized_instance_id="tg_veraveda777_bot_legacy",
+            recipient_id=979514796,
+            event_type="opened",
+            status="pending",
+            attempts=0,
+            max_attempts=6,
+            message_text="PostgreSQL concurrent CAS test notification",
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        session.add(notif)
+        await session.commit()
+        notif_id = notif.id
+
+    worker_1_sends = []
+    worker_2_sends = []
+
+    class PgWorker2Session(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            if isinstance(method, SendMessage):
+                worker_2_sends.append(method)
+                return Message(
+                    message_id=4002,
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    bot_worker_2 = Bot(token="8224473896:AAFtest_token_veraveda", session=PgWorker2Session())
+    worker_2_delivered = None
+
+    class PgWorker1Session(BaseSession):
+        async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+            nonlocal worker_2_delivered
+            if isinstance(method, SendMessage):
+                worker_1_sends.append(method)
+
+                async with pg_test_session_maker() as s:
+                    row = await s.get(AIIncidentNotificationModel, notif_id)
+                    assert row.status == "processing"
+                    row.lease_until = datetime.utcnow() - timedelta(seconds=10)
+                    await s.commit()
+
+                worker_2_delivered = await process_ai_incident_notifications(bot_worker_2, session_maker=pg_test_session_maker)
+
+                return Message(
+                    message_id=4001,
+                    date=datetime.now(),
+                    chat=Chat(id=method.chat_id, type="private"),
+                    text=method.text,
+                    from_user=AiogramUser(id=8224473896, is_bot=True, first_name="bot"),
+                )
+            elif method.__class__.__name__ == "GetMe":
+                return AiogramUser(id=8224473896, is_bot=True, first_name="bot", username="veraveda777_bot")
+            return None
+
+        async def stream_content(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def close(self):
+            pass
+
+    bot_worker_1 = Bot(token="8224473896:AAFtest_token_veraveda", session=PgWorker1Session())
+
+    worker_1_delivered = await process_ai_incident_notifications(bot_worker_1, session_maker=pg_test_session_maker)
+
+    assert len(worker_1_sends) == 1
+    assert len(worker_2_sends) == 1
+    assert worker_2_delivered == 1
+    assert worker_1_delivered == 0
+
+    async with pg_test_session_maker() as session:
+        final_row = await session.get(AIIncidentNotificationModel, notif_id)
+        assert final_row.status == "delivered"
+        assert final_row.attempts == 2
+        assert final_row.last_error == "delivered_ok"
 
 
 

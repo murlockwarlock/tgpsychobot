@@ -66,11 +66,11 @@ class ProviderFailure:
     provider_error_message: str = ""
     http_status: int | None = None
     request_id: str | None = None
-    retryable: bool = False
+    retryable: bool | None = None
     retry_after_seconds: float | None = None
-    network_attempted: bool = True
-    transient: bool = False
-    operator_action_required: bool = False
+    network_attempted: bool | None = None
+    transient: bool | None = None
+    operator_action_required: bool | None = None
     classification_source: str = "provider_structured"
     provider_metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -89,13 +89,26 @@ class ProviderFailure:
                 safe_c = inferred
                 if self.classification_source in ("provider_structured", "unknown"):
                     object.__setattr__(self, "classification_source", "http_status_fallback")
-                if not self.retryable and safe_c in RETRYABLE_CLASSES:
-                    object.__setattr__(self, "retryable", True)
-                    object.__setattr__(self, "transient", True)
-                if not self.operator_action_required and safe_c in OPERATOR_CLASSES:
-                    object.__setattr__(self, "operator_action_required", True)
         if safe_c != self.classification:
             object.__setattr__(self, "classification", safe_c)
+
+        # Flag derivation and override resolution:
+        # If omitted (None), strictly derive from canonical classification
+        if self.retryable is None:
+            object.__setattr__(self, "retryable", safe_c in RETRYABLE_CLASSES)
+
+        if self.network_attempted is None:
+            object.__setattr__(
+                self,
+                "network_attempted",
+                safe_c not in ("configuration", "application_internal"),
+            )
+
+        if self.transient is None:
+            object.__setattr__(self, "transient", bool(self.retryable))
+
+        if self.operator_action_required is None:
+            object.__setattr__(self, "operator_action_required", safe_c in OPERATOR_CLASSES)
 
     def diagnostics(self) -> dict[str, Any]:
         return asdict(self)
