@@ -124,8 +124,6 @@ def sanitize_technical_code(
     # Check if code has low-credit pattern "balance_X.XX_below_Y.YY"
     if re.match(r"^balance_\d+(\.\d+)?_below_\d+(\.\d+)?$", s):
         return s
-    if re.match(r"^inferred_[a-z0-9_]{1,50}$", s_lower):
-        return s[:64]
     if s in ("superseded_by_key_rotation", "recovered", "persisting"):
         return s
     # Fallback to valid canonical classification if available

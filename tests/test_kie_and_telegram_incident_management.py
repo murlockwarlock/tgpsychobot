@@ -10633,6 +10633,9 @@ async def test_real_postgresql_ai_classification_positive_negative_and_edge_scen
 
     # 1. Negative Scenarios on real PostgreSQL
     LocalAuthErrorPg = type("AuthenticationError", (Exception,), {})
+    SyntheticAuthOpenAIPg = type("AuthenticationError", (Exception,), {"__module__": "openai"})
+    SyntheticAuthOpenAIFakePg = type("AuthenticationError", (Exception,), {"__module__": "openai_fake"})
+    LocalBalPg = type("InsufficientBalanceError", (Exception,), {})
     adhoc_auth_exc = Exception("Custom untyped error")
     adhoc_auth_exc.classification = "auth"
     neg_exceptions = [
@@ -10640,6 +10643,9 @@ async def test_real_postgresql_ai_classification_positive_negative_and_edge_scen
         ("pg_unauthorized", Exception("Unexpected content includes unauthorized")),
         ("pg_balance", Exception("Application text contains insufficient balance")),
         ("pg_local_auth_class", LocalAuthErrorPg("Local authentication fake class")),
+        ("pg_synthetic_auth_openai", SyntheticAuthOpenAIPg("Synthetic openai auth")),
+        ("pg_synthetic_auth_openai_fake", SyntheticAuthOpenAIFakePg("Synthetic fake prefix auth")),
+        ("pg_local_bal_class", LocalBalPg("Local balance fake class")),
         ("pg_adhoc_auth_attr", adhoc_auth_exc),
     ]
     for label, exc in neg_exceptions:
@@ -10738,6 +10744,40 @@ async def test_real_postgresql_ai_classification_positive_negative_and_edge_scen
     deliv_bal = await process_ai_incident_notifications(test_bot, session_maker=pg_test_session_maker)
     assert deliv_bal > 0
     assert len(sent_messages) > 0
+
+    # 2D: Confirmed typed SDK exception without response on PostgreSQL
+    import google.api_core.exceptions
+    sent_messages.clear()
+    exc_sdk_pg = google.api_core.exceptions.Unauthenticated("Google unauth key invalid")
+    inc_sdk_pg = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="google",
+        error=exc_sdk_pg,
+        operation="chat",
+        model="gemini-1.5-pro",
+        credential_scope="scope-pg-pos-sdk",
+        enqueue_notification=True,
+        session_maker=pg_test_session_maker,
+    )
+    assert inc_sdk_pg.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_sdk_pg.status == "active"
+    assert inc_sdk_pg.incident_type == "auth"
+    deliv_sdk_pg = await process_ai_incident_notifications(test_bot, session_maker=pg_test_session_maker)
+    assert deliv_sdk_pg > 0
+    assert len(sent_messages) > 0
+
+    # 2E: PII Sanitization verification on PostgreSQL
+    from ai_incident_manager import sanitize_technical_code
+    assert sanitize_technical_code("inferred_patient_123456789") == "unspecified"
+    assert sanitize_technical_code("inferred_user_987654") == "unspecified"
+    assert sanitize_technical_code("inferred_secret_account_reference") == "unspecified"
+
+    async with pg_test_session_maker() as session:
+        all_pg_notifs = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        for n in all_pg_notifs:
+            assert "patient_123456789" not in (n.message_text or "")
+            assert "user_987654" not in (n.message_text or "")
+            assert "secret_account" not in (n.message_text or "")
 
 
 @pytest.mark.postgres_integration
@@ -11051,13 +11091,31 @@ async def test_blocker_priorities_sdk_and_database_classification_e2e(
     assert pf_503.retryable is True
     assert pf_503.operator_action_required is False
 
-    # Case 1G: Typed SDK exception without response/status
-    SDKAuthError = type("AuthenticationError", (Exception,), {"__module__": "openai"})
-    exc_sdk_no_resp = SDKAuthError("Client validation error")
-    pf_sdk_no_resp = normalize_exception(exc_sdk_no_resp, "OpenAI", "chat")
+    # Case 1G: Real typed SDK exception without response/status
+    import google.api_core.exceptions
+    exc_sdk_no_resp = google.api_core.exceptions.Unauthenticated("API key invalid from Google SDK")
+    pf_sdk_no_resp = normalize_exception(exc_sdk_no_resp, "google", "chat")
     assert pf_sdk_no_resp.classification == "auth"
     assert pf_sdk_no_resp.classification_source == "sdk_typed_exception"
     assert pf_sdk_no_resp.operator_action_required is True
+
+    sent_messages.clear()
+    inc_sdk_no_resp = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="google",
+        error=exc_sdk_no_resp,
+        operation="chat",
+        model="gemini-1.5-pro",
+        credential_scope="scope-sdk-no-resp",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_sdk_no_resp.evidence_tier == "CONFIRMED_STRUCTURED"
+    assert inc_sdk_no_resp.status == "active"
+    assert inc_sdk_no_resp.incident_type == "auth"
+    deliv_sdk = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_sdk > 0
+    assert len(sent_messages) > 0
 
     # Case 1H: Exception with already attached ProviderFailure
     pf_pre_attached = ProviderFailure("OpenAI", "chat", "auth", "attached_test", operator_action_required=True, classification_source="provider_structured")
@@ -11109,7 +11167,7 @@ async def test_blocker_priorities_sdk_and_database_classification_e2e(
         assert len(p5xx_recs) == 0, f"Expected 0 provider_5xx in DB, found {len(p5xx_recs)}"
 
     # =========================================================================
-    # PART 3: SDK Origin Verification
+    # PART 3: SDK Origin Verification & Synthetic Rejection
     # =========================================================================
 
     # Case 3A: Local class named AuthenticationError
@@ -11137,7 +11195,82 @@ async def test_blocker_priorities_sdk_and_database_classification_e2e(
     assert deliv_fake == 0
     assert len(sent_messages) == 0
 
-    # Case 3B: Arbitrary Exception with .classification = "auth"
+    # Case 3B: Synthetic class with spoofed __module__ = "openai"
+    SyntheticAuthOpenAI = type("AuthenticationError", (Exception,), {"__module__": "openai"})
+    exc_synth_openai = SyntheticAuthOpenAI("Synthetic openai auth")
+    pf_synth_openai = normalize_exception(exc_synth_openai, "OpenAI", "chat")
+    assert pf_synth_openai.classification_source == "message_fallback"
+    assert pf_synth_openai.operator_action_required is False
+
+    sent_messages.clear()
+    inc_synth_openai = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_synth_openai,
+        operation="chat",
+        model="gpt-synth-openai",
+        credential_scope="scope-synth-openai",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_synth_openai.evidence_tier == "INFERRED_MESSAGE"
+    assert inc_synth_openai.status == "transient"
+    assert inc_synth_openai.incident_type == "unknown"
+    deliv_synth_openai = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_synth_openai == 0
+    assert len(sent_messages) == 0
+
+    # Case 3C: Synthetic class with spoofed __module__ = "openai_fake"
+    SyntheticAuthOpenAIFake = type("AuthenticationError", (Exception,), {"__module__": "openai_fake"})
+    exc_synth_fake = SyntheticAuthOpenAIFake("Synthetic prefix fake auth")
+    pf_synth_fake = normalize_exception(exc_synth_fake, "OpenAI", "chat")
+    assert pf_synth_fake.classification_source == "message_fallback"
+    assert pf_synth_fake.operator_action_required is False
+
+    sent_messages.clear()
+    inc_synth_fake = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_synth_fake,
+        operation="chat",
+        model="gpt-synth-fake",
+        credential_scope="scope-synth-fake",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_synth_fake.evidence_tier == "INFERRED_MESSAGE"
+    assert inc_synth_fake.status == "transient"
+    assert inc_synth_fake.incident_type == "unknown"
+    deliv_synth_fake = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_synth_fake == 0
+    assert len(sent_messages) == 0
+
+    # Case 3D: Local class named InsufficientBalanceError
+    LocalBalError = type("InsufficientBalanceError", (Exception,), {})
+    exc_local_bal = LocalBalError("Local fake balance error")
+    pf_local_bal = normalize_exception(exc_local_bal, "OpenAI", "chat")
+    assert pf_local_bal.classification_source == "message_fallback"
+    assert pf_local_bal.operator_action_required is False
+
+    sent_messages.clear()
+    inc_local_bal = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_local_bal,
+        operation="chat",
+        model="gpt-local-bal",
+        credential_scope="scope-local-bal",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert inc_local_bal.evidence_tier == "INFERRED_MESSAGE"
+    assert inc_local_bal.status == "transient"
+    assert inc_local_bal.incident_type == "unknown"
+    deliv_local_bal = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_local_bal == 0
+    assert len(sent_messages) == 0
+
+    # Case 3E: Arbitrary Exception with .classification = "auth"
     exc_ad_hoc_auth = Exception("Plain exception with ad-hoc classification")
     exc_ad_hoc_auth.classification = "auth"
     pf_ad_hoc = normalize_exception(exc_ad_hoc_auth, "OpenAI", "chat")
@@ -11162,7 +11295,7 @@ async def test_blocker_priorities_sdk_and_database_classification_e2e(
     assert deliv_adhoc == 0
     assert len(sent_messages) == 0
 
-    # Case 3C: Real domain InsufficientBalanceError
+    # Case 3F: Real domain InsufficientBalanceError
     exc_domain_bal = InsufficientBalanceError("Actual domain balance exhausted")
     pf_domain_bal = normalize_exception(exc_domain_bal, "OpenAI", "chat")
     assert pf_domain_bal.classification == "insufficient_balance_quota"
@@ -11186,6 +11319,55 @@ async def test_blocker_priorities_sdk_and_database_classification_e2e(
     deliv_domain = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
     assert deliv_domain > 0
     assert len(sent_messages) > 0
+
+    # =========================================================================
+    # PART 4: PII Sanitization in sanitize_technical_code & Outbox Delivery
+    # =========================================================================
+    from ai_incident_manager import sanitize_technical_code
+
+    # 4A: Arbitrary inferred codes with patient / user / secret IDs are strictly rejected
+    assert sanitize_technical_code("inferred_patient_123456789") == "unspecified"
+    assert sanitize_technical_code("inferred_user_987654") == "unspecified"
+    assert sanitize_technical_code("inferred_secret_account_reference") == "unspecified"
+
+    # Canonical codes are preserved
+    assert sanitize_technical_code("inferred_provider_5xx") == "inferred_provider_5xx"
+    assert sanitize_technical_code("inferred_auth") == "inferred_auth"
+    assert sanitize_technical_code("inferred_rate_limit") == "inferred_rate_limit"
+    assert sanitize_technical_code("inferred_insufficient_balance_quota") == "inferred_insufficient_balance_quota"
+    assert sanitize_technical_code("inferred_unspecified") == "inferred_unspecified"
+
+    # 4B: End-to-end incident recording with potential PII tokens in error
+    sent_messages.clear()
+    exc_pii = Exception("Diagnostic failure mentioning patient_123456789 and secret_token_987")
+    inc_pii = await record_ai_provider_failure(
+        origin_instance_id="tg_veraveda777_bot_legacy",
+        provider="OpenAI",
+        error=exc_pii,
+        operation="chat",
+        model="gpt-4o",
+        credential_scope="scope-pii-test",
+        enqueue_notification=True,
+        session_maker=test_db_session_maker,
+    )
+    assert "patient_123456789" not in inc_pii.detail_code
+    assert "patient_123456789" not in inc_pii.incident_type
+    assert "secret_token_987" not in inc_pii.detail_code
+    assert inc_pii.evidence_tier == "INFERRED_MESSAGE"
+    assert inc_pii.status == "transient"
+    assert inc_pii.incident_type == "unknown"
+
+    deliv_pii = await process_ai_incident_notifications(test_bot, session_maker=test_db_session_maker)
+    assert deliv_pii == 0
+    assert len(sent_messages) == 0
+
+    # Also verify that if notification rows are inspected, zero PII tokens exist anywhere
+    async with test_db_session_maker() as session:
+        all_notifs = (await session.execute(select(AIIncidentNotificationModel))).scalars().all()
+        for n in all_notifs:
+            assert "patient_123456789" not in (n.message_text or "")
+            assert "secret_token_987" not in (n.message_text or "")
+            assert "inferred_patient" not in (n.message_text or "")
 
 
 

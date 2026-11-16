@@ -4,6 +4,7 @@ import json
 import math
 import re
 import ssl
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -468,21 +469,118 @@ def is_openai_image_size_incompatibility(failure: ProviderFailure | None) -> boo
     )
 
 
-_TRUSTED_SDK_MODULE_PREFIXES: tuple[str, ...] = (
-    "openai",
-    "anthropic",
-    "google.genai",
-    "google.api_core",
-    "google.generativeai",
-    "google.cloud",
+def _resolve_sdk_classes(module_name: str, class_names: tuple[str, ...]) -> tuple[type[BaseException], ...]:
+    mod = sys.modules.get(module_name)
+    if mod is None:
+        try:
+            mod = __import__(module_name, fromlist=list(class_names))
+        except Exception:
+            return ()
+    classes = []
+    for name in class_names:
+        cls = getattr(mod, name, None)
+        if isinstance(cls, type) and issubclass(cls, BaseException):
+            classes.append(cls)
+    return tuple(classes)
+
+
+SDK_TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    (TimeoutError, httpx.TimeoutException)
+    + _resolve_sdk_classes("openai", ("APITimeoutError",))
+    + _resolve_sdk_classes("anthropic", ("APITimeoutError",))
+    + _resolve_sdk_classes("google.api_core.exceptions", ("DeadlineExceeded",))
 )
-_TRUSTED_DOMAIN_MODULE_PREFIXES: tuple[str, ...] = (
+
+SDK_CONNECTION_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    (httpx.TransportError, ConnectionError)
+    + _resolve_sdk_classes("openai", ("APIConnectionError",))
+    + _resolve_sdk_classes("anthropic", ("APIConnectionError",))
+)
+
+SDK_AUTH_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    _resolve_sdk_classes("openai", ("AuthenticationError",))
+    + _resolve_sdk_classes("anthropic", ("AuthenticationError",))
+    + _resolve_sdk_classes("google.api_core.exceptions", ("Unauthenticated",))
+)
+
+SDK_PERMISSION_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    _resolve_sdk_classes("openai", ("PermissionDeniedError",))
+    + _resolve_sdk_classes("anthropic", ("PermissionDeniedError",))
+    + _resolve_sdk_classes("google.api_core.exceptions", ("PermissionDenied",))
+)
+
+SDK_RATE_LIMIT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    _resolve_sdk_classes("openai", ("RateLimitError",))
+    + _resolve_sdk_classes("anthropic", ("RateLimitError",))
+    + _resolve_sdk_classes("google.api_core.exceptions", ("ResourceExhausted",))
+)
+
+SDK_5XX_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    _resolve_sdk_classes("openai", ("InternalServerError",))
+    + _resolve_sdk_classes("anthropic", ("InternalServerError",))
+    + _resolve_sdk_classes("google.api_core.exceptions", ("InternalServerError", "ServiceUnavailable"))
+)
+
+SDK_NOT_FOUND_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    _resolve_sdk_classes("openai", ("NotFoundError",))
+    + _resolve_sdk_classes("anthropic", ("NotFoundError",))
+    + _resolve_sdk_classes("google.api_core.exceptions", ("NotFound",))
+)
+
+_ALL_TRUSTED_SDK_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    SDK_TIMEOUT_EXCEPTIONS
+    + SDK_CONNECTION_EXCEPTIONS
+    + SDK_AUTH_EXCEPTIONS
+    + SDK_PERMISSION_EXCEPTIONS
+    + SDK_RATE_LIMIT_EXCEPTIONS
+    + SDK_5XX_EXCEPTIONS
+    + SDK_NOT_FOUND_EXCEPTIONS
+)
+
+_DOMAIN_BALANCE_MODULES: tuple[str, ...] = (
     "ai_integration",
     "background_worker",
-    "max_messenger_bot",
-    "provider_adapters",
-    "ai_cache",
+    "max_messenger_bot.ai",
 )
+
+
+def _is_domain_insufficient_balance_error(item: BaseException) -> bool:
+    if type(item).__name__ != "InsufficientBalanceError":
+        return False
+    for mod_name in _DOMAIN_BALANCE_MODULES:
+        mod = sys.modules.get(mod_name)
+        if mod is not None:
+            cls = getattr(mod, "InsufficientBalanceError", None)
+            if isinstance(cls, type) and isinstance(item, cls):
+                return True
+    for mod_name in _DOMAIN_BALANCE_MODULES:
+        if mod_name not in sys.modules:
+            try:
+                mod = __import__(mod_name, fromlist=["InsufficientBalanceError"])
+                cls = getattr(mod, "InsufficientBalanceError", None)
+                if isinstance(cls, type) and isinstance(item, cls):
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def _is_trusted_adapter_error(item: BaseException) -> bool:
+    if type(item).__name__ != "ProviderAdapterError":
+        return False
+    mod = sys.modules.get("provider_adapters")
+    if mod is not None:
+        cls = getattr(mod, "ProviderAdapterError", None)
+        if isinstance(cls, type) and isinstance(item, cls):
+            return True
+    try:
+        import provider_adapters
+        cls = getattr(provider_adapters, "ProviderAdapterError", None)
+        if isinstance(cls, type) and isinstance(item, cls):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def normalize_exception(exception: Exception, provider: str = "", operation: str = "chat") -> ProviderFailure:
@@ -537,7 +635,7 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
     # 3. Transport-level exceptions (failed before/during TCP/TLS connection)
     for item in chain:
         cls = None
-        if isinstance(item, (TimeoutError, httpx.TimeoutException)) or type(item).__name__ == "APITimeoutError":
+        if isinstance(item, SDK_TIMEOUT_EXCEPTIONS):
             cls = "timeout"
         elif (
             isinstance(item, ssl.SSLError)
@@ -547,7 +645,7 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
             cls = "network_ssl"
         elif isinstance(item, httpx.ProxyError):
             cls = "proxy_error"
-        elif isinstance(item, (httpx.TransportError, ConnectionError)) or type(item).__name__ == "APIConnectionError":
+        elif isinstance(item, SDK_CONNECTION_EXCEPTIONS):
             cls = "network_connection"
         if cls:
             return ProviderFailure(
@@ -564,14 +662,8 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
 
     # 4. Trusted Domain & SDK exceptions WITHOUT HTTP response
     for item in chain:
-        t_name = type(item).__name__
-        mod = getattr(type(item), "__module__", "") or ""
-
         # 4a. Domain InsufficientBalanceError (verified origin)
-        if t_name == "InsufficientBalanceError" and (
-            mod.startswith(_TRUSTED_DOMAIN_MODULE_PREFIXES)
-            or "InsufficientBalanceError" in str(type(item).__mro__)
-        ):
+        if _is_domain_insufficient_balance_error(item):
             return ProviderFailure(
                 provider=provider,
                 operation=operation,
@@ -586,72 +678,71 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
             )
 
         # 4b. Verified Provider SDK exceptions (only from real SDK modules)
-        if mod.startswith(_TRUSTED_SDK_MODULE_PREFIXES):
-            if t_name in ("AuthenticationError", "Unauthenticated"):
-                return ProviderFailure(
-                    provider=provider,
-                    operation=operation,
-                    classification="auth",
-                    detail_code="authentication_error",
-                    provider_error_message=safe_message(item),
-                    retryable=False,
-                    transient=False,
-                    network_attempted=True,
-                    operator_action_required=True,
-                    classification_source="sdk_typed_exception",
-                )
-            elif t_name in ("PermissionDeniedError", "PermissionDenied"):
-                return ProviderFailure(
-                    provider=provider,
-                    operation=operation,
-                    classification="permission",
-                    detail_code="permission_denied",
-                    provider_error_message=safe_message(item),
-                    retryable=False,
-                    transient=False,
-                    network_attempted=True,
-                    operator_action_required=True,
-                    classification_source="sdk_typed_exception",
-                )
-            elif t_name in ("RateLimitError", "ResourceExhausted"):
-                return ProviderFailure(
-                    provider=provider,
-                    operation=operation,
-                    classification="rate_limit",
-                    detail_code="rate_limit_error",
-                    provider_error_message=safe_message(item),
-                    retryable=True,
-                    transient=True,
-                    network_attempted=True,
-                    operator_action_required=False,
-                    classification_source="sdk_typed_exception",
-                )
-            elif t_name in ("InternalServerError", "ServiceUnavailable"):
-                return ProviderFailure(
-                    provider=provider,
-                    operation=operation,
-                    classification="provider_5xx",
-                    detail_code="internal_server_error",
-                    provider_error_message=safe_message(item),
-                    retryable=True,
-                    transient=True,
-                    network_attempted=True,
-                    operator_action_required=False,
-                    classification_source="sdk_typed_exception",
-                )
-            elif t_name in ("NotFoundError", "NotFound"):
-                return ProviderFailure(
-                    provider=provider,
-                    operation=operation,
-                    classification="invalid_model_or_resource",
-                    detail_code="model_not_found",
-                    provider_error_message=safe_message(item),
-                    retryable=False,
-                    transient=False,
-                    network_attempted=True,
-                    operator_action_required=True,
-                    classification_source="sdk_typed_exception",
-                )
+        if isinstance(item, SDK_AUTH_EXCEPTIONS):
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="auth",
+                detail_code="authentication_error",
+                provider_error_message=safe_message(item),
+                retryable=False,
+                transient=False,
+                network_attempted=True,
+                operator_action_required=True,
+                classification_source="sdk_typed_exception",
+            )
+        elif isinstance(item, SDK_PERMISSION_EXCEPTIONS):
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="permission",
+                detail_code="permission_denied",
+                provider_error_message=safe_message(item),
+                retryable=False,
+                transient=False,
+                network_attempted=True,
+                operator_action_required=True,
+                classification_source="sdk_typed_exception",
+            )
+        elif isinstance(item, SDK_RATE_LIMIT_EXCEPTIONS):
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="rate_limit",
+                detail_code="rate_limit_error",
+                provider_error_message=safe_message(item),
+                retryable=True,
+                transient=True,
+                network_attempted=True,
+                operator_action_required=False,
+                classification_source="sdk_typed_exception",
+            )
+        elif isinstance(item, SDK_5XX_EXCEPTIONS):
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="provider_5xx",
+                detail_code="internal_server_error",
+                provider_error_message=safe_message(item),
+                retryable=True,
+                transient=True,
+                network_attempted=True,
+                operator_action_required=False,
+                classification_source="sdk_typed_exception",
+            )
+        elif isinstance(item, SDK_NOT_FOUND_EXCEPTIONS):
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="invalid_model_or_resource",
+                detail_code="model_not_found",
+                provider_error_message=safe_message(item),
+                retryable=False,
+                transient=False,
+                network_attempted=True,
+                operator_action_required=True,
+                classification_source="sdk_typed_exception",
+            )
 
     # 5. Application internal exceptions
     if any(isinstance(item, (TypeError, AttributeError, AssertionError, KeyError)) for item in chain):
@@ -674,10 +765,10 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
         explicit = getattr(item, "classification", None)
         if explicit:
             cls = canonical_classification(explicit)
-            mod = getattr(type(item), "__module__", "") or ""
             is_trusted = (
-                mod.startswith(_TRUSTED_SDK_MODULE_PREFIXES)
-                or mod.startswith(_TRUSTED_DOMAIN_MODULE_PREFIXES)
+                isinstance(item, _ALL_TRUSTED_SDK_EXCEPTIONS)
+                or _is_domain_insufficient_balance_error(item)
+                or _is_trusted_adapter_error(item)
             )
             network = getattr(item, "network_attempted", cls not in ("configuration", "application_internal"))
             if cls in ("configuration", "application_internal"):
@@ -710,7 +801,7 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
         cls = "auth"
     elif (
         any(marker in fallback_text for marker in ("quota", "credit", "billing", "balance", "status code 402"))
-        or any(type(item).__name__ == "InsufficientBalanceError" for item in chain)
+        or any(_is_domain_insufficient_balance_error(item) for item in chain)
     ):
         cls = "insufficient_balance_quota"
     elif any(marker in fallback_text for marker in ("configuration", "not configured", "api key for")):
