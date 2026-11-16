@@ -145,6 +145,8 @@ def setup_scheduler(
     scheduler.add_job(check_subscriptions, 'interval', minutes=15, args=(bot,))
     scheduler.add_job(check_kie_credit_balance, 'interval', minutes=15, args=(bot,))
     scheduler.add_job(process_payment_notification_outbox, 'interval', seconds=30, args=(bot,), max_instances=1, coalesce=True)
+    from ai_incident_manager import process_ai_incident_notifications
+    scheduler.add_job(process_ai_incident_notifications, 'interval', seconds=15, args=(bot,), max_instances=1, coalesce=True)
     scheduler.add_job(process_pending_events, 'interval', minutes=1, args=(bot,), max_instances=1)
     scheduler.add_job(process_due_followups, 'interval', minutes=1, args=(followup_transports,), max_instances=1)
     scheduler.add_job(

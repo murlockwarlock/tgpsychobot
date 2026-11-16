@@ -945,6 +945,11 @@ def is_bot_blocked_or_suspended_log(text: str) -> bool:
     return False
 
 
+def is_handled_ai_log(line: str) -> bool:
+    """True if line is an explicitly controlled handled AI notice (not an infrastructure error or crash)."""
+    return "handled ai notice:" in line.lower()
+
+
 def extract_log_error_summaries(chunk: str) -> list[str]:
     lines = chunk.splitlines()
     summaries: list[str] = []
@@ -978,7 +983,10 @@ def extract_log_error_summaries(chunk: str) -> list[str]:
                     i += 1
                     break
 
-            if is_bot_blocked_or_suspended_log(exception_line) or any(is_bot_blocked_or_suspended_log(l) for l in tb_lines):
+            if (
+                is_bot_blocked_or_suspended_log(exception_line)
+                or any(is_bot_blocked_or_suspended_log(l) for l in tb_lines)
+            ):
                 continue
 
             frame_info = ""
@@ -996,7 +1004,7 @@ def extract_log_error_summaries(chunk: str) -> list[str]:
             continue
 
         if LOG_ERROR_RE.search(line):
-            if not is_bot_blocked_or_suspended_log(line):
+            if not is_bot_blocked_or_suspended_log(line) and not is_handled_ai_log(line):
                 summaries.append(line)
         i += 1
 
@@ -1032,7 +1040,7 @@ def read_new_log_errors(app: dict, state: dict, include_existing: bool) -> list[
     if not matches:
         return []
 
-    matches = [line for line in matches if not is_bot_blocked_or_suspended_log(line)]
+    matches = [line for line in matches if not is_bot_blocked_or_suspended_log(line) and not is_handled_ai_log(line)]
     if not matches:
         return []
 
@@ -1049,11 +1057,50 @@ def read_new_log_errors(app: dict, state: dict, include_existing: bool) -> list[
     return issues
 
 
+def _normalize_issue_segment(s: str) -> str:
+    text = s
+    # Timestamps (ISO date-time or time only)
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,\.]\d+)?\b", "TIMESTAMP", text)
+    text = re.sub(r"\b\d{2}:\d{2}:\d{2}(?:[,\.]\d+)?\b", "TIME", text)
+    # Memory addresses / pointers
+    text = re.sub(r"\b0x[0-9a-fA-F]+\b", "0xADDR", text)
+    # Update IDs: update_id=123, update id 123, update 123, update #123
+    text = re.sub(r"(?i)\bupdate(?:_id|\s*id)?\s*[=:\s]\s*#?\d+\b", "update_id=N", text)
+    text = re.sub(r"(?i)\bupdate\s*#?\d+\b", "update_id=N", text)
+    # Bot IDs: bot_id=123, bot id: 123, bot 12345678 (numeric ID)
+    text = re.sub(r"(?i)\bbot(?:_id|\s*id)\s*[=:\s]\s*#?\d+\b", "bot_id=N", text)
+    text = re.sub(r"(?i)\bbot\s+(\d{6,})\b", "bot bot_id=N", text)
+    # User / Chat / Message / Peer / Channel / Sender IDs
+    text = re.sub(r"(?i)\b(user|chat|message|peer|channel|sender)(?:_id|\s*id)?\s*[=:\s]\s*#?\d+\b", r"\1_id=N", text)
+    # Counts & retries
+    text = re.sub(r"\b\d+\s+polling fetch errors\b", "N polling fetch errors", text)
+    text = re.sub(r"\bprompt_len=\d+\b", "prompt_len=N", text)
+    text = re.sub(r"\btryings\s*=\s*\d+\b", "tryings=N", text)
+    text = re.sub(r"(?i)\bretry(?:\s+in)?\s+\d+(?:\.\d+)?\s*(?:s|sec|seconds?)\b", "retry in N seconds", text)
+    # Collapse multiple whitespaces
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _normalize_issue_for_signature(issue: str) -> str:
+    if not issue:
+        return ""
+    if "Logs: " in issue:
+        prefix, _, log_content = issue.partition("Logs: ")
+        segments = [seg.strip() for seg in log_content.split(" | ") if seg.strip()]
+        if not segments:
+            return f"{prefix}Logs:"
+        normalized_segments = sorted(set(_normalize_issue_segment(seg) for seg in segments))
+        return f"{prefix}Logs: " + " | ".join(normalized_segments)
+    return _normalize_issue_segment(issue)
+
+
 def should_alert(issues: list[str], state: dict) -> bool:
     if not issues:
         return False
     now = int(time.time())
-    signature = hashlib.sha256("\n".join(sorted(issues)).encode("utf-8")).hexdigest()
+    normalized = [_normalize_issue_for_signature(i) for i in issues]
+    signature = hashlib.sha256("\n".join(sorted(normalized)).encode("utf-8")).hexdigest()
     alerts = state.setdefault("alerts", {})
     last = alerts.get(signature, 0)
     if now - int(last) < REPEAT_ALERT_SECONDS:
@@ -1065,7 +1112,8 @@ def record_alert_delivered(issues: list[str], state: dict) -> None:
     if not issues:
         return
     now = int(time.time())
-    signature = hashlib.sha256("\n".join(sorted(issues)).encode("utf-8")).hexdigest()
+    normalized = [_normalize_issue_for_signature(i) for i in issues]
+    signature = hashlib.sha256("\n".join(sorted(normalized)).encode("utf-8")).hexdigest()
     alerts = state.setdefault("alerts", {})
     alerts[signature] = now
 
@@ -1114,6 +1162,14 @@ def is_telegram_network_issue(issue: str) -> bool:
 
 def is_transient_polling_error(issue: str) -> bool:
     return issue.startswith("Logs: polling fetch error:")
+
+
+def is_transient_network_issue(issue: str) -> bool:
+    if is_transient_polling_error(issue):
+        return True
+    if issue.startswith("Telegram getMe failed:"):
+        return "HTTP 502" in issue
+    return False
 
 
 def has_polling_fetch_error(issues: list[str]) -> bool:
@@ -1206,10 +1262,15 @@ def format_issues_alert(
 def format_recovery_alert(
     affected_count: int,
     duration_str: str,
+    bot_names: list[str] | None = None,
 ) -> str:
+    if bot_names and len(bot_names) == 1:
+        target_str = f"бот {html.escape(bot_names[0])}"
+    else:
+        target_str = f"{affected_count} ботов"
     lines = [
         "✅ <b>Восстановление: Telegram API / Прокси в норме</b>",
-        f"• Связь с Telegram восстановлена ({affected_count} ботов)",
+        f"• Связь с Telegram восстановлена ({target_str})",
         f"• Длительность инцидента: {duration_str}",
         "• Ошибок polling и getMe не зафиксировано",
     ]
@@ -1397,17 +1458,21 @@ def _queue_issue_notification(
     pending_notifications: dict,
     alert_text: str,
     now: int,
+    flat_remaining: list[str] | None = None,
 ) -> None:
     if "issue" not in pending_notifications:
         pending_notifications["issue"] = {
             "text": alert_text,
             "created_at": now,
             "delivered_recipients": [],
+            "flat_remaining": list(flat_remaining or []),
         }
         return
 
     existing = pending_notifications["issue"]
     if existing.get("text") == alert_text:
+        if flat_remaining and not existing.get("flat_remaining"):
+            existing["flat_remaining"] = list(flat_remaining)
         return
 
     # If the existing issue has not yet been partially delivered, update text in-place
@@ -1415,6 +1480,7 @@ def _queue_issue_notification(
     if not delivered:
         existing["text"] = alert_text
         existing["created_at"] = now
+        existing["flat_remaining"] = list(flat_remaining or [])
     else:
         # Partially delivered! Do NOT overwrite text or delivered_recipients.
         # Queue a new independent notification record so the new event is tracked separately
@@ -1425,7 +1491,39 @@ def _queue_issue_notification(
                 "text": alert_text,
                 "created_at": now,
                 "delivered_recipients": [],
+                "flat_remaining": list(flat_remaining or []),
             }
+
+
+async def _flush_pending_issue_notifications(
+    apps: list[dict],
+    pending_notifications: dict,
+    state: dict,
+) -> bool:
+    """
+    Deliver all queued issue notifications in order.
+    Ensures that for each successfully delivered notification:
+    - cooldown is committed to state via record_alert_delivered(flat_remaining, state)
+    - the delivered item is safely removed from pending_notifications
+    If any delivery fails, stops and returns False, keeping remaining notifications for retry.
+    """
+    issue_keys = [
+        k for k in sorted(pending_notifications.keys())
+        if k == "issue" or k.startswith("issue_")
+    ]
+    all_delivered = True
+    for k in issue_keys:
+        p_issue = pending_notifications[k]
+        delivered = await _deliver_notification(apps, p_issue, state)
+        if delivered:
+            flat_remaining = p_issue.get("flat_remaining")
+            if flat_remaining:
+                record_alert_delivered(flat_remaining, state)
+            pending_notifications.pop(k, None)
+        else:
+            all_delivered = False
+            break
+    return all_delivered
 
 
 async def run_check(
@@ -1475,7 +1573,7 @@ async def run_check(
         for app in apps:
             name = app["name"]
             app_issues = next((issues for n, issues in all_issues if n == name), [])
-            if has_polling_fetch_error(app_issues):
+            if any(is_telegram_network_issue(i) for i in app_issues):
                 polling_failures[name] = int(polling_failures.get(name, 0)) + 1
             else:
                 polling_failures.pop(name, None)
@@ -1493,20 +1591,19 @@ async def run_check(
             if is_telegram_network_issue(i)
         ]
 
-        # Filter out isolated transient polling errors if only 1 bot has polling error and getMe succeeded
+        # Filter out isolated transient polling/network errors if only 1 bot has error and no existing incident
         if len(affected_net_bots) == 1 and not nl_net_issues and INCIDENT_SHARED_NETWORK not in active_incidents:
             single_name = affected_net_bots[0]
             consecutive_fails = int(polling_failures.get(single_name, 0))
-            if consecutive_fails < 2:
+            single_inc_key = f"network_{single_name}"
+            if consecutive_fails < 2 and single_inc_key not in active_incidents:
                 for idx, (name, issues) in enumerate(all_issues):
                     if name == single_name:
-                        get_me_failed = any("Telegram getMe failed:" in i for i in issues)
-                        if not get_me_failed:
-                            filtered = [i for i in issues if not is_transient_polling_error(i)]
-                            if filtered:
-                                all_issues[idx] = (name, filtered)
-                            else:
-                                all_issues.pop(idx)
+                        filtered = [i for i in issues if not is_transient_network_issue(i)]
+                        if filtered:
+                            all_issues[idx] = (name, filtered)
+                        else:
+                            all_issues.pop(idx)
                         break
                 affected_net_bots = [
                     name
@@ -1525,6 +1622,18 @@ async def run_check(
         summary = ""
         proxy_status = ""
         if is_shared_network:
+            # Merge any previous single-bot network incidents into shared network
+            for inc_k in list(active_incidents.keys()):
+                if inc_k.startswith("network_") and inc_k != INCIDENT_SHARED_NETWORK:
+                    prev_inc = active_incidents.pop(inc_k, None)
+                    if prev_inc and INCIDENT_SHARED_NETWORK in active_incidents:
+                        prev_seen = prev_inc.get("first_seen")
+                        if prev_seen:
+                            active_incidents[INCIDENT_SHARED_NETWORK]["first_seen"] = min(
+                                int(active_incidents[INCIDENT_SHARED_NETWORK].get("first_seen", now)),
+                                int(prev_seen),
+                            )
+
             all_net_errors = [
                 i for name, issues in all_issues for i in issues if is_telegram_network_issue(i)
             ]
@@ -1556,22 +1665,9 @@ async def run_check(
         else:
             if INCIDENT_SHARED_NETWORK in active_incidents or "recovery" in pending_notifications:
                 # 1. Flush pending issue notifications if any before sending recovery
-                issue_keys = [
-                    k for k in sorted(pending_notifications.keys())
-                    if k == "issue" or k.startswith("issue_")
-                ]
-                all_issues_delivered = True
-                for k in issue_keys:
-                    p_issue = pending_notifications[k]
-                    issue_delivered = await _deliver_notification(apps, p_issue, state)
-                    if issue_delivered:
-                        pending_notifications.pop(k, None)
-                    else:
-                        all_issues_delivered = False
-                        break
+                all_issues_delivered = await _flush_pending_issue_notifications(apps, pending_notifications, state)
 
                 # 2. ONLY proceed to recovery if all incident alerts have been confirmed delivered!
-                # If Telegram has not delivered the incident alert, recovery MUST NOT overtake it!
                 if all_issues_delivered:
                     if "recovery" not in pending_notifications:
                         inc = active_incidents.get(INCIDENT_SHARED_NETWORK, {})
@@ -1591,11 +1687,77 @@ async def run_check(
                         pending_notifications.pop("recovery", None)
                         active_incidents.pop(INCIDENT_SHARED_NETWORK, None)
 
+        # Handle single-bot network incidents
+        should_alert_single_net = False
+        active_single_bot_keys = []
+        if len(affected_net_bots) == 1 and not is_shared_network:
+            single_name = affected_net_bots[0]
+            single_inc_key = f"network_{single_name}"
+            active_single_bot_keys.append(single_inc_key)
+            single_net_errors = [
+                i for name, issues in all_issues if name == single_name for i in issues if is_telegram_network_issue(i)
+            ]
+            single_summary = summarize_network_errors(single_net_errors)
+            proxy_status = get_proxy_status_summary(apps, proxy_ok=proxy_ok)
+
+            if single_inc_key not in active_incidents:
+                active_incidents[single_inc_key] = {
+                    "first_seen": now,
+                    "last_seen": now,
+                    "last_alerted": 0,
+                    "alert_count": 0,
+                    "affected_bots": [single_name],
+                    "summary": single_summary,
+                }
+                should_alert_single_net = True
+            else:
+                inc = active_incidents[single_inc_key]
+                inc["last_seen"] = now
+                inc["summary"] = single_summary
+                last_alerted = int(inc.get("last_alerted", 0))
+                if last_alerted == 0 or (now - last_alerted >= get_network_repeat_seconds()):
+                    should_alert_single_net = True
+                else:
+                    should_alert_single_net = False
+
+            pending_notifications.pop(f"recovery_{single_inc_key}", None)
+
+        # Check recovery for active single-bot network incidents
+        for inc_k in list(active_incidents.keys()):
+            if inc_k.startswith("network_") and inc_k != INCIDENT_SHARED_NETWORK:
+                bot_name = inc_k[len("network_"):]
+                if bot_name not in affected_net_bots and not is_shared_network:
+                    all_issues_delivered = await _flush_pending_issue_notifications(apps, pending_notifications, state)
+
+                    if all_issues_delivered:
+                        rec_k = f"recovery_{inc_k}"
+                        if rec_k not in pending_notifications:
+                            inc = active_incidents[inc_k]
+                            duration_sec = max(0, now - int(inc.get("first_seen", now)))
+                            duration_str = format_age(duration_sec)
+                            recovery_text = format_recovery_alert(1, duration_str, bot_names=[bot_name])
+                            pending_notifications[rec_k] = {
+                                "text": recovery_text,
+                                "created_at": now,
+                                "delivered_recipients": [],
+                            }
+                        rec_notif = pending_notifications[rec_k]
+                        rec_delivered = await _deliver_notification(apps, rec_notif, state)
+                        if rec_delivered:
+                            pending_notifications.pop(rec_k, None)
+                            active_incidents.pop(inc_k, None)
+
+        # Clean up any legacy ai_balance_* incidents from monitor state
+        for inc_k in list(active_incidents.keys()):
+            if inc_k.startswith("ai_balance_"):
+                active_incidents.pop(inc_k, None)
+
+        # Remaining non-incident issues (PM2 status stopped, DB errors, auth errors, etc.)
         remaining_issues = []
         for name, issues in all_issues:
             display_issues = [
                 i for i in issues
-                if not (is_shared_network and is_telegram_network_issue(i))
+                if not is_telegram_network_issue(i)
                 and not is_bot_blocked_or_suspended_log(i)
             ]
             if display_issues:
@@ -1604,7 +1766,7 @@ async def run_check(
         flat_remaining = [f"{name}: {issue}" for name, issues in remaining_issues for issue in issues]
         should_alert_other = should_alert(flat_remaining, state) if flat_remaining else False
 
-        if should_alert_shared_network or should_alert_other:
+        if should_alert_shared_network or should_alert_single_net or should_alert_other:
             alert_text = format_issues_alert(
                 all_issues=all_issues,
                 is_shared_network_active=is_shared_network,
@@ -1614,29 +1776,22 @@ async def run_check(
                 total_tg_bots=len(telegram_apps),
                 proxy_status=proxy_status,
             )
-            _queue_issue_notification(pending_notifications, alert_text, now)
+            _queue_issue_notification(pending_notifications, alert_text, now, flat_remaining=flat_remaining)
 
         # Deliver all queued issue notifications in order
-        issue_keys = [
-            k for k in sorted(pending_notifications.keys())
-            if k == "issue" or k.startswith("issue_")
-        ]
-        all_delivered = True
-        for k in issue_keys:
-            p_issue = pending_notifications[k]
-            delivered = await _deliver_notification(apps, p_issue, state)
-            if delivered:
-                pending_notifications.pop(k, None)
-            else:
-                all_delivered = False
-                break
+        all_delivered = await _flush_pending_issue_notifications(apps, pending_notifications, state)
 
-        if all_delivered and issue_keys:
+        if all_delivered:
             inc = active_incidents.get(INCIDENT_SHARED_NETWORK)
             if inc and (should_alert_shared_network or int(inc.get("last_alerted", 0)) == 0):
                 inc["last_alerted"] = now
                 inc["alert_count"] = inc.get("alert_count", 0) + 1
-            if should_alert_other:
+            for single_inc_key in active_single_bot_keys:
+                single_inc = active_incidents.get(single_inc_key)
+                if single_inc and (should_alert_single_net or int(single_inc.get("last_alerted", 0)) == 0):
+                    single_inc["last_alerted"] = now
+                    single_inc["alert_count"] = single_inc.get("alert_count", 0) + 1
+            if should_alert_other and flat_remaining:
                 record_alert_delivered(flat_remaining, state)
 
         save_state(state)

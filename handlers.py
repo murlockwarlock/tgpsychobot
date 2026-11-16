@@ -5919,7 +5919,9 @@ async def set_ai_provider(callback: CallbackQuery, bot: Bot):
 
 
 @router.callback_query(F.data == "admin_ai_keys")
-async def admin_ai_keys_models(callback: CallbackQuery):
+async def admin_ai_keys_models(callback: CallbackQuery, state: FSMContext | None = None):
+    if state is not None:
+        await state.clear()
     async with async_session_maker() as session:
         config = await session.get(AIConfig, 1)
 
@@ -7544,6 +7546,11 @@ async def process_api_input(message: Message, state: FSMContext, bot: Bot):
     is_key = current_state == AdminStates.set_api_key.state
     value = message.text.strip() if message.text else None
 
+    if is_key and not value:
+        await message.answer("API ключ не может быть пустым. Настройки не изменены.")
+        await state.clear()
+        return
+
     if not is_key:
         try:
             value = validate_model_selection(provider, value, channel="chat")
@@ -7575,10 +7582,49 @@ async def process_api_input(message: Message, state: FSMContext, bot: Bot):
         await message.answer("Недопустимый провайдер. Настройки не изменены.")
         return
 
-    async with async_session_maker() as session:
-        stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
-        await session.execute(stmt)
-        await session.commit()
+    if is_key:
+        from ai_incident_manager import IncidentSecurityError, handle_key_rotation
+        try:
+            async with async_session_maker() as session:
+                async with session.begin():
+                    cfg_now = await session.get(AIConfig, 1)
+                    old_key = getattr(cfg_now, column_name, None) if cfg_now else None
+                    b_url = None
+                    if provider.upper() == "KIE" and cfg_now:
+                        b_url = getattr(cfg_now, "kie_base_url", None)
+                    stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
+                    await session.execute(stmt)
+
+                    if value:
+                        await handle_key_rotation(
+                            origin_instance_id=None,
+                            provider=provider,
+                            new_key=value,
+                            base_url=b_url,
+                            old_key=old_key,
+                            session=session,
+                        )
+        except IncidentSecurityError as sec_err:
+            logging.error("Security/identity validation failed during key rotation: %s", sec_err)
+            await message.answer("Ошибка авторизации экземпляра бота. Настройки не изменены.")
+            await state.clear()
+            return
+        except Exception as exc:
+            logging.error("Database transaction error during key rotation: %s", exc, exc_info=True)
+            await message.answer("Ошибка сохранения настроек. Попробуйте еще раз.")
+            await state.clear()
+            return
+    else:
+        try:
+            async with async_session_maker() as session:
+                stmt = update(AIConfig).where(AIConfig.id == 1).values({column_name: value})
+                await session.execute(stmt)
+                await session.commit()
+        except Exception as exc:
+            logging.error("Database transaction error during model update: %s", exc, exc_info=True)
+            await message.answer("Ошибка сохранения настроек. Попробуйте еще раз.")
+            await state.clear()
+            return
 
     await state.clear()
 

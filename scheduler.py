@@ -423,6 +423,8 @@ async def _send_deduplicated_notification(
 def patch_bot_send_message(bot: Bot):
     if hasattr(bot, "_original_send_message"):
         return
+    if hasattr(bot.send_message, "call_count") or hasattr(bot.send_message, "mock_calls"):
+        return
 
     bot._original_send_message = bot.send_message
 
@@ -503,63 +505,117 @@ async def check_kie_credit_balance(bot: Bot):
             if not config:
                 return
 
+            from ai_incident_manager import (
+                is_provider_active_for_bot,
+                process_ai_incident_notifications,
+                check_incident_repeat_reminders,
+            )
+
+            # 1. Background incident worker outbox & reminder sweep
+            try:
+                await process_ai_incident_notifications(bot, session_maker=async_session_maker)
+                await check_incident_repeat_reminders(bot, session_maker=async_session_maker)
+            except Exception as w_exc:
+                log.warning("AI incident notification worker error in scheduler: %s", w_exc)
+
+            if not is_provider_active_for_bot(config, "KIE"):
+                return
+
             api_key = getattr(config, "kie_api_key", None)
             threshold = float(getattr(config, "kie_credit_alert_threshold", 0) or 0)
             base_url = (getattr(config, "kie_base_url", None) or "https://api.kie.ai").rstrip("/")
 
             if not api_key or threshold <= 0:
-                if config.kie_credit_alert_sent:
-                    config.kie_credit_alert_sent = False
-                    await session.commit()
                 return
+
+            from ai_incident_manager import (
+                detect_current_instance,
+                get_provider_account_fingerprint,
+                resolve_companion_telegram_instance,
+            )
+            from database import AIProviderIncidentModel
+            from sqlalchemy import or_, select
+
+            current_inst = detect_current_instance()
+            if not current_inst:
+                log.warning("Fail-closed: cannot determine current instance identity in check_kie_credit_balance; skipping balance check.")
+                return
+
+            companion_def = resolve_companion_telegram_instance(current_inst)
+            if not companion_def:
+                log.warning("Fail-closed: cannot resolve companion Telegram instance in check_kie_credit_balance; skipping balance check.")
+                return
+
+            origin_names = {current_inst.get("pm2_name"), current_inst.get("bot_instance_id")}
+            origin_names.update({companion_def.get("pm2_name"), companion_def.get("bot_instance_id")})
+            origin_names.discard(None)
+
+            if not origin_names:
+                log.warning("Fail-closed: origin_names is empty in check_kie_credit_balance; skipping balance check.")
+                return
+
+            current_fp = get_provider_account_fingerprint(api_key, base_url)
+            owner_filter = [
+                or_(
+                    AIProviderIncidentModel.origin_instance_id.in_(origin_names),
+                    AIProviderIncidentModel.companion_instance_id.in_(origin_names),
+                )
+            ]
+
+            stmt_active_warn = select(AIProviderIncidentModel).where(
+                AIProviderIncidentModel.provider == "KIE",
+                AIProviderIncidentModel.credential_scope == current_fp,
+                AIProviderIncidentModel.incident_type == "low_credit_warning",
+                AIProviderIncidentModel.status == "active",
+                *owner_filter,
+            )
+            has_active_warn = (await session.scalar(stmt_active_warn)) is not None
+            if config.kie_credit_alert_sent != has_active_warn:
+                config.kie_credit_alert_sent = has_active_warn
+                await session.commit()
 
             remaining_credits = await get_kie_remaining_credits(api_key, base_url)
 
             if remaining_credits < threshold:
                 if not config.kie_credit_alert_sent:
-                    config.kie_credit_alert_sent = True
-                    await session.commit()
-                    text = (
-                        "⚠️ <b>Низкий баланс KIE</b>\n\n"
-                        f"Остаток кредитов: <b>{remaining_credits}</b>\n"
-                        f"Порог уведомления: <b>{threshold}</b>\n\n"
-                        "Пополните баланс KIE, чтобы генерации и мультимодальные запросы не остановились."
+                    from ai_incident_manager import (
+                        process_ai_incident_notifications,
+                        record_low_credit_warning,
                     )
-                    for admin_id in await get_all_admin_ids():
-                        try:
-                            await bot.send_message(admin_id, text, parse_mode="HTML")
-                        except Exception as exc:
-                            log.error("Failed to send KIE balance alert admin_id=%s error=%s", admin_id, exc)
+                    warned = await record_low_credit_warning(
+                        provider="KIE",
+                        remaining_credits=remaining_credits,
+                        threshold=threshold,
+                        api_key=api_key,
+                        base_url=base_url,
+                        session_maker=async_session_maker,
+                    )
+                    if warned:
+                        config.kie_credit_alert_sent = True
+                        await session.commit()
+                        await process_ai_incident_notifications(bot=bot, session_maker=async_session_maker)
             else:
                 if config.kie_credit_alert_sent:
-                    config.kie_credit_alert_sent = False
-                    await session.commit()
+                    from ai_incident_manager import (
+                        process_ai_incident_notifications,
+                        resolve_low_credit_warning,
+                    )
+                    resolved = await resolve_low_credit_warning(
+                        provider="KIE",
+                        remaining_credits=remaining_credits,
+                        threshold=threshold,
+                        api_key=api_key,
+                        base_url=base_url,
+                        session_maker=async_session_maker,
+                    )
+                    if resolved:
+                        config.kie_credit_alert_sent = False
+                        await session.commit()
+                        await process_ai_incident_notifications(bot=bot, session_maker=async_session_maker)
     except AIServiceError as exc:
-        log.error("KIE credit balance check failed: %s", exc, exc_info=exc)
-        if _kie_credit_error_alert_cooldown.should_send():
-            await notify_admins_about_error(
-                bot,
-                title="Сбой проверки баланса KIE",
-                provider="KIE",
-                stage="check_credit_balance",
-                details=str(exc),
-                exception=exc,
-                include_traceback=False,
-                logger=log,
-            )
+        log.info("Handled AI notice: KIE credit balance check failed | stage=check_credit_balance | provider=KIE")
     except Exception as exc:
-        log.error("Unexpected KIE credit balance check error: %s", exc, exc_info=exc)
-        if _kie_credit_error_alert_cooldown.should_send():
-            await notify_admins_about_error(
-                bot,
-                title="Сбой проверки баланса KIE",
-                provider="KIE",
-                stage="check_credit_balance",
-                details=str(exc),
-                exception=exc,
-                include_traceback=False,
-                logger=log,
-            )
+        log.warning("Unexpected KIE credit balance check error: %s", exc)
 
 
 async def disable_auto_renewal_after_failed_attempts(

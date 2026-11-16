@@ -31,6 +31,12 @@ class KeyedAlertCooldown:
         self._last_sent[key] = current_time
         return True
 
+    def reset(self, key: str) -> None:
+        self._last_sent.pop(key, None)
+
+    def reset_all(self) -> None:
+        self._last_sent.clear()
+
     def _prune_if_needed(self, current_time: datetime) -> None:
         if len(self._last_sent) > self.max_entries:
             expired = [k for k, v in self._last_sent.items() if current_time - v >= self.duration]

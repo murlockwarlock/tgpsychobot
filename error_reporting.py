@@ -10,7 +10,7 @@ from typing import Any, Sequence
 from aiogram import Bot
 
 from alert_cooldown import KeyedAlertCooldown
-from database import get_all_admin_ids
+from database import get_all_admin_ids, async_session_maker, AIConfig
 
 
 # Patterns for scrubbing secrets from error strings, URLs, and headers
@@ -64,15 +64,17 @@ def _shorten(value: str, limit: int = 1400) -> str:
 
 def exception_chain(exception: Exception | None, *, include_context: bool = True) -> list[Exception]:
     """Return a finite outer-to-inner exception chain."""
+    if not isinstance(exception, BaseException):
+        return []
     chain: list[Exception] = []
     seen: set[int] = set()
     current = exception
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         chain.append(current)
-        current = current.__cause__
+        current = getattr(current, "__cause__", None)
         if current is None and include_context:
-            current = chain[-1].__context__
+            current = getattr(chain[-1], "__context__", None)
     return chain
 
 
@@ -480,13 +482,15 @@ async def notify_admins_about_error(
     provider_attempts: Sequence[dict[str, str | None]] | None = None,
     exception: Exception | None = None,
     classification_override: str | None = None,
+    classification: str | None = None,
+    classification_source: str | None = None,
     include_traceback: bool = True,
     logger: logging.Logger | None = None,
     level: int = logging.ERROR,
 ) -> None:
     log = logger or logging.getLogger(__name__)
     root_exception = root_cause_exception(exception)
-    classification = classification_override
+    classification = classification_override or classification
     classification_description = None
     root_summary = None
     outcome = getattr(exception, "ai_outcome", None) if exception is not None else None
@@ -502,7 +506,7 @@ async def notify_admins_about_error(
             )
         root_summary = sanitize_secret_values(exception_summary(root_exception or exception))
 
-    if exception is not None and include_traceback:
+    if isinstance(exception, BaseException) and include_traceback:
         raw_trace = "".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
     else:
         raw_trace = ""
@@ -545,7 +549,96 @@ async def notify_admins_about_error(
     if extra:
         log_lines.append(f"extra={_safe_extra_text(extra)}")
 
-    if exception is not None:
+    from provider_failures import OPERATOR_CLASSES, RETRYABLE_CLASSES, ProviderFailure
+    from sqlalchemy.exc import SQLAlchemyError
+
+    err_target = root_exception or exception
+    err_type_name = type(err_target).__name__ if err_target is not None else ""
+    is_infra_or_db_error = (
+        isinstance(
+            err_target,
+            (
+                SQLAlchemyError,
+                ConnectionError,
+                OSError,
+                TypeError,
+                KeyError,
+                AttributeError,
+                NameError,
+                UnboundLocalError,
+                IndexError,
+                ZeroDivisionError,
+                AssertionError,
+            ),
+        )
+        or any(
+            k in err_type_name
+            for k in (
+                "OperationalError",
+                "DatabaseError",
+                "ProgrammingError",
+                "IntegrityError",
+                "InterfaceError",
+                "InternalError",
+                "DataError",
+            )
+        )
+    )
+    is_internal_class = classification in {"application_internal", "unknown", None}
+
+    prov_failure = None
+    for cand in (exception, root_exception):
+        if isinstance(cand, ProviderFailure):
+            prov_failure = cand
+            break
+        cand_f = getattr(cand, "failure", None)
+        if isinstance(cand_f, ProviderFailure):
+            prov_failure = cand_f
+            break
+
+    # Security: classification_source CANNOT be elevated to trusted by an arbitrary caller argument.
+    # The genuine classification_source is strictly read from the verified ProviderFailure object.
+    genuine_source = getattr(prov_failure, "classification_source", None) if prov_failure else None
+    if genuine_source in (
+        "provider_structured",
+        "http_status_fallback",
+        "transport",
+        "sdk_typed_exception",
+    ):
+        effective_classification_source = "unverified" if classification_source == "unverified" else genuine_source
+    else:
+        effective_classification_source = genuine_source or "unverified"
+
+    has_verified_provider_failure = (
+        prov_failure is not None
+        and effective_classification_source in (
+            "provider_structured",
+            "http_status_fallback",
+            "transport",
+            "sdk_typed_exception",
+        )
+    )
+
+    # Strict typed contract: handled AI notice ONLY for confirmed provider failures (retryable / operator quota)
+    # Explicit classification alone passed by caller NEVER proves normal provider failure.
+    is_handled_ai = (
+        not is_infra_or_db_error
+        and not is_internal_class
+        and has_verified_provider_failure
+        and (prov_failure.classification in (OPERATOR_CLASSES | RETRYABLE_CLASSES))
+    )
+
+    if is_handled_ai:
+        ai_notice_lines = [
+            f"Handled AI notice: {title}",
+            f"stage={stage}",
+        ]
+        if provider:
+            ai_notice_lines.append(f"provider={provider}")
+        if classification:
+            ai_notice_lines.append(f"failure_type={classification}")
+        log.warning(" | ".join(ai_notice_lines))
+    elif exception is not None and include_traceback:
         log.log(level, " | ".join(log_lines), exc_info=exception)
     else:
         log.log(level, " | ".join(log_lines))
@@ -605,6 +698,23 @@ async def notify_admins_about_error(
     if trace and trace.strip() and trace.strip() != "NoneType: None":
         message_lines.append(f"Traceback: <code>{html.escape(_shorten(trace, 1800))}</code>")
 
+    if classification in OPERATOR_CLASSES or (
+        root_exception is not None and type(root_exception).__name__ == "InsufficientBalanceError"
+    ):
+        if stage not in ("ai_provider_fallback", "check_credit_balance"):
+            from ai_incident_manager import record_ai_provider_failure
+            try:
+                await record_ai_provider_failure(
+                    origin_instance_id=None,
+                    provider=provider or "unknown",
+                    error=exception or root_exception or Exception(details or title),
+                    operation=stage or "chat",
+                    model=model,
+                )
+            except Exception as rec_exc:
+                log.warning("Could not record AI provider failure in incident manager: %s", rec_exc)
+        return
+
     admin_text = "\n".join(message_lines)
     admin_ids = await get_all_admin_ids()
     for admin_id in admin_ids:
@@ -616,6 +726,18 @@ async def notify_admins_about_error(
 
 _terminal_failure_cooldown = KeyedAlertCooldown(timedelta(minutes=30))
 _output_budget_cooldown = KeyedAlertCooldown(timedelta(minutes=30))
+_insufficient_balance_cooldown = KeyedAlertCooldown(timedelta(hours=6))
+
+
+def reset_insufficient_balance_cooldown(provider: str | None = None) -> None:
+    """Reset insufficient balance alert cooldown in error_reporting."""
+    if provider:
+        norm = provider.strip()
+        _insufficient_balance_cooldown.reset(f"balance:{norm}")
+        _insufficient_balance_cooldown.reset(f"balance:{norm.upper()}")
+        _insufficient_balance_cooldown.reset(f"balance:{norm.lower()}")
+    else:
+        _insufficient_balance_cooldown.reset_all()
 
 
 def extract_error_metadata(
@@ -747,6 +869,10 @@ async def send_terminal_ai_failure_alert(
     topic_name: str | None = None,
     username: str | None = None,
     full_name: str | None = None,
+    incident_id: int | None = None,
+    credential_scope: str | None = None,
+    attempt_started_at: datetime | None = None,
+    session_maker: Any = None,
 ) -> bool:
     """Send realtime terminal AI failure alert to Telegram admins with 30m cooldown."""
     if user is not None:
@@ -782,37 +908,58 @@ async def send_terminal_ai_failure_alert(
         or detected_bot_name
         or "tgpsychobot"
     )
-    cls_str = classification or "provider_failure"
+    from provider_failures import (
+        CANONICAL_CLASSES,
+        KNOWN_EXCEPTION_NAMES,
+        KNOWN_TECHNICAL_CODES,
+        canonical_classification,
+    )
+    canon_cls = canonical_classification(classification) if classification else None
+    if canon_cls and canon_cls in CANONICAL_CLASSES and canon_cls != "unknown":
+        cls_str = canon_cls
+    else:
+        cls_str = "provider_failure"
     primary_p = primary_provider or "primary"
     fb_p = fallback_provider or "none"
 
-    if request_type == "vision":
-        fingerprint = f"vision:{platform_norm}:{b_name}:{primary_p}:{fb_p}:{cls_str}"
-        alert_title = title or f"🚨 <b>[{platform_norm}] Сбой ИИ при анализе изображения</b>\n\n"
+    if title:
+        t_str = sanitize_secret_values(str(title).strip())
+        t_str = re.sub(r"(?i)\b(patient|user|client|customer|token|secret)[_-]?\w+\b", "[REDACTED]", t_str)
+        # Extract inner content if already wrapped in canonical bold header
+        match_header = re.match(r"^🚨\s*<b>(?:\[.*?\])?\s*(.*?)\s*</b>$", t_str, flags=re.DOTALL)
+        inner_title = match_header.group(1) if match_header else t_str
+        alert_title = f"🚨 <b>[{platform_norm}] {html.escape(inner_title)}</b>\n\n"
+    elif request_type == "vision":
+        alert_title = f"🚨 <b>[{platform_norm}] Сбой ИИ при анализе изображения</b>\n\n"
     else:
-        fingerprint = f"{platform_norm}:{b_name}:{primary_p}:{fb_p}:{cls_str}"
-        alert_title = title or f"🚨 <b>[{platform_norm}] Сбой ИИ в текстовом диалоге</b>\n\n"
+        alert_title = f"🚨 <b>[{platform_norm}] Сбой ИИ в текстовом диалоге</b>\n\n"
 
-    if not _terminal_failure_cooldown.should_send(fingerprint):
-        return False
+    if error_type and (
+        error_type.lower() in KNOWN_TECHNICAL_CODES
+        or error_type in KNOWN_EXCEPTION_NAMES
+        or error_type in _ERROR_CLASS_DESCRIPTIONS
+    ):
+        err_type_str = error_type
+    elif exception is not None:
+        t_name = type(exception).__name__
+        err_type_str = (
+            t_name
+            if (
+                t_name in KNOWN_EXCEPTION_NAMES
+                or t_name.lower() in KNOWN_TECHNICAL_CODES
+                or t_name in _ERROR_CLASS_DESCRIPTIONS
+            )
+            else "AIServiceError"
+        )
+    else:
+        err_type_str = "AIServiceError"
 
-    id_label = f"MAX ID: <code>{user_id}</code>" if platform_norm == "MAX" else f"Telegram ID: <code>{user_id}</code>"
-    chat_line = f"Chat ID: <code>{chat_id}</code>\n" if chat_id is not None else ""
-
-    err_type_str = error_type or (type(exception).__name__ if exception is not None else "AIServiceError")
-    raw_err = error_message or (str(exception) if exception is not None else "Unknown error")
-    if request_type == "vision":
-        from vision_reliability import sanitize_vision_request_payload
-        raw_err = sanitize_vision_request_payload(raw_err)
-    err_msg_str = sanitize_secret_values(str(raw_err))
-    err_msg_short = _shorten(err_msg_str, 500)
-
+    ai_log_line = "\nAI Log: не удалось сохранить"
     if ai_log_ids:
-        logs_str = ", ".join(f"#{i}" if str(i).isdigit() else str(i) for i in ai_log_ids)
-        label = "AI Log:" if len(ai_log_ids) == 1 else "AI Log IDs:"
-        ai_log_line = f"\n{label} {logs_str}"
-    else:
-        ai_log_line = "\nAI Log: не удалось сохранить"
+        safe_logs = [f"#{i}" for i in ai_log_ids if str(i).isdigit()]
+        if safe_logs:
+            label = "AI Log:" if len(safe_logs) == 1 else "AI Log IDs:"
+            ai_log_line = f"\n{label} {', '.join(safe_logs)}"
 
     fb_lines = ""
     if fallback_provider:
@@ -822,31 +969,98 @@ async def send_terminal_ai_failure_alert(
     if provider_attempts:
         lines = []
         for att in provider_attempts:
-            p = att.get("provider", "Unknown")
-            m = att.get("model", "—")
-            st = att.get("status", "UNKNOWN")
-            cls = att.get("classification")
-            mark = "✅" if st in ("SUCCESS", "success", True) else "❌"
-            cls_info = f" ({cls})" if cls else ""
-            lines.append(f"• {html.escape(str(p))} / {html.escape(str(m))} {mark}{cls_info}")
-        attempts_block = "\nПопытки:\n" + "\n".join(lines) + "\n"
+            if not isinstance(att, dict):
+                continue
+            p = re.sub(r"[^A-Za-z0-9_\-\.]", "", str(att.get("provider") or "Unknown"))[:32] or "Unknown"
+            m = re.sub(r"[^A-Za-z0-9_\-\./:]", "", str(att.get("model") or "—"))[:64] or "—"
+            st = str(att.get("status") or "UNKNOWN").upper()
+            mark = "✅" if st in ("SUCCESS", "TRUE", "1") else "❌"
+            raw_cls = att.get("classification")
+            canon_att_cls = canonical_classification(raw_cls) if raw_cls else None
+            cls_info = (
+                f" ({canon_att_cls})"
+                if (canon_att_cls and canon_att_cls in CANONICAL_CLASSES and canon_att_cls != "unknown")
+                else ""
+            )
+            lines.append(f"• {html.escape(p)} / {html.escape(m)} {mark}{cls_info}")
+        if lines:
+            attempts_block = "\nПопытки:\n" + "\n".join(lines) + "\n"
 
+    # Strictly typed technical diagnostic snapshot: ZERO PII (no user ID, chat ID, or raw exception/input strings)
     text = (
         f"{alert_title}"
         f"Бот: <code>{html.escape(b_name)}</code>\n"
-        f"{id_label}\n"
-        f"{chat_line}"
+        f"Платформа: <code>{platform_norm}</code> | Канал: <code>{html.escape(request_type)}</code>\n"
         f"Primary: {html.escape(primary_provider)} / {html.escape(primary_model)} ❌\n"
         f"{fb_lines}"
         f"{attempts_block}\n"
         f"Ошибка:\n"
-        f"<code>{html.escape(err_type_str)}</code> / <code>{html.escape(err_msg_short)}</code>\n\n"
+        f"<code>{html.escape(err_type_str)}</code>\n\n"
         f"Классификация:\n"
         f"<code>{html.escape(cls_str)}</code>\n"
         f"{ai_log_line}"
     )
+    text = sanitize_secret_values(text)
 
-    return await _dispatch_admin_alert_text(bot, text)
+    # Durable DB-backed outbox delivery: single canonical route with per-recipient status,
+    # retry, lease recovery, and companion Telegram routing. No parallel direct sends.
+    try:
+        from ai_incident_manager import (
+            enqueue_terminal_ai_failure_notification,
+            process_ai_incident_notifications,
+            record_ai_provider_failure,
+        )
+        target_incident_id = incident_id
+        if target_incident_id is None:
+            err_for_inc = exception or Exception(err_type_str)
+            target_inc = await record_ai_provider_failure(
+                origin_instance_id=None,
+                provider=primary_provider or provider or "unknown",
+                error=err_for_inc,
+                operation=request_type or "chat",
+                model=primary_model or model,
+                credential_scope=credential_scope,
+                attempt_started_at=attempt_started_at,
+                enqueue_notification=False,
+                session_maker=session_maker,
+            )
+            if target_inc:
+                if target_inc.status == "superseded":
+                    logging.getLogger(__name__).info(
+                        "[AI Terminal Alert] Stale failure belongs to superseded generation. Suppressing terminal alert."
+                    )
+                    return False
+                target_incident_id = target_inc.id
+
+        if target_incident_id is None:
+            logging.getLogger(__name__).error(
+                "[AI Terminal Alert] Could not create or resolve incident for terminal alert. Delivery not guaranteed."
+            )
+            return False
+
+        enqueued = await enqueue_terminal_ai_failure_notification(
+            incident_id=target_incident_id,
+            origin_instance_id=None,
+            text=text,
+            cooldown_seconds=1800,
+            session_maker=session_maker,
+        )
+        if not enqueued:
+            # Suppressed by persistent DB cooldown (or invalid recipient configuration)
+            return False
+
+        # When running in Telegram bot process, trigger immediate outbox processing turn
+        if bot is not None:
+            await process_ai_incident_notifications(bot, session_maker=session_maker)
+        return True
+
+    except Exception as outbox_err:
+        logging.getLogger(__name__).error(
+            "[AI Terminal Alert] Terminal failure outbox delivery failed: %s. Delivery not guaranteed.",
+            outbox_err,
+            exc_info=True,
+        )
+        return False
 
 
 async def send_output_budget_exhausted_alert(
@@ -874,6 +1088,10 @@ async def send_output_budget_exhausted_alert(
     topic_name: str | None = None,
     username: str | None = None,
     full_name: str | None = None,
+    incident_id: int | None = None,
+    credential_scope: str | None = None,
+    attempt_started_at: datetime | None = None,
+    session_maker: Any = None,
 ) -> bool:
     """Send alert when AI provider exhausts output budget on tokens (30m cooldown)."""
     if user is not None:
@@ -902,35 +1120,80 @@ async def send_output_budget_exhausted_alert(
         or "tgpsychobot"
     )
 
-    if request_type == "vision":
-        fingerprint = f"vision:{b_name}:{provider}:{model}:output_budget_exhausted"
-        title = f"⚠️ <b>[Vision] {html.escape(provider)} исчерпал output budget</b>\n\n"
-    else:
-        fingerprint = f"{b_name}:{provider}:{model}:output_budget_exhausted"
-        title = f"⚠️ <b>[AI] {html.escape(provider)} исчерпал output budget</b>\n\n"
+    clean_provider = re.sub(r"[^A-Za-z0-9_\-\.]", "", str(provider or "Deepseek"))[:32] or "Deepseek"
+    clean_model = re.sub(r"[^A-Za-z0-9_\-\./:]", "", str(model or "—"))[:64] or "—"
+    req_type_clean = "vision" if str(request_type).lower() == "vision" else "chat"
 
-    if not _output_budget_cooldown.should_send(fingerprint):
-        return False
+    safe_finish = str(finish_reason or "length").strip().lower()
+    if safe_finish not in {"length", "max_tokens", "token_limit", "context_length", "model_context_limit"}:
+        safe_finish = "length"
 
-    ai_log_str = f"#{ai_log_id}" if ai_log_id is not None and str(ai_log_id).isdigit() else (str(ai_log_id) if ai_log_id else "не удалось сохранить")
-    id_label = f"User ID: <code>{user_id if user_id is not None else 'не указан'}</code>\n"
-    chat_line = f"Chat ID: <code>{chat_id}</code>\n" if chat_id is not None else ""
+    safe_vis_len = int(visible_content_length) if str(visible_content_length).isdigit() else 0
+    safe_reas_len = int(reasoning_content_length) if str(reasoning_content_length).isdigit() else 0
+    safe_max_tokens = int(max_tokens) if str(max_tokens).isdigit() else 65536
 
+    ai_log_str = f"#{ai_log_id}" if ai_log_id is not None and str(ai_log_id).isdigit() else "не зафиксирован"
+
+    title = f"⚠️ <b>[{platform_norm}] {html.escape(clean_provider)} исчерпал output budget ({html.escape(req_type_clean)})</b>\n\n"
     text = (
         f"{title}"
         f"Бот: <code>{html.escape(b_name)}</code>\n"
-        f"Платформа: <b>{platform_norm}</b>\n"
-        f"{id_label}"
-        f"{chat_line}"
-        f"Model: <code>{html.escape(model)}</code>\n"
-        f"finish_reason: <code>{html.escape(finish_reason)}</code>\n"
-        f"visible_content_length: <code>{visible_content_length}</code>\n"
-        f"reasoning_content_length: <code>{reasoning_content_length}</code>\n"
-        f"max_tokens: <code>{max_tokens}</code>\n"
+        f"Платформа: <code>{platform_norm}</code> | Канал: <code>{html.escape(req_type_clean)}</code>\n"
+        f"Провайдер: <code>{html.escape(clean_provider)}</code> / <code>{html.escape(clean_model)}</code>\n"
+        f"Причина: <code>{html.escape(safe_finish)}</code>\n"
+        f"Длина видимого ответа: <code>{safe_vis_len}</code>\n"
+        f"Длина рассуждений: <code>{safe_reas_len}</code>\n"
+        f"Лимит max_tokens: <code>{safe_max_tokens}</code>\n"
         f"AI Log: {ai_log_str}"
     )
+    text = sanitize_secret_values(text)
 
-    return await _dispatch_admin_alert_text(bot, text)
+    try:
+        from ai_incident_manager import (
+            enqueue_ai_notification_event,
+            process_ai_incident_notifications,
+            record_ai_provider_failure,
+        )
+        target_incident_id = incident_id
+        if target_incident_id is None:
+            err_for_inc = exception if isinstance(exception, Exception) else Exception("AI output budget exhausted (max_tokens)")
+            target_inc = await record_ai_provider_failure(
+                origin_instance_id=None,
+                provider=clean_provider,
+                error=err_for_inc,
+                operation=req_type_clean,
+                model=clean_model,
+                credential_scope=credential_scope,
+                attempt_started_at=attempt_started_at,
+                enqueue_notification=False,
+                session_maker=session_maker,
+            )
+            if target_inc:
+                if target_inc.status == "superseded":
+                    logging.getLogger(__name__).info("[AI Alert] Stale output budget failure on superseded key. Suppressing.")
+                    return False
+                target_incident_id = target_inc.id
+
+        if target_incident_id is None:
+            return False
+
+        enqueued = await enqueue_ai_notification_event(
+            incident_id=target_incident_id,
+            origin_instance_id=None,
+            event_type="output_budget_exhausted",
+            text=text,
+            cooldown_seconds=1800,
+            session_maker=session_maker,
+        )
+        if not enqueued:
+            return False
+
+        if bot is not None:
+            await process_ai_incident_notifications(bot, session_maker=session_maker)
+        return True
+    except Exception as exc:
+        logging.getLogger(__name__).error("[AI Alert] Output budget alert failed: %s", exc, exc_info=True)
+        return False
 
 
 async def send_ai_fallback_used_alert(
@@ -959,63 +1222,171 @@ async def send_ai_fallback_used_alert(
     topic_name: str | None = None,
     username: str | None = None,
     full_name: str | None = None,
+    incident_id: int | None = None,
+    credential_scope: str | None = None,
+    attempt_started_at: datetime | None = None,
+    session_maker: Any = None,
 ) -> bool:
-    """Send realtime notification that reserve AI provider was used successfully."""
-    if user is not None:
-        user_id = getattr(user, "user_id", None) or getattr(user, "id", None) or user_id
-        chat_id = getattr(user, "chat_id", None) or chat_id
-        username = getattr(user, "username", None) or username
-        full_name = getattr(user, "full_name", None) or getattr(user, "name", None) or full_name
-        platform = getattr(user, "platform", platform) or platform
+    """Send realtime notification via durable outbox that reserve AI provider was used successfully."""
+    from provider_failures import (
+        CANONICAL_CLASSES,
+        KNOWN_EXCEPTION_NAMES,
+        KNOWN_TECHNICAL_CODES,
+        ProviderFailure,
+        canonical_classification,
+    )
 
-    primary_provider = primary_provider or failed_provider or "Unknown"
-    primary_model = primary_model or failed_model or "—"
-    primary_error = primary_error or reason or failure_reason
-    fallback_model = fallback_model or ""
+    clean_primary_prov = re.sub(r"[^A-Za-z0-9_\-\.]", "", str(primary_provider or failed_provider or "Unknown"))[:32] or "Unknown"
+    clean_primary_mod = re.sub(r"[^A-Za-z0-9_\-\./:]", "", str(primary_model or failed_model or "—"))[:64] or "—"
+    clean_fallback_prov = re.sub(r"[^A-Za-z0-9_\-\.]", "", str(fallback_provider or "Unknown"))[:32] or "Unknown"
+    clean_fallback_mod = re.sub(r"[^A-Za-z0-9_\-\./:]", "", str(fallback_model or "—"))[:64] or "—"
+    req_type_clean = "vision" if str(request_type).lower() == "vision" else "chat"
+
     platform_norm = "MAX" if platform.lower() == "max" else "Telegram"
     b_name = bot_name or os.getenv("BOT_NAME") or os.getenv("BOT_USERNAME") or "tgpsychobot"
-    id_label = f"MAX ID: <code>{user_id}</code>" if platform_norm == "MAX" else f"Telegram ID: <code>{user_id}</code>"
-    chat_line = f"Chat ID: <code>{chat_id}</code>\n" if chat_id is not None else ""
 
-    raw_err = str(primary_error) if primary_error is not None else "Не зафиксирована"
-    if request_type == "vision":
-        from vision_reliability import sanitize_vision_request_payload
-        raw_err = sanitize_vision_request_payload(raw_err)
-    err_str = sanitize_secret_values(str(raw_err))
-    err_short = _shorten(err_str, 300)
+    err_target = primary_error or reason or failure_reason
+    err_type_str = "ProviderFailure"
+    cls_candidate = None
 
-    title_type = "при анализе изображения" if request_type == "vision" else "в текстовом диалоге"
+    if isinstance(err_target, ProviderFailure):
+        cls_candidate = err_target.classification
+        code = err_target.detail_code or err_target.provider_error_type or ""
+        code_norm = code.strip().lower()
+        if (
+            code.strip() in KNOWN_EXCEPTION_NAMES
+            or code_norm in KNOWN_TECHNICAL_CODES
+            or code_norm in _ERROR_CLASS_DESCRIPTIONS
+        ):
+            err_type_str = code.strip()
+        elif err_target.classification in CANONICAL_CLASSES and err_target.classification != "unknown":
+            err_type_str = err_target.classification
+        else:
+            err_type_str = "ProviderFailure"
+    elif isinstance(err_target, Exception):
+        t_name = type(err_target).__name__
+        if (
+            t_name in KNOWN_EXCEPTION_NAMES
+            or t_name.lower() in KNOWN_TECHNICAL_CODES
+            or t_name in _ERROR_CLASS_DESCRIPTIONS
+        ):
+            err_type_str = t_name
+        else:
+            err_type_str = "ProviderFailure"
+        cls_candidate = getattr(err_target, "classification", None)
+    elif isinstance(err_target, str):
+        # Strictly accept only verified canonical technical codes; NEVER use regex or accept arbitrary free text
+        s_code = err_target.strip()
+        s_norm = s_code.lower()
+        if (
+            s_code in KNOWN_EXCEPTION_NAMES
+            or s_norm in KNOWN_TECHNICAL_CODES
+            or s_norm in _ERROR_CLASS_DESCRIPTIONS
+        ):
+            err_type_str = s_code
+            cls_candidate = s_norm
+        else:
+            err_type_str = "ProviderFailure"
+            cls_candidate = None
+    else:
+        err_type_str = "ProviderFailure"
+
+    canon_cls = canonical_classification(cls_candidate) if cls_candidate else None
+    if canon_cls and canon_cls in CANONICAL_CLASSES and canon_cls != "unknown":
+        cls_str = canon_cls
+    else:
+        cls_str = "fallback_recovery"
+
+    title_type = "при анализе изображения" if req_type_clean == "vision" else "в текстовом диалоге"
 
     eff_attempts = provider_attempts or attempts
     attempts_block = ""
     if eff_attempts:
         lines = []
         for att in eff_attempts:
-            p = att.get("provider", "Unknown")
-            m = att.get("model", "—")
-            st = att.get("status", "UNKNOWN")
-            cls = att.get("classification")
-            mark = "✅" if (st in ("SUCCESS", "success", True) or str(st).upper() == "SUCCESS") else "❌"
-            cls_info = f" ({cls})" if cls else ""
-            lines.append(f"• {html.escape(str(p))} / {html.escape(str(m))} {mark}{cls_info}")
-        attempts_block = "\nПопытки:\n" + "\n".join(lines) + "\n"
+            if not isinstance(att, dict):
+                continue
+            p = re.sub(r"[^A-Za-z0-9_\-\.]", "", str(att.get("provider") or "Unknown"))[:32] or "Unknown"
+            m = re.sub(r"[^A-Za-z0-9_\-\./:]", "", str(att.get("model") or "—"))[:64] or "—"
+            st = str(att.get("status") or "UNKNOWN").upper()
+            mark = "✅" if st in ("SUCCESS", "TRUE", "1") else "❌"
+            raw_cls = att.get("classification")
+            canon_att_cls = canonical_classification(raw_cls) if raw_cls else None
+            cls_info = f" ({canon_att_cls})" if (canon_att_cls and canon_att_cls in CANONICAL_CLASSES and canon_att_cls != "unknown") else ""
+            lines.append(f"• {html.escape(p)} / {html.escape(m)} {mark}{cls_info}")
+        if lines:
+            attempts_block = "\nПопытки:\n" + "\n".join(lines) + "\n"
 
     ai_log_line = ""
     if ai_log_ids:
-        logs_str = ", ".join(f"#{i}" if str(i).isdigit() else str(i) for i in ai_log_ids)
-        ai_log_line = f"\nAI Log IDs: {logs_str}"
+        safe_logs = [f"#{i}" for i in ai_log_ids if str(i).isdigit()]
+        if safe_logs:
+            ai_log_line = f"\nAI Log IDs: {', '.join(safe_logs)}"
 
     text = (
         f"ℹ️ <b>[{platform_norm}] Использован резервный AI-провайдер {title_type}</b>\n\n"
         f"Бот: <code>{html.escape(b_name)}</code>\n"
-        f"{id_label}\n"
-        f"{chat_line}"
-        f"Основной: {html.escape(primary_provider)} / {html.escape(primary_model or '—')} ❌\n"
-        f"Резервный: {html.escape(fallback_provider)} / {html.escape(fallback_model or '—')} ✅\n"
+        f"Платформа: <code>{platform_norm}</code> | Канал: <code>{html.escape(req_type_clean)}</code>\n"
+        f"Основной: {html.escape(clean_primary_prov)} / {html.escape(clean_primary_mod)} ❌\n"
+        f"Резервный: {html.escape(clean_fallback_prov)} / {html.escape(clean_fallback_mod)} ✅\n"
         f"{attempts_block}"
-        f"Причина переключения:\n"
-        f"<code>{html.escape(err_short)}</code>\n"
+        f"Тип сбоя: <code>{html.escape(err_type_str)}</code>\n"
+        f"Классификация: <code>{html.escape(cls_str)}</code>\n"
         f"{ai_log_line}"
     )
-    return await _dispatch_admin_alert_text(bot, text)
+    text = sanitize_secret_values(text)
+
+    try:
+        from ai_incident_manager import (
+            enqueue_ai_notification_event,
+            process_ai_incident_notifications,
+            record_ai_provider_failure,
+        )
+        target_incident_id = incident_id
+        if target_incident_id is None:
+            err_for_inc = (
+                err_target
+                if isinstance(err_target, (Exception, ProviderFailure))
+                else Exception("Primary provider failed; fallback used")
+            )
+            target_inc = await record_ai_provider_failure(
+                origin_instance_id=None,
+                provider=clean_primary_prov,
+                error=err_for_inc,
+                operation=req_type_clean,
+                model=clean_primary_mod,
+                fallback_provider=clean_fallback_prov,
+                fallback_model=clean_fallback_mod,
+                fallback_succeeded=True,
+                credential_scope=credential_scope,
+                attempt_started_at=attempt_started_at,
+                enqueue_notification=False,
+                session_maker=session_maker,
+            )
+            if target_inc:
+                if target_inc.status == "superseded":
+                    logging.getLogger(__name__).info("[AI Alert] Stale fallback used on superseded key. Suppressing.")
+                    return False
+                target_incident_id = target_inc.id
+
+        if target_incident_id is None:
+            return False
+
+        enqueued = await enqueue_ai_notification_event(
+            incident_id=target_incident_id,
+            origin_instance_id=None,
+            event_type="fallback_used",
+            text=text,
+            cooldown_seconds=1800,
+            session_maker=session_maker,
+        )
+        if not enqueued:
+            return False
+
+        if bot is not None:
+            await process_ai_incident_notifications(bot, session_maker=session_maker)
+        return True
+    except Exception as exc:
+        logging.getLogger(__name__).error("[AI Alert] Fallback alert failed: %s", exc, exc_info=True)
+        return False
 

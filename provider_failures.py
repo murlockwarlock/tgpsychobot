@@ -4,6 +4,7 @@ import json
 import math
 import re
 import ssl
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -66,13 +67,49 @@ class ProviderFailure:
     provider_error_message: str = ""
     http_status: int | None = None
     request_id: str | None = None
-    retryable: bool = False
+    retryable: bool | None = None
     retry_after_seconds: float | None = None
-    network_attempted: bool = True
-    transient: bool = False
-    operator_action_required: bool = False
+    network_attempted: bool | None = None
+    transient: bool | None = None
+    operator_action_required: bool | None = None
     classification_source: str = "provider_structured"
     provider_metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        raw_c = str(self.classification or "unknown").strip()
+        canon = canonical_classification(raw_c)
+        if canon and canon in CANONICAL_CLASSES and canon != "unknown":
+            safe_c = canon
+        elif raw_c in ("low_credit_warning",):
+            safe_c = raw_c
+        else:
+            safe_c = "unknown"
+        if safe_c == "unknown" and self.http_status is not None:
+            inferred = _status_class(self.http_status, str(self.provider).lower())
+            if inferred and inferred != "unknown":
+                safe_c = inferred
+                if self.classification_source in ("provider_structured", "unknown"):
+                    object.__setattr__(self, "classification_source", "http_status_fallback")
+        if safe_c != self.classification:
+            object.__setattr__(self, "classification", safe_c)
+
+        # Flag derivation and override resolution:
+        # If omitted (None), strictly derive from canonical classification
+        if self.retryable is None:
+            object.__setattr__(self, "retryable", safe_c in RETRYABLE_CLASSES)
+
+        if self.network_attempted is None:
+            object.__setattr__(
+                self,
+                "network_attempted",
+                safe_c not in ("configuration", "application_internal"),
+            )
+
+        if self.transient is None:
+            object.__setattr__(self, "transient", bool(self.retryable))
+
+        if self.operator_action_required is None:
+            object.__setattr__(self, "operator_action_required", safe_c in OPERATOR_CLASSES)
 
     def diagnostics(self) -> dict[str, Any]:
         return asdict(self)
@@ -117,6 +154,53 @@ _CODE_GROUPS = {
     "unknown": "unmapped",
 }
 CODE_CLASSES = {code: cls for cls, codes in _CODE_GROUPS.items() for code in codes.split()}
+KNOWN_EXCEPTION_NAMES: frozenset[str] = frozenset({
+    # Built-in exceptions
+    "TimeoutError", "ConnectionError", "ConnectionRefusedError", "ConnectionResetError",
+    "BrokenPipeError", "SSLError", "OSError", "RuntimeError", "ValueError", "TypeError",
+    "KeyError", "AttributeError",
+    # httpx exceptions
+    "TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout",
+    "TransportError", "ConnectError", "ReadError", "WriteError", "CloseError",
+    "ProxyError", "HTTPStatusError", "RequestError", "DecodingError", "StreamError",
+    # Telegram / aiogram exceptions
+    "TelegramAPIError", "TelegramNetworkError", "TelegramRetryAfter", "TelegramForbiddenError",
+    "TelegramBadRequest", "TelegramUnauthorizedError", "TelegramServerError", "TelegramNotFound",
+    "RestartingTelegram",
+    # OpenAI / Anthropic SDK exceptions
+    "APIError", "APIConnectionError", "APITimeoutError", "RateLimitError", "BadRequestError",
+    "AuthenticationError", "PermissionDeniedError", "NotFoundError", "ConflictError",
+    "UnprocessableEntityError", "InternalServerError", "APIStatusError", "APIResponseValidationError",
+    # Application / domain exceptions
+    "AIServiceError", "AIResponseError", "InsufficientBalanceError", "DailyLimitError",
+    "ModelUnavailableError", "ProviderAdapterError", "GeminiImageError", "GeminiImageResponseError",
+    "IncidentSecurityError", "RoutingError", "ConfigurationError",
+})
+KNOWN_TECHNICAL_CODES: frozenset[str] = frozenset(
+    CANONICAL_CLASSES
+    | frozenset(LEGACY_ALIASES.keys())
+    | frozenset(CODE_CLASSES.keys())
+    | KNOWN_EXCEPTION_NAMES
+    | {name.lower() for name in KNOWN_EXCEPTION_NAMES}
+    | {
+        "billing_or_spend_limit",
+        "billing_or_credit_exhaustion",
+        "spend_limit",
+        "size_incompatible",
+        "invalid_model_or_parameter",
+        "not_found",
+        "security_policy",
+        "content_policy_violation",
+        "openrouter_in_flight_budget",
+        "rate_limit_exceeded",
+        "quota_exceeded",
+        "access_policy",
+        "unsupported_region",
+        "superseded_by_key_rotation",
+    }
+    | {f"inferred_{cls}" for cls in CANONICAL_CLASSES}
+    | {"inferred_unspecified"}
+)
 OPENROUTER_TYPES = frozenset("context_length_exceeded max_tokens_exceeded token_limit_exceeded string_too_long authentication permission_denied payment_required rate_limit_exceeded provider_overloaded provider_unavailable invalid_request invalid_prompt not_found precondition_failed payload_too_large unprocessable content_policy_violation refusal invalid_image image_too_large image_too_small unsupported_image_format image_not_found image_download_failed server timeout unmapped".split())
 _OPENROUTER_HTTP_LIKE_CODES = frozenset({400, 401, 402, 403, 404, 408, 409, 413, 422, 429, 500, 501, 502, 503, 504})
 _BALANCE_QUOTA_MESSAGE_MARKERS = (
@@ -385,56 +469,271 @@ def is_openai_image_size_incompatibility(failure: ProviderFailure | None) -> boo
     )
 
 
+def _resolve_sdk_classes(module_name: str, class_names: tuple[str, ...]) -> tuple[type[BaseException], ...]:
+    mod = sys.modules.get(module_name)
+    if mod is None:
+        try:
+            mod = __import__(module_name, fromlist=list(class_names))
+        except Exception:
+            return ()
+    classes = []
+    for name in class_names:
+        cls = getattr(mod, name, None)
+        if isinstance(cls, type) and issubclass(cls, BaseException):
+            classes.append(cls)
+    return tuple(classes)
+
+
+SDK_TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    (TimeoutError, httpx.TimeoutException)
+    + _resolve_sdk_classes("openai", ("APITimeoutError",))
+    + _resolve_sdk_classes("anthropic", ("APITimeoutError",))
+    + _resolve_sdk_classes("google.api_core.exceptions", ("DeadlineExceeded",))
+)
+
+SDK_CONNECTION_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    (httpx.TransportError, ConnectionError)
+    + _resolve_sdk_classes("openai", ("APIConnectionError",))
+    + _resolve_sdk_classes("anthropic", ("APIConnectionError",))
+)
+
+SDK_AUTH_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    _resolve_sdk_classes("openai", ("AuthenticationError",))
+    + _resolve_sdk_classes("anthropic", ("AuthenticationError",))
+    + _resolve_sdk_classes("google.api_core.exceptions", ("Unauthenticated",))
+)
+
+SDK_PERMISSION_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    _resolve_sdk_classes("openai", ("PermissionDeniedError",))
+    + _resolve_sdk_classes("anthropic", ("PermissionDeniedError",))
+    + _resolve_sdk_classes("google.api_core.exceptions", ("PermissionDenied",))
+)
+
+SDK_RATE_LIMIT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    _resolve_sdk_classes("openai", ("RateLimitError",))
+    + _resolve_sdk_classes("anthropic", ("RateLimitError",))
+    + _resolve_sdk_classes("google.api_core.exceptions", ("ResourceExhausted",))
+)
+
+SDK_5XX_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    _resolve_sdk_classes("openai", ("InternalServerError",))
+    + _resolve_sdk_classes("anthropic", ("InternalServerError",))
+    + _resolve_sdk_classes("google.api_core.exceptions", ("InternalServerError", "ServiceUnavailable"))
+)
+
+SDK_NOT_FOUND_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    _resolve_sdk_classes("openai", ("NotFoundError",))
+    + _resolve_sdk_classes("anthropic", ("NotFoundError",))
+    + _resolve_sdk_classes("google.api_core.exceptions", ("NotFound",))
+)
+
+_ALL_TRUSTED_SDK_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    SDK_TIMEOUT_EXCEPTIONS
+    + SDK_CONNECTION_EXCEPTIONS
+    + SDK_AUTH_EXCEPTIONS
+    + SDK_PERMISSION_EXCEPTIONS
+    + SDK_RATE_LIMIT_EXCEPTIONS
+    + SDK_5XX_EXCEPTIONS
+    + SDK_NOT_FOUND_EXCEPTIONS
+)
+
+_DOMAIN_BALANCE_MODULES: tuple[str, ...] = (
+    "ai_integration",
+    "background_worker",
+    "max_messenger_bot.ai",
+)
+
+
+def _is_domain_insufficient_balance_error(item: BaseException) -> bool:
+    if type(item).__name__ != "InsufficientBalanceError":
+        return False
+    # Check strictly within domain modules ALREADY loaded in sys.modules.
+    # An error classifier must never import or initialize foreign subsystems
+    # just to inspect an exception type (avoids side-effects such as MAX configure_logging).
+    item_class = type(item)
+    for mod_name in _DOMAIN_BALANCE_MODULES:
+        mod = sys.modules.get(mod_name)
+        if mod is not None:
+            cls = getattr(mod, "InsufficientBalanceError", None)
+            if isinstance(cls, type) and (item_class is cls or issubclass(item_class, cls)):
+                return True
+    return False
+
+
+def _is_trusted_adapter_error(item: BaseException) -> bool:
+    if type(item).__name__ != "ProviderAdapterError":
+        return False
+    # Check strictly within provider_adapters if ALREADY loaded in sys.modules.
+    mod = sys.modules.get("provider_adapters")
+    if mod is not None:
+        cls = getattr(mod, "ProviderAdapterError", None)
+        if isinstance(cls, type) and (type(item) is cls or isinstance(item, cls)):
+            return True
+    return False
+
+
 def normalize_exception(exception: Exception, provider: str = "", operation: str = "chat") -> ProviderFailure:
+    # 1. Pre-attached or already normalized ProviderFailure
+    if isinstance(exception, ProviderFailure):
+        return exception
     chain, seen = [], set()
     item = exception
     while item is not None and id(item) not in seen:
         seen.add(id(item))
         chain.append(item)
-        item = item.__cause__
+        item = getattr(item, "__cause__", None)
     for item in chain:
         existing = getattr(item, "failure", None)
         if isinstance(existing, ProviderFailure):
             return existing
-    for item in chain:
-        cls = None
-        if isinstance(item, (TimeoutError, httpx.TimeoutException)) or type(item).__name__ == "APITimeoutError":
-            cls = "timeout"
-        elif isinstance(item, ssl.SSLError) or "sslerror" in type(item).__name__.lower() or "ssl" in str(item).lower() and "unexpected_eof" in str(item).lower():
-            cls = "network_ssl"
-        elif isinstance(item, httpx.ProxyError):
-            cls = "proxy_error"
-        elif isinstance(item, (httpx.TransportError, ConnectionError)) or type(item).__name__ == "APIConnectionError":
-            cls = "network_connection"
-        if cls:
-            return ProviderFailure(provider, operation, cls, cls, provider_error_message=safe_message(item), retryable=True, transient=True, classification_source="transport")
+
+    # 2. Structured HTTP Response & status code (Highest priority for remote API errors)
     for item in chain:
         response = getattr(item, "response", None)
         body = getattr(item, "body", None)
         headers = getattr(response, "headers", None)
-        status = getattr(response, "status_code", None) or getattr(item, "http_status", None) or getattr(item, "status_code", None)
+        raw_status = (
+            getattr(response, "status_code", None)
+            or getattr(item, "http_status", None)
+            or getattr(item, "status_code", None)
+            or (getattr(item, "status", None) if isinstance(getattr(item, "status", None), int) else None)
+        )
         if response is not None and body is None:
             try:
                 body = response.json()
             except (ValueError, TypeError, AttributeError):
                 pass
-        if body is not None or status is not None:
+        if body is not None or raw_status is not None:
             if isinstance(body, dict) and "error" not in body and any(k in body for k in ("type", "message")):
                 body = {"error": body}
-            failure = parse_provider_failure(provider, operation, status, body, headers)
+            failure = parse_provider_failure(provider, operation, raw_status, body, headers)
             if failure:
                 if failure.classification_source == "http_status_fallback":
                     response_headers = getattr(getattr(item, "response", None), "headers", None)
                     enriched = parse_provider_failure(
                         provider,
                         operation,
-                        status,
+                        raw_status,
                         {"error": {"message": safe_message(item)}},
                         response_headers,
                     )
                     if enriched is not None and enriched.classification_source != "http_status_fallback":
                         return enriched
                 return failure
+
+    # 3. Transport-level exceptions (failed before/during TCP/TLS connection)
+    for item in chain:
+        cls = None
+        if isinstance(item, SDK_TIMEOUT_EXCEPTIONS):
+            cls = "timeout"
+        elif (
+            isinstance(item, ssl.SSLError)
+            or "sslerror" in type(item).__name__.lower()
+            or ("ssl" in str(item).lower() and "unexpected_eof" in str(item).lower())
+        ):
+            cls = "network_ssl"
+        elif isinstance(item, httpx.ProxyError):
+            cls = "proxy_error"
+        elif isinstance(item, SDK_CONNECTION_EXCEPTIONS):
+            cls = "network_connection"
+        if cls:
+            return ProviderFailure(
+                provider,
+                operation,
+                cls,
+                cls,
+                provider_error_message=safe_message(item),
+                retryable=True,
+                transient=True,
+                network_attempted=True,
+                classification_source="transport",
+            )
+
+    # 4. Trusted Domain & SDK exceptions WITHOUT HTTP response
+    for item in chain:
+        # 4a. Domain InsufficientBalanceError (verified origin)
+        if _is_domain_insufficient_balance_error(item):
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="insufficient_balance_quota",
+                detail_code="insufficient_balance",
+                provider_error_message=safe_message(item),
+                retryable=False,
+                transient=False,
+                network_attempted=True,
+                operator_action_required=True,
+                classification_source="sdk_typed_exception",
+            )
+
+        # 4b. Verified Provider SDK exceptions (only from real SDK modules)
+        if isinstance(item, SDK_AUTH_EXCEPTIONS):
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="auth",
+                detail_code="authentication_error",
+                provider_error_message=safe_message(item),
+                retryable=False,
+                transient=False,
+                network_attempted=True,
+                operator_action_required=True,
+                classification_source="sdk_typed_exception",
+            )
+        elif isinstance(item, SDK_PERMISSION_EXCEPTIONS):
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="permission",
+                detail_code="permission_denied",
+                provider_error_message=safe_message(item),
+                retryable=False,
+                transient=False,
+                network_attempted=True,
+                operator_action_required=True,
+                classification_source="sdk_typed_exception",
+            )
+        elif isinstance(item, SDK_RATE_LIMIT_EXCEPTIONS):
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="rate_limit",
+                detail_code="rate_limit_error",
+                provider_error_message=safe_message(item),
+                retryable=True,
+                transient=True,
+                network_attempted=True,
+                operator_action_required=False,
+                classification_source="sdk_typed_exception",
+            )
+        elif isinstance(item, SDK_5XX_EXCEPTIONS):
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="provider_5xx",
+                detail_code="internal_server_error",
+                provider_error_message=safe_message(item),
+                retryable=True,
+                transient=True,
+                network_attempted=True,
+                operator_action_required=False,
+                classification_source="sdk_typed_exception",
+            )
+        elif isinstance(item, SDK_NOT_FOUND_EXCEPTIONS):
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification="invalid_model_or_resource",
+                detail_code="model_not_found",
+                provider_error_message=safe_message(item),
+                retryable=False,
+                transient=False,
+                network_attempted=True,
+                operator_action_required=True,
+                classification_source="sdk_typed_exception",
+            )
+
+    # 5. Application internal exceptions
     if any(isinstance(item, (TypeError, AttributeError, AssertionError, KeyError)) for item in chain):
         item = chain[-1]
         return ProviderFailure(
@@ -449,15 +748,37 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
             operator_action_required=False,
             classification_source="message_fallback",
         )
+
+    # 6. Explicit classification attribute
     for item in chain:
         explicit = getattr(item, "classification", None)
         if explicit:
             cls = canonical_classification(explicit)
-            network = getattr(item, "network_attempted", cls != "configuration")
-            if cls == "configuration":
+            is_trusted = (
+                isinstance(item, _ALL_TRUSTED_SDK_EXCEPTIONS)
+                or _is_domain_insufficient_balance_error(item)
+                or _is_trusted_adapter_error(item)
+            )
+            network = getattr(item, "network_attempted", cls not in ("configuration", "application_internal"))
+            if cls in ("configuration", "application_internal"):
                 network = False
             retryable = bool(getattr(item, "retryable", cls in RETRYABLE_CLASSES)) and network
-            return ProviderFailure(provider, operation, cls, str(explicit), provider_error_message=safe_message(item), retryable=retryable, transient=retryable, network_attempted=network, operator_action_required=cls in OPERATOR_CLASSES, classification_source="sdk_typed_exception")
+            operator = (cls in OPERATOR_CLASSES) and is_trusted
+            source = "sdk_typed_exception" if is_trusted else "message_fallback"
+            return ProviderFailure(
+                provider=provider,
+                operation=operation,
+                classification=cls,
+                detail_code=str(explicit),
+                provider_error_message=safe_message(item),
+                retryable=retryable,
+                transient=retryable,
+                network_attempted=network,
+                operator_action_required=operator,
+                classification_source=source,
+            )
+
+    # 7. Fallback text diagnostic matching
     fallback_text = " ".join(str(item) for item in chain).lower()
     if any(marker in fallback_text for marker in ("timed out", "timeout", "status code 408")):
         cls = "timeout"
@@ -467,7 +788,10 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
         cls = "rate_limit"
     elif any(marker in fallback_text for marker in ("invalid api key", "authentication", "unauthorized", "status code 401")):
         cls = "auth"
-    elif any(marker in fallback_text for marker in ("quota", "credit", "billing", "status code 402")):
+    elif (
+        any(marker in fallback_text for marker in ("quota", "credit", "billing", "balance", "status code 402"))
+        or any(_is_domain_insufficient_balance_error(item) for item in chain)
+    ):
         cls = "insufficient_balance_quota"
     elif any(marker in fallback_text for marker in ("configuration", "not configured", "api key for")):
         cls = "configuration"
@@ -476,8 +800,19 @@ def normalize_exception(exception: Exception, provider: str = "", operation: str
     else:
         cls = "unknown"
     retryable = cls in RETRYABLE_CLASSES
-    network_attempted = cls != "configuration"
-    return ProviderFailure(provider, operation, cls, type(chain[-1]).__name__, provider_error_message=safe_message(chain[-1]), retryable=retryable, transient=retryable, network_attempted=network_attempted, operator_action_required=cls in OPERATOR_CLASSES, classification_source="message_fallback")
+    network_attempted = cls not in ("configuration", "application_internal")
+    return ProviderFailure(
+        provider,
+        operation,
+        cls,
+        type(chain[-1]).__name__,
+        provider_error_message=safe_message(chain[-1]),
+        retryable=retryable,
+        transient=retryable,
+        network_attempted=network_attempted,
+        operator_action_required=False,
+        classification_source="message_fallback",
+    )
 
 
 def attach_failure(exception: Exception, failure: ProviderFailure) -> Exception:
